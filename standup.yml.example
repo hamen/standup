@@ -1,0 +1,11 @@
+projects_root: /home/youruser/code
+
+# Optional: map repo directory names to display names (often hashtags)
+# Useful if you use project hashtags on communities like wip.co
+# Example: local repo "daily-journal" maps to "#dailyjournal" (same as your wip.co project name)
+repo_name_mapping:
+  habit-tracker: "#habittracker"
+  ebook-finder: "#ebookfinder"
+  daily-journal: "#dailyjournal"
+
+
