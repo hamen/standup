@@ -41,8 +41,9 @@ branch lives. It also:
 - skips merge commits, because *"Merge pull request #51"* is not a standup line
 - skips the stash, which `--all` would otherwise walk into
 - matches your author name literally, so a name holding `[` or `(` still works
-- says nothing rather than the wrong thing when a repository has no `user.name`,
-  since an empty author filter matches **everyone's** commits
+- leaves out the commits of a repository that has no `user.name`, since an empty
+  author filter matches **everyone's** commits. A dated `llm-context.md` entry
+  in such a repository is still reported: it carries no author to filter on.
 
 ## Install
 
