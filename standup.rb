@@ -72,6 +72,22 @@ rescue SystemCallError => e
   ''
 end
 
+# The repository names to keep out of the report.
+#
+# Written as a YAML scalar rather than a list, this would be a String, and
+# String#include? matches a substring: `exclude_repos: api` would silently drop
+# every repository whose name contains "api". A config that hides the wrong
+# work is worse than one that refuses to run, so this refuses.
+def exclude_list(value)
+  return [] if value.nil?
+
+  unless value.is_a?(Array) && value.all? { |name| name.is_a?(String) && !name.strip.empty? }
+    abort 'exclude_repos must be a list of repository directory names'
+  end
+
+  value
+end
+
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
   repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
@@ -182,6 +198,11 @@ def show_help
       projects_root: /path/to/projects
       repo_name_mapping:
         repo_dir_name: "#display_name"
+      exclude_repos:
+        - repo_dir_name
+
+    Every repository under the projects root is reported unless exclude_repos
+    names it. Use that for the ones a published standup should not mention.
 
     The script scans all Git repositories under the projects root and:
     - Lists all commits from the target date
@@ -232,7 +253,22 @@ if __FILE__ == $0
   target_date = options[:today] ? Date.today : Date.today - 1
   date_label = options[:today] ? "Today" : "Yesterday"
 
+  # Repositories a published standup must not name. A list of what to hide,
+  # not of what to show, so a new repository appears on its own. Checked before
+  # anything is scanned, so a bad config fails at once.
+  excluded = exclude_list(cfg['exclude_repos'])
+
   repos = find_git_repos(projects_root, verbose: options[:verbose])
+
+  # An entry that matches nothing is usually a typo, and a typo here does not
+  # look like a mistake: the repository it was meant to hide is simply reported
+  # as usual. Say so, because that is the direction that leaks.
+  names = repos.map { |repo| File.basename(repo) }
+  (excluded - names).each do |name|
+    warn "exclude_repos names #{name}, which is not a repository in #{projects_root}"
+  end
+
+  repos = repos.reject { |repo| excluded.include?(File.basename(repo)) }
 
   any_activity = false
 
