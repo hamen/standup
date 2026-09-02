@@ -274,6 +274,27 @@ Dir.mktmpdir do |root|
   failures << 'the scalar exclude_repos error does not say what is wrong' unless
     scalar_out.include?('exclude_repos must be a list')
 
+  # A list is not enough on its own: one entry that is not a string puts a
+  # non-string into the same include? check the scalar case exists to stop.
+  mixed = File.join(root, 'mixed.yml')
+  File.write(mixed, "exclude_repos:\n  - shell-repo\n  - 42\n")
+  _, mixed_status = Open3.capture2e({ 'HOME' => fake_home },
+                                    'ruby', SCRIPT, '--projects-root', root, '--config', mixed)
+
+  failures << 'exclude_repos holding a non-string entry was accepted' if mixed_status.success?
+
+  # The match is on the whole directory name. "repo" must not take out
+  # "shell-repo", or the substring trap is back through a valid list.
+  substring = File.join(root, 'substring.yml')
+  File.write(substring, "exclude_repos:\n  - repo\n")
+  partial, = Open3.capture2e({ 'HOME' => fake_home },
+                             'ruby', SCRIPT, '--projects-root', root, '--config', substring)
+
+  failures << 'an exclude_repos entry matched a repository name as a substring' unless
+    partial.include?('the shell-name commit') && partial.include?('the regex-name commit')
+  failures << 'an exclude_repos entry that matches nothing was passed over in silence' unless
+    partial.include?('not a repository in')
+
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else
