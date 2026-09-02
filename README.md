@@ -8,8 +8,11 @@
   <img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-9aa7b8">
 </p>
 
-A single Ruby file that reads every Git repository you own and prints what you
-actually shipped yesterday, grouped by project.
+A single Ruby file that reads the Git repositories sitting in your projects
+directory and prints what you actually shipped yesterday, grouped by project.
+
+It looks one level down — `~/code/my-app/.git`, not `~/code/work/my-app/.git` —
+so repositories filed inside a subdirectory are not picked up.
 
 ```console
 $ standup
@@ -117,9 +120,10 @@ meant to hide is simply reported as usual.
 
 ## Publishing the report
 
-The output is plain text with one hashtag per project, which is exactly the
-shape [wip.co](https://wip.co) wants: a hashtag in a todo attaches it to that
-project. Map each repository to its project hashtag, and the report is ready to
+A hashtag in a [wip.co](https://wip.co) todo attaches it to that project, which
+is exactly the shape `repo_name_mapping` produces. Give every repository you
+publish an entry in the map: one without an entry prints its bare directory
+name, which attaches to nothing and puts a private-looking name in a public
 post.
 
 Keep private work out with `exclude_repos` before you publish anywhere. A
