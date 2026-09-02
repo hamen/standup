@@ -72,6 +72,22 @@ rescue SystemCallError => e
   ''
 end
 
+# The repository names to keep out of the report.
+#
+# Written as a YAML scalar rather than a list, this would be a String, and
+# String#include? matches a substring: `exclude_repos: api` would silently drop
+# every repository whose name contains "api". A config that hides the wrong
+# work is worse than one that refuses to run, so this refuses.
+def exclude_list(value)
+  return [] if value.nil?
+
+  unless value.is_a?(Array) && value.all?(String)
+    raise "exclude_repos must be a list of repository directory names, one per line"
+  end
+
+  value
+end
+
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
   repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
@@ -239,12 +255,9 @@ if __FILE__ == $0
 
   repos = find_git_repos(projects_root, verbose: options[:verbose])
 
-  # A standup can end up somewhere public, and not every repository under the
-  # projects root is meant to be named there. exclude_repos is the list that
-  # stays out of the report. It is deliberately a list of what to hide rather
-  # than a list of what to show: a repository added next month appears on its
-  # own, and hiding one is a thing you decide, not a thing you forget.
-  excluded = cfg['exclude_repos'] || []
+  # Repositories a published standup must not name. A list of what to hide,
+  # not of what to show, so a new repository appears on its own.
+  excluded = exclude_list(cfg['exclude_repos'])
   repos = repos.reject { |repo| excluded.include?(File.basename(repo)) }
 
   any_activity = false

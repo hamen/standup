@@ -15,5 +15,3 @@ repo_name_mapping:
 exclude_repos:
   - some-client-work
   - unannounced-side-project
-
-
