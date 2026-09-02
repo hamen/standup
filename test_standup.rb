@@ -228,15 +228,9 @@ Dir.mktmpdir do |root|
   # repo_name_mapping renames a repository. It must not decide which ones are
   # scanned: a repository missing from the map is still a repository worked in.
   #
-  # exclude_repos is the one that decides. A published standup must not name
-  # what it lists, and must still name everything else.
+  # A config with no exclude_repos at all still reports everything.
   config = File.join(root, 'standup.yml')
-  File.write(config, <<~YAML)
-    repo_name_mapping:
-      quiet-repo: "#quiet"
-    exclude_repos:
-      - shell-repo
-  YAML
+  File.write(config, "repo_name_mapping:\n  quiet-repo: \"#quiet\"\n")
   mapped, = Open3.capture2e({ 'HOME' => fake_home },
                             'ruby', SCRIPT, '--projects-root', root, '--config', config)
 
@@ -244,18 +238,48 @@ Dir.mktmpdir do |root|
     mapped.include?('demo-repo')
   failures << 'repo_name_mapping did not rename the repository it names' unless
     mapped.include?('#quiet')
-  failures << 'an excluded repository was named in the report' if
-    mapped.include?('shell-repo')
-  failures << 'an excluded repository still reported its commits' if
+  failures << 'a config with no exclude_repos dropped a repository' unless
     mapped.include?('the shell-name commit')
+
+  # exclude_repos is what decides. A published standup must not name what it
+  # lists, and must still name everything else. It matches the directory name,
+  # not the display name repo_name_mapping gives it — otherwise renaming a
+  # project would quietly un-hide it.
+  excluding = File.join(root, 'excluding.yml')
+  File.write(excluding, <<~YAML)
+    repo_name_mapping:
+      shell-repo: "#renamed"
+    exclude_repos:
+      - shell-repo
+  YAML
+  hidden, = Open3.capture2e({ 'HOME' => fake_home },
+                            'ruby', SCRIPT, '--projects-root', root, '--config', excluding)
+
+  failures << 'an excluded repository was named in the report' if
+    hidden.include?('shell-repo') || hidden.include?('#renamed')
+  failures << 'an excluded repository still reported its commits' if
+    hidden.include?('the shell-name commit')
   failures << 'excluding one repository dropped the others' unless
-    mapped.include?('the regex-name commit')
+    hidden.include?('the regex-name commit')
+
+  # A scalar instead of a list would make the check a substring match, which
+  # hides repositories nobody asked to hide. It has to refuse, not guess.
+  scalar = File.join(root, 'scalar.yml')
+  File.write(scalar, "exclude_repos: repo\n")
+  scalar_out, scalar_status = Open3.capture2e({ 'HOME' => fake_home },
+                                              'ruby', SCRIPT, '--projects-root', root,
+                                              '--config', scalar)
+
+  failures << 'exclude_repos written as a scalar was accepted' if scalar_status.success?
+  failures << 'the scalar exclude_repos error does not say what is wrong' unless
+    scalar_out.include?('exclude_repos must be a list')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else
     warn "--- standup output ---\n#{output}--- stderr ---\n#{errors}" \
-         "--- with a config ---\n#{mapped}----------------------"
+         "--- with a config ---\n#{mapped}--- excluding one ---\n#{hidden}" \
+         "--- with a scalar ---\n#{scalar_out}----------------------"
     failures.each { |f| warn "FAIL: #{f}" }
     exit 1
   end
