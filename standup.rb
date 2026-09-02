@@ -59,10 +59,16 @@ end
 # shell. That matters because one of the arguments is `git config user.name`,
 # and a name holding $(...) or a backtick used to run as a command.
 def git_capture(repo_path, *args)
-  out, _err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
-  status.success? ? out : ''
+  out, err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
+  return out if status.success?
+
+  # A missing config key exits non-zero and says nothing, which is a normal
+  # answer. Anything git does complain about is worth seeing, because the
+  # alternative is a broken repository that quietly reports an empty day.
+  warn "git #{args.first} failed in #{repo_path}: #{err.lines.first&.strip}" unless err.strip.empty?
+  ''
 rescue SystemCallError => e
-  puts "Error running git in #{repo_path}: #{e.message}"
+  warn "Error running git in #{repo_path}: #{e.message}"
   ''
 end
 
