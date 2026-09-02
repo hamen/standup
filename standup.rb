@@ -81,7 +81,7 @@ end
 def exclude_list(value)
   return [] if value.nil?
 
-  unless value.is_a?(Array) && value.all?(String)
+  unless value.is_a?(Array) && value.all? { |name| name.is_a?(String) && !name.strip.empty? }
     abort 'exclude_repos must be a list of repository directory names'
   end
 

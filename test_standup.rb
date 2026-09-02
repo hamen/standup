@@ -278,10 +278,34 @@ Dir.mktmpdir do |root|
   # non-string into the same include? check the scalar case exists to stop.
   mixed = File.join(root, 'mixed.yml')
   File.write(mixed, "exclude_repos:\n  - shell-repo\n  - 42\n")
-  _, mixed_status = Open3.capture2e({ 'HOME' => fake_home },
-                                    'ruby', SCRIPT, '--projects-root', root, '--config', mixed)
+  mixed_out, mixed_status = Open3.capture2e({ 'HOME' => fake_home },
+                                            'ruby', SCRIPT, '--projects-root', root, '--config', mixed)
 
   failures << 'exclude_repos holding a non-string entry was accepted' if mixed_status.success?
+  failures << 'the non-string exclude_repos error does not say what is wrong' unless
+    mixed_out.include?('exclude_repos must be a list')
+
+  # An empty entry is not a repository name, and it would otherwise reach the
+  # unmatched warning as "exclude_repos names , which is not a repository".
+  blank = File.join(root, 'blank.yml')
+  File.write(blank, "exclude_repos:\n  - \"\"\n")
+  blank_out, blank_status = Open3.capture2e({ 'HOME' => fake_home },
+                                            'ruby', SCRIPT, '--projects-root', root, '--config', blank)
+
+  failures << 'an empty exclude_repos entry was accepted' if blank_status.success?
+  failures << 'the empty exclude_repos entry error does not say what is wrong' unless
+    blank_out.include?('exclude_repos must be a list')
+
+  # An empty list is a real answer: exclude nothing. Strict validation must not
+  # start rejecting the configs it was written to allow.
+  empty = File.join(root, 'empty.yml')
+  File.write(empty, "exclude_repos: []\n")
+  emptied, empty_status = Open3.capture2e({ 'HOME' => fake_home },
+                                          'ruby', SCRIPT, '--projects-root', root, '--config', empty)
+
+  failures << 'an empty exclude_repos list was rejected' unless empty_status.success?
+  failures << 'an empty exclude_repos list dropped a repository' unless
+    emptied.include?('the shell-name commit')
 
   # The match is on the whole directory name. "repo" must not take out
   # "shell-repo", or the substring trap is back through a valid list.
@@ -295,12 +319,25 @@ Dir.mktmpdir do |root|
   failures << 'an exclude_repos entry that matches nothing was passed over in silence' unless
     partial.include?('not a repository in')
 
+  # Excluding everything with work is the end state of a long enough list. The
+  # report has to reach its no-activity line rather than crash or print husks.
+  everything = File.join(root, 'everything.yml')
+  File.write(everything, "exclude_repos:\n#{report_blocks(output).keys.map { |n| "  - #{n}\n" }.join}")
+  silent, silent_status = Open3.capture2e({ 'HOME' => fake_home },
+                                          'ruby', SCRIPT, '--projects-root', root, '--config', everything)
+
+  failures << 'excluding every active repository did not exit cleanly' unless silent_status.success?
+  failures << 'excluding every active repository did not report a quiet day' unless
+    silent.include?('No activity found')
+
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else
     warn "--- standup output ---\n#{output}--- stderr ---\n#{errors}" \
          "--- with a config ---\n#{mapped}--- excluding one ---\n#{hidden}" \
-         "--- with a scalar ---\n#{scalar_out}----------------------"
+         "--- with a scalar ---\n#{scalar_out}--- with a non-string ---\n#{mixed_out}" \
+         "--- with a blank entry ---\n#{blank_out}--- with an empty list ---\n#{emptied}--- excluding a substring ---\n#{partial}" \
+         "--- excluding everything ---\n#{silent}----------------------"
     failures.each { |f| warn "FAIL: #{f}" }
     exit 1
   end
