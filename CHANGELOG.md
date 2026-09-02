@@ -29,8 +29,10 @@ and fixed.
 - **`--author` was read as a regular expression.** A name holding `[` matched a
   character class and found nothing. Matching is literal now.
 - **A repository with no `user.name` reported everyone else's work as yours.**
-  An empty `--author=` is not a narrow filter; it matches every commit. Such a
-  repository is now skipped.
+  An empty `--author=` is not a narrow filter; it matches every commit. The
+  commits of such a repository, and the `llm-context.md` change detection that
+  uses the same filter, are now left out. Dated `llm-context.md` entries are
+  still reported from the checkout, since they carry no author to filter on.
 - **A failing `git` became a quiet empty day.** Errors were discarded. A git
   that has something to say now says it on stderr.
 
