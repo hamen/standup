@@ -66,13 +66,14 @@ def get_commits(repo_path, target_date)
     author = `git config user.name`.strip
     
     # Git log command for the target date.
-    # --all, because the day's work often sits on a feature branch, or in a
-    # separate worktree, and the checkout the script runs in stays behind.
+    # --branches --remotes, because the day's work often sits on a feature
+    # branch, or in another worktree, and the checkout this runs in stays
+    # behind. Not --all: that also walks refs/stash, and one stash made that
+    # day puts "index on main: ..." in the report.
     # --no-merges, because "Merge pull request #12" is not a standup line.
     date_str = target_date.to_s
-    cmd = "git log --all --no-merges --since=\"#{date_str} 00:00:00\" --until=\"#{date_str} 23:59:59\" --author=\"#{author}\" --pretty=format:\"%s\" 2>/dev/null"
-    # uniq, because --all sees a rebased branch and its old copy as two commits
-    commits = `#{cmd}`.split("\n").reject(&:empty?).uniq
+    cmd = "git log --branches --remotes --no-merges --since=\"#{date_str} 00:00:00\" --until=\"#{date_str} 23:59:59\" --author=\"#{author}\" --pretty=format:\"%s\" 2>/dev/null"
+    commits = `#{cmd}`.split("\n").reject(&:empty?)
     commits
   end
 rescue => e
@@ -87,12 +88,15 @@ def get_llm_context_entries(repo_path, target_date)
   entries = []
   date_str = target_date.strftime('%Y-%m-%d')
   
-  # Check if file was modified on target date
+  # Check if the file was touched on the target date, on any branch. The
+  # entries below still come from the checked-out copy, so a branch-only entry
+  # reports as "llm-context.md was updated" rather than by name. That over-
+  # reports; the alternative is to stay silent about a day's work.
   was_modified = false
   Dir.chdir(repo_path) do
     author = `git config user.name`.strip
     date_str_full = target_date.to_s
-    cmd = "git log --all --no-merges --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
+    cmd = "git log --branches --remotes --no-merges --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
     was_modified = !`#{cmd}`.strip.empty?
   end
   
