@@ -76,16 +76,19 @@ standup --help
 
 ## Configuration
 
-Configuration is optional. With no config, `standup` looks in `~/code`, then
+Configuration is optional. With none at all, `standup` looks in `~/code`, then
 `~/projects`.
 
-It reads the first of these that exists:
+**Which file it reads.** With `--config PATH`, that file and nothing else — if
+it is not there, `standup` runs with no configuration rather than falling back.
+Without the flag, the first of `~/.standup.yml` and `./standup.yml` that exists.
 
-1. `--config PATH`
-2. `~/.standup.yml`
-3. `./standup.yml`
-4. `STANDUP_PROJECTS_ROOT` in the environment
-5. the defaults above
+**Where it looks for repositories.** The first of these that is set:
+
+1. `--projects-root PATH`
+2. `projects_root` in the config file
+3. `STANDUP_PROJECTS_ROOT` in the environment
+4. `~/code`, then `~/projects`
 
 ```yaml
 projects_root: /home/you/code
