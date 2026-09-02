@@ -227,6 +227,8 @@ Dir.mktmpdir do |root|
 
   # repo_name_mapping renames a repository. It must not decide which ones are
   # scanned: a repository missing from the map is still a repository worked in.
+  #
+  # A config with no exclude_repos at all still reports everything.
   config = File.join(root, 'standup.yml')
   File.write(config, "repo_name_mapping:\n  quiet-repo: \"#quiet\"\n")
   mapped, = Open3.capture2e({ 'HOME' => fake_home },
@@ -236,12 +238,106 @@ Dir.mktmpdir do |root|
     mapped.include?('demo-repo')
   failures << 'repo_name_mapping did not rename the repository it names' unless
     mapped.include?('#quiet')
+  failures << 'a config with no exclude_repos dropped a repository' unless
+    mapped.include?('the shell-name commit')
+
+  # exclude_repos is what decides. A published standup must not name what it
+  # lists, and must still name everything else. It matches the directory name,
+  # not the display name repo_name_mapping gives it — otherwise renaming a
+  # project would quietly un-hide it.
+  excluding = File.join(root, 'excluding.yml')
+  File.write(excluding, <<~YAML)
+    repo_name_mapping:
+      shell-repo: "#renamed"
+    exclude_repos:
+      - shell-repo
+  YAML
+  hidden, = Open3.capture2e({ 'HOME' => fake_home },
+                            'ruby', SCRIPT, '--projects-root', root, '--config', excluding)
+
+  failures << 'an excluded repository was named in the report' if
+    hidden.include?('shell-repo') || hidden.include?('#renamed')
+  failures << 'an excluded repository still reported its commits' if
+    hidden.include?('the shell-name commit')
+  failures << 'excluding one repository dropped the others' unless
+    hidden.include?('the regex-name commit')
+
+  # A scalar instead of a list would make the check a substring match, which
+  # hides repositories nobody asked to hide. It has to refuse, not guess.
+  scalar = File.join(root, 'scalar.yml')
+  File.write(scalar, "exclude_repos: repo\n")
+  scalar_out, scalar_status = Open3.capture2e({ 'HOME' => fake_home },
+                                              'ruby', SCRIPT, '--projects-root', root,
+                                              '--config', scalar)
+
+  failures << 'exclude_repos written as a scalar was accepted' if scalar_status.success?
+  failures << 'the scalar exclude_repos error does not say what is wrong' unless
+    scalar_out.include?('exclude_repos must be a list')
+
+  # A list is not enough on its own: one entry that is not a string puts a
+  # non-string into the same include? check the scalar case exists to stop.
+  mixed = File.join(root, 'mixed.yml')
+  File.write(mixed, "exclude_repos:\n  - shell-repo\n  - 42\n")
+  mixed_out, mixed_status = Open3.capture2e({ 'HOME' => fake_home },
+                                            'ruby', SCRIPT, '--projects-root', root, '--config', mixed)
+
+  failures << 'exclude_repos holding a non-string entry was accepted' if mixed_status.success?
+  failures << 'the non-string exclude_repos error does not say what is wrong' unless
+    mixed_out.include?('exclude_repos must be a list')
+
+  # An empty entry is not a repository name, and it would otherwise reach the
+  # unmatched warning as "exclude_repos names , which is not a repository".
+  blank = File.join(root, 'blank.yml')
+  File.write(blank, "exclude_repos:\n  - \"\"\n")
+  blank_out, blank_status = Open3.capture2e({ 'HOME' => fake_home },
+                                            'ruby', SCRIPT, '--projects-root', root, '--config', blank)
+
+  failures << 'an empty exclude_repos entry was accepted' if blank_status.success?
+  failures << 'the empty exclude_repos entry error does not say what is wrong' unless
+    blank_out.include?('exclude_repos must be a list')
+
+  # An empty list is a real answer: exclude nothing. Strict validation must not
+  # start rejecting the configs it was written to allow.
+  empty = File.join(root, 'empty.yml')
+  File.write(empty, "exclude_repos: []\n")
+  emptied, empty_status = Open3.capture2e({ 'HOME' => fake_home },
+                                          'ruby', SCRIPT, '--projects-root', root, '--config', empty)
+
+  failures << 'an empty exclude_repos list was rejected' unless empty_status.success?
+  failures << 'an empty exclude_repos list dropped a repository' unless
+    emptied.include?('the shell-name commit')
+
+  # The match is on the whole directory name. "repo" must not take out
+  # "shell-repo", or the substring trap is back through a valid list.
+  substring = File.join(root, 'substring.yml')
+  File.write(substring, "exclude_repos:\n  - repo\n")
+  partial, = Open3.capture2e({ 'HOME' => fake_home },
+                             'ruby', SCRIPT, '--projects-root', root, '--config', substring)
+
+  failures << 'an exclude_repos entry matched a repository name as a substring' unless
+    partial.include?('the shell-name commit') && partial.include?('the regex-name commit')
+  failures << 'an exclude_repos entry that matches nothing was passed over in silence' unless
+    partial.include?('not a repository in')
+
+  # Excluding everything with work is the end state of a long enough list. The
+  # report has to reach its no-activity line rather than crash or print husks.
+  everything = File.join(root, 'everything.yml')
+  File.write(everything, "exclude_repos:\n#{report_blocks(output).keys.map { |n| "  - #{n}\n" }.join}")
+  silent, silent_status = Open3.capture2e({ 'HOME' => fake_home },
+                                          'ruby', SCRIPT, '--projects-root', root, '--config', everything)
+
+  failures << 'excluding every active repository did not exit cleanly' unless silent_status.success?
+  failures << 'excluding every active repository did not report a quiet day' unless
+    silent.include?('No activity found')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else
     warn "--- standup output ---\n#{output}--- stderr ---\n#{errors}" \
-         "--- with a config ---\n#{mapped}----------------------"
+         "--- with a config ---\n#{mapped}--- excluding one ---\n#{hidden}" \
+         "--- with a scalar ---\n#{scalar_out}--- with a non-string ---\n#{mixed_out}" \
+         "--- with a blank entry ---\n#{blank_out}--- with an empty list ---\n#{emptied}--- excluding a substring ---\n#{partial}" \
+         "--- excluding everything ---\n#{silent}----------------------"
     failures.each { |f| warn "FAIL: #{f}" }
     exit 1
   end
