@@ -110,6 +110,32 @@ def build_unidentified_repo(path, subject, name: '')
   end
 end
 
+# A repository whose branch points at an object that is not there. git log
+# fails with something on stderr, which must be said rather than swallowed
+# into an empty day.
+def build_broken_repo(path)
+  FileUtils.mkdir_p(path)
+  Dir.chdir(path) do
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test User')
+    git('config', 'user.email', 'test@example.com')
+    git('config', 'commit.gpgsign', 'false')
+    commit('a commit that will be unreachable', YESTERDAY)
+    File.write(File.join('.git', 'refs', 'heads', 'main'), "#{'0' * 40}\n")
+  end
+end
+
+# A repository with no commits at all. git log over its refs finds an empty
+# set, which is not a failure, so this one must pass in silence.
+def build_unborn_repo(path)
+  FileUtils.mkdir_p(path)
+  Dir.chdir(path) do
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', 'Test User')
+    git('config', 'user.email', 'test@example.com')
+  end
+end
+
 # The report is blocks separated by blank lines, each headed by the repository
 # name. Splitting it that way lets an assertion name the repository it means.
 def report_blocks(stdout)
@@ -150,13 +176,15 @@ Dir.mktmpdir do |root|
                       'Regex [Meta] User', 'the regex-name commit')
   build_unidentified_repo(File.join(root, 'empty-name-repo'), 'the empty-name commit')
   build_unidentified_repo(File.join(root, 'no-name-repo'), 'the absent-name commit', name: nil)
+  build_broken_repo(File.join(root, 'broken-repo'))
+  build_unborn_repo(File.join(root, 'unborn-repo'))
 
   # A home of its own, so the machine's global user.name cannot stand in for
   # the one no-name-repo deliberately lacks. Every fixture sets its own.
   fake_home = File.join(root, 'fake-home')
   FileUtils.mkdir_p(fake_home)
-  output, = Open3.capture2e({ 'HOME' => fake_home },
-                            'ruby', SCRIPT, '--projects-root', root)
+  output, errors, = Open3.capture3({ 'HOME' => fake_home },
+                                   'ruby', SCRIPT, '--projects-root', root)
   blocks = report_blocks(output)
 
   failures = []
@@ -167,9 +195,20 @@ Dir.mktmpdir do |root|
   failures << 'the commit of a user whose name holds regex characters is missing' unless
     output.include?('the regex-name commit')
   %w[shell-repo regex-repo].each do |repo|
+    unless blocks.key?(repo)
+      failures << "#{repo} is missing from the report entirely"
+      next
+    end
+
     failures << "the llm-context.md query did not run for #{repo}" unless
-      blocks[repo].to_a.any? { |line| line.include?('llm-context.md was updated') }
+      blocks[repo].any? { |line| line.include?('llm-context.md was updated') }
   end
+  failures << 'a repository whose git log fails was passed over in silence' unless
+    errors.include?('broken-repo')
+  failures << 'a git failure was written into the report instead of stderr' if
+    output.include?('bad object')
+  failures << 'a repository with no commits was reported as broken' if
+    errors.include?('unborn-repo')
   failures << 'a repository whose user.name is empty reported somebody else\'s commit' if
     output.include?('the empty-name commit')
   failures << 'a repository with no user.name at all reported somebody else\'s commit' if
@@ -201,7 +240,8 @@ Dir.mktmpdir do |root|
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else
-    warn "--- standup output ---\n#{output}--- with a config ---\n#{mapped}----------------------"
+    warn "--- standup output ---\n#{output}--- stderr ---\n#{errors}" \
+         "--- with a config ---\n#{mapped}----------------------"
     failures.each { |f| warn "FAIL: #{f}" }
     exit 1
   end
