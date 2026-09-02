@@ -182,6 +182,11 @@ def show_help
       projects_root: /path/to/projects
       repo_name_mapping:
         repo_dir_name: "#display_name"
+      exclude_repos:
+        - repo_dir_name
+
+    Every repository under the projects root is reported unless exclude_repos
+    names it. Use that for the ones a published standup should not mention.
 
     The script scans all Git repositories under the projects root and:
     - Lists all commits from the target date
@@ -233,6 +238,14 @@ if __FILE__ == $0
   date_label = options[:today] ? "Today" : "Yesterday"
 
   repos = find_git_repos(projects_root, verbose: options[:verbose])
+
+  # A standup can end up somewhere public, and not every repository under the
+  # projects root is meant to be named there. exclude_repos is the list that
+  # stays out of the report. It is deliberately a list of what to hide rather
+  # than a list of what to show: a repository added next month appears on its
+  # own, and hiding one is a thing you decide, not a thing you forget.
+  excluded = cfg['exclude_repos'] || []
+  repos = repos.reject { |repo| excluded.include?(File.basename(repo)) }
 
   any_activity = false
 

@@ -227,8 +227,16 @@ Dir.mktmpdir do |root|
 
   # repo_name_mapping renames a repository. It must not decide which ones are
   # scanned: a repository missing from the map is still a repository worked in.
+  #
+  # exclude_repos is the one that decides. A published standup must not name
+  # what it lists, and must still name everything else.
   config = File.join(root, 'standup.yml')
-  File.write(config, "repo_name_mapping:\n  quiet-repo: \"#quiet\"\n")
+  File.write(config, <<~YAML)
+    repo_name_mapping:
+      quiet-repo: "#quiet"
+    exclude_repos:
+      - shell-repo
+  YAML
   mapped, = Open3.capture2e({ 'HOME' => fake_home },
                             'ruby', SCRIPT, '--projects-root', root, '--config', config)
 
@@ -236,6 +244,12 @@ Dir.mktmpdir do |root|
     mapped.include?('demo-repo')
   failures << 'repo_name_mapping did not rename the repository it names' unless
     mapped.include?('#quiet')
+  failures << 'an excluded repository was named in the report' if
+    mapped.include?('shell-repo')
+  failures << 'an excluded repository still reported its commits' if
+    mapped.include?('the shell-name commit')
+  failures << 'excluding one repository dropped the others' unless
+    mapped.include?('the regex-name commit')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
