@@ -76,6 +76,32 @@ def build_odd_name_repo(path, name, marker)
     git('config', 'user.email', 'test@example.com')
     git('config', 'commit.gpgsign', 'false')
     commit(marker, YESTERDAY)
+
+    # The same hostile name has to reach the llm-context.md query too. Putting
+    # the file on a branch keeps it out of the checkout, so the only way it can
+    # be reported is through that query.
+    git('checkout', '-q', '-b', 'notes')
+    commit('add notes', YESTERDAY, file: 'llm-context.md',
+           content: "#### #{YESTERDAY} - notes\n")
+    git('checkout', '-q', 'main')
+  end
+end
+
+# A repository with no user.name. An empty --author= matches every commit, so
+# this one's commit belongs to somebody else and must not be reported.
+def build_unidentified_repo(path)
+  FileUtils.mkdir_p(path)
+  Dir.chdir(path) do
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', '')
+    git('config', 'user.email', 'test@example.com')
+    git('config', 'commit.gpgsign', 'false')
+    stamp = "#{YESTERDAY} 12:00:00 +0000"
+    File.write('file.txt', "someone else\n")
+    git('add', 'file.txt')
+    ENV['GIT_COMMITTER_DATE'] = stamp
+    git('-c', 'user.name=Someone Else', 'commit', '-m', 'not my commit', '--date', stamp)
+    ENV.delete('GIT_COMMITTER_DATE')
   end
 end
 
@@ -106,6 +132,7 @@ Dir.mktmpdir do |root|
   # where "(" is already literal but "[Meta]" is a character class.
   build_odd_name_repo(File.join(root, 'regex-repo'),
                       'Regex [Meta] User', 'the regex-name commit')
+  build_unidentified_repo(File.join(root, 'unidentified-repo'))
 
   output = `ruby #{Shellwords.escape(SCRIPT)} --projects-root #{Shellwords.escape(root)} 2>&1`
 
@@ -116,6 +143,10 @@ Dir.mktmpdir do |root|
     output.include?('the shell-name commit')
   failures << 'the commit of a user whose name holds regex characters is missing' unless
     output.include?('the regex-name commit')
+  failures << 'the llm-context.md query did not run for the hostile names' unless
+    output.scan('llm-context.md was updated').size >= 3
+  failures << 'a repository with no user.name reported somebody else\'s commit' if
+    output.include?('not my commit')
   failures << 'reported no activity' if output.include?('No activity found')
   failures << 'a date-stamped llm-context.md entry was not listed by name' unless
     output.include?('the entry that must be named')

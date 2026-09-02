@@ -82,8 +82,14 @@ end
 # --no-merges, because "Merge pull request #12" is not a standup line.
 # --fixed-strings, because --author is otherwise a regular expression, and a
 # name holding "(" is then either an error or a wrong match.
+#
+# Returns nil when the repository has no user.name configured. An empty
+# --author= matches every commit, so such a repository would report everyone
+# else's day as yours.
 def day_log_args(repo_path, target_date)
   author = git_capture(repo_path, 'config', 'user.name').strip
+  return nil if author.empty?
+
   date_str = target_date.to_s
   ['log', '--branches', '--remotes', '--no-merges', '--fixed-strings',
    "--since=#{date_str} 00:00:00", "--until=#{date_str} 23:59:59",
@@ -91,8 +97,10 @@ def day_log_args(repo_path, target_date)
 end
 
 def get_commits(repo_path, target_date)
-  args = day_log_args(repo_path, target_date) + ['--pretty=format:%s']
-  git_capture(repo_path, *args).split("\n").reject(&:empty?)
+  args = day_log_args(repo_path, target_date)
+  return [] unless args
+
+  git_capture(repo_path, *(args + ['--pretty=format:%s'])).split("\n").reject(&:empty?)
 end
 
 def get_llm_context_entries(repo_path, target_date)
@@ -102,9 +110,14 @@ def get_llm_context_entries(repo_path, target_date)
   # Was the file touched on the target date, on any branch? This runs before
   # the checkout is looked at, so a file that only exists on a feature branch
   # still counts as work.
-  args = day_log_args(repo_path, target_date) +
-         ['--name-only', '--pretty=format:', '--', 'llm-context.md']
-  was_modified = !git_capture(repo_path, *args).strip.empty?
+  args = day_log_args(repo_path, target_date)
+  was_modified =
+    if args
+      log = git_capture(repo_path, *(args + ['--name-only', '--pretty=format:', '--', 'llm-context.md']))
+      !log.strip.empty?
+    else
+      false
+    end
 
   # The entries themselves come from the checked-out copy, so a branch-only
   # entry reports as "llm-context.md was updated" rather than by name. That
