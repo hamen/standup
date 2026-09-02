@@ -9,7 +9,7 @@ ENV['TZ'] = 'UTC' # the log window below has no offset, so git reads it as local
 
 require 'date'
 require 'fileutils'
-require 'shellwords'
+require 'open3'
 require 'tmpdir'
 
 SCRIPT = File.expand_path('standup.rb', __dir__)
@@ -87,21 +87,37 @@ def build_odd_name_repo(path, name, marker)
   end
 end
 
-# A repository with no user.name. An empty --author= matches every commit, so
-# this one's commit belongs to somebody else and must not be reported.
-def build_unidentified_repo(path)
+# A repository the standup cannot attribute. An empty --author= matches every
+# commit, so this one's commit belongs to somebody else and must not be
+# reported. `name` nil leaves user.name unset, which is the other route to the
+# same place: git config then exits non-zero instead of printing an empty line.
+def build_unidentified_repo(path, subject, name: '')
   FileUtils.mkdir_p(path)
   Dir.chdir(path) do
     git('init', '-q', '-b', 'main')
-    git('config', 'user.name', '')
+    git('config', 'user.name', name) if name
     git('config', 'user.email', 'test@example.com')
     git('config', 'commit.gpgsign', 'false')
     stamp = "#{YESTERDAY} 12:00:00 +0000"
     File.write('file.txt', "someone else\n")
     git('add', 'file.txt')
-    ENV['GIT_COMMITTER_DATE'] = stamp
-    git('-c', 'user.name=Someone Else', 'commit', '-m', 'not my commit', '--date', stamp)
-    ENV.delete('GIT_COMMITTER_DATE')
+    begin
+      ENV['GIT_COMMITTER_DATE'] = stamp
+      git('-c', 'user.name=Someone Else', 'commit', '-m', subject, '--date', stamp)
+    ensure
+      ENV.delete('GIT_COMMITTER_DATE')
+    end
+  end
+end
+
+# The report is blocks separated by blank lines, each headed by the repository
+# name. Splitting it that way lets an assertion name the repository it means.
+def report_blocks(stdout)
+  stdout.split(/\n{2,}/).each_with_object({}) do |block, acc|
+    lines = block.lines.map(&:chomp).reject(&:empty?)
+    next if lines.empty?
+
+    acc[lines.first] = lines.drop(1)
   end
 end
 
@@ -132,9 +148,16 @@ Dir.mktmpdir do |root|
   # where "(" is already literal but "[Meta]" is a character class.
   build_odd_name_repo(File.join(root, 'regex-repo'),
                       'Regex [Meta] User', 'the regex-name commit')
-  build_unidentified_repo(File.join(root, 'unidentified-repo'))
+  build_unidentified_repo(File.join(root, 'empty-name-repo'), 'the empty-name commit')
+  build_unidentified_repo(File.join(root, 'no-name-repo'), 'the absent-name commit', name: nil)
 
-  output = `ruby #{Shellwords.escape(SCRIPT)} --projects-root #{Shellwords.escape(root)} 2>&1`
+  # A home of its own, so the machine's global user.name cannot stand in for
+  # the one no-name-repo deliberately lacks. Every fixture sets its own.
+  fake_home = File.join(root, 'fake-home')
+  FileUtils.mkdir_p(fake_home)
+  output, = Open3.capture2e({ 'HOME' => fake_home },
+                            'ruby', SCRIPT, '--projects-root', root)
+  blocks = report_blocks(output)
 
   failures = []
   failures << 'a user.name holding $(...) was executed as a command' if
@@ -143,10 +166,14 @@ Dir.mktmpdir do |root|
     output.include?('the shell-name commit')
   failures << 'the commit of a user whose name holds regex characters is missing' unless
     output.include?('the regex-name commit')
-  failures << 'the llm-context.md query did not run for the hostile names' unless
-    output.scan('llm-context.md was updated').size >= 3
-  failures << 'a repository with no user.name reported somebody else\'s commit' if
-    output.include?('not my commit')
+  %w[shell-repo regex-repo].each do |repo|
+    failures << "the llm-context.md query did not run for #{repo}" unless
+      blocks[repo].to_a.any? { |line| line.include?('llm-context.md was updated') }
+  end
+  failures << 'a repository whose user.name is empty reported somebody else\'s commit' if
+    output.include?('the empty-name commit')
+  failures << 'a repository with no user.name at all reported somebody else\'s commit' if
+    output.include?('the absent-name commit')
   failures << 'reported no activity' if output.include?('No activity found')
   failures << 'a date-stamped llm-context.md entry was not listed by name' unless
     output.include?('the entry that must be named')
@@ -163,7 +190,8 @@ Dir.mktmpdir do |root|
   # scanned: a repository missing from the map is still a repository worked in.
   config = File.join(root, 'standup.yml')
   File.write(config, "repo_name_mapping:\n  quiet-repo: \"#quiet\"\n")
-  mapped = `ruby #{Shellwords.escape(SCRIPT)} --projects-root #{Shellwords.escape(root)} --config #{Shellwords.escape(config)} 2>&1`
+  mapped, = Open3.capture2e({ 'HOME' => fake_home },
+                            'ruby', SCRIPT, '--projects-root', root, '--config', config)
 
   failures << 'a repository missing from repo_name_mapping was filtered out' unless
     mapped.include?('demo-repo')
