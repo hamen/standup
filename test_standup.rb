@@ -65,6 +65,20 @@ def build_repo(path)
   end
 end
 
+# A repository whose configured user.name is hostile to a shell, and to a
+# regular expression. git log used to be assembled as a shell string, so the
+# $(...) ran; --author is a regex, so the parentheses matched nothing.
+def build_odd_name_repo(path, name, marker)
+  FileUtils.mkdir_p(path)
+  Dir.chdir(path) do
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.name', name)
+    git('config', 'user.email', 'test@example.com')
+    git('config', 'commit.gpgsign', 'false')
+    commit(marker, YESTERDAY)
+  end
+end
+
 def build_quiet_repo(path)
   FileUtils.mkdir_p(path)
   Dir.chdir(path) do
@@ -84,9 +98,24 @@ end
 Dir.mktmpdir do |root|
   build_repo(File.join(root, 'demo-repo'))
   build_quiet_repo(File.join(root, 'quiet-repo'))
+
+  canary = File.join(root, 'the-injection-ran')
+  build_odd_name_repo(File.join(root, 'shell-repo'),
+                      "Shell $(touch #{canary}) User", 'the shell-name commit')
+  # Brackets, not parentheses: git's --author is a basic regular expression,
+  # where "(" is already literal but "[Meta]" is a character class.
+  build_odd_name_repo(File.join(root, 'regex-repo'),
+                      'Regex [Meta] User', 'the regex-name commit')
+
   output = `ruby #{Shellwords.escape(SCRIPT)} --projects-root #{Shellwords.escape(root)} 2>&1`
 
   failures = []
+  failures << 'a user.name holding $(...) was executed as a command' if
+    File.exist?(canary)
+  failures << 'the commit of a user whose name holds $(...) is missing' unless
+    output.include?('the shell-name commit')
+  failures << 'the commit of a user whose name holds regex characters is missing' unless
+    output.include?('the regex-name commit')
   failures << 'reported no activity' if output.include?('No activity found')
   failures << 'a date-stamped llm-context.md entry was not listed by name' unless
     output.include?('the entry that must be named')
