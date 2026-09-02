@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 require 'date'
+require 'open3'
 require 'yaml'
 require 'optparse'
 
@@ -52,6 +53,19 @@ def repo_display_name(repo_basename, repo_name_mapping)
   (repo_name_mapping && repo_name_mapping[repo_basename]) || repo_basename
 end
 
+# Run git in a repository and return its stdout, or "" if it failed.
+#
+# Every argument goes to git as one argv entry, so nothing here reaches a
+# shell. That matters because one of the arguments is `git config user.name`,
+# and a name holding $(...) or a backtick used to run as a command.
+def git_capture(repo_path, *args)
+  out, _err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
+  status.success? ? out : ''
+rescue SystemCallError => e
+  puts "Error running git in #{repo_path}: #{e.message}"
+  ''
+end
+
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
   repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
@@ -59,26 +73,26 @@ def find_git_repos(root, verbose: false)
   repos
 end
 
+# The refs and the window one day's work is looked for in.
+#
+# --branches --remotes, because the day's work often sits on a feature branch,
+# or in another worktree, and the checkout this runs in stays behind. Not
+# --all: that also walks refs/stash, and one stash made that day puts
+# "index on main: ..." in the report.
+# --no-merges, because "Merge pull request #12" is not a standup line.
+# --fixed-strings, because --author is otherwise a regular expression, and a
+# name holding "(" is then either an error or a wrong match.
+def day_log_args(repo_path, target_date)
+  author = git_capture(repo_path, 'config', 'user.name').strip
+  date_str = target_date.to_s
+  ['log', '--branches', '--remotes', '--no-merges', '--fixed-strings',
+   "--since=#{date_str} 00:00:00", "--until=#{date_str} 23:59:59",
+   "--author=#{author}"]
+end
+
 def get_commits(repo_path, target_date)
-  # Change directory to the repo
-  Dir.chdir(repo_path) do
-    # Get current git user name if not provided
-    author = `git config user.name`.strip
-    
-    # Git log command for the target date.
-    # --branches --remotes, because the day's work often sits on a feature
-    # branch, or in another worktree, and the checkout this runs in stays
-    # behind. Not --all: that also walks refs/stash, and one stash made that
-    # day puts "index on main: ..." in the report.
-    # --no-merges, because "Merge pull request #12" is not a standup line.
-    date_str = target_date.to_s
-    cmd = "git log --branches --remotes --no-merges --since=\"#{date_str} 00:00:00\" --until=\"#{date_str} 23:59:59\" --author=\"#{author}\" --pretty=format:\"%s\" 2>/dev/null"
-    commits = `#{cmd}`.split("\n").reject(&:empty?)
-    commits
-  end
-rescue => e
-  puts "Error processing #{repo_path}: #{e.message}"
-  []
+  args = day_log_args(repo_path, target_date) + ['--pretty=format:%s']
+  git_capture(repo_path, *args).split("\n").reject(&:empty?)
 end
 
 def get_llm_context_entries(repo_path, target_date)
@@ -88,13 +102,9 @@ def get_llm_context_entries(repo_path, target_date)
   # Was the file touched on the target date, on any branch? This runs before
   # the checkout is looked at, so a file that only exists on a feature branch
   # still counts as work.
-  was_modified = false
-  Dir.chdir(repo_path) do
-    author = `git config user.name`.strip
-    date_str_full = target_date.to_s
-    cmd = "git log --branches --remotes --no-merges --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
-    was_modified = !`#{cmd}`.strip.empty?
-  end
+  args = day_log_args(repo_path, target_date) +
+         ['--name-only', '--pretty=format:', '--', 'llm-context.md']
+  was_modified = !git_capture(repo_path, *args).strip.empty?
 
   # The entries themselves come from the checked-out copy, so a branch-only
   # entry reports as "llm-context.md was updated" rather than by name. That
