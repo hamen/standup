@@ -37,18 +37,24 @@ def build_repo(path)
     git('config', 'commit.gpgsign', 'false')
     commit('base commit', Date.today - 10)
 
-    # Yesterday's work sits on a branch that main is then merged with, and main
-    # is left behind — the way a main checkout is left behind while the work
-    # happens in a worktree.
+    # Yesterday's work sits on a branch that is never merged into main, and
+    # main stays checked out — the way a main checkout stays behind while the
+    # work happens in a worktree. Nothing here is reachable from HEAD.
     git('checkout', '-q', '-b', 'feature')
     commit('the commit that must show up', YESTERDAY)
+
+    # An llm-context.md that exists only on that branch.
+    File.write('llm-context.md', "#### #{YESTERDAY} - branch-only entry\n")
+    commit('add llm-context on the feature branch', YESTERDAY, file: 'llm-context.md')
     git('checkout', '-q', 'main')
 
-    # A merge whose own commit lands yesterday too. Its subject is noise.
+    # A second branch, carrying a merge whose own commit lands yesterday too.
+    # Its subject is noise, and it must not reach the report.
+    git('checkout', '-q', '-b', 'released')
     ENV['GIT_COMMITTER_DATE'] = "#{YESTERDAY} 13:00:00 +0000"
-    git('-c', 'core.mergeAutoStash=false', 'merge', '--no-ff', '-q',
-        '-m', 'Merge pull request #99 from feature', 'feature')
+    git('merge', '--no-ff', '-q', '-m', 'Merge pull request #99 from feature', 'feature')
     ENV.delete('GIT_COMMITTER_DATE')
+    git('checkout', '-q', 'main')
 
     # An uncommitted change, stashed yesterday. Its stash commits are not work.
     File.write('file.txt', "stashed edit\n")
@@ -72,6 +78,8 @@ Dir.mktmpdir do |root|
     output.include?('Merge pull request')
   failures << 'a stash commit was reported as work' if
     output.match?(/index on |WIP on |untracked files on |must not show up/)
+  failures << 'an llm-context.md that exists only on a branch went unreported' unless
+    output.include?('llm-context.md was updated')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'

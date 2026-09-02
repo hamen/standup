@@ -82,16 +82,12 @@ rescue => e
 end
 
 def get_llm_context_entries(repo_path, target_date)
-  llm_context_path = File.join(repo_path, 'llm-context.md')
-  return { entries: [], modified: false } unless File.exist?(llm_context_path)
-  
   entries = []
   date_str = target_date.strftime('%Y-%m-%d')
-  
-  # Check if the file was touched on the target date, on any branch. The
-  # entries below still come from the checked-out copy, so a branch-only entry
-  # reports as "llm-context.md was updated" rather than by name. That over-
-  # reports; the alternative is to stay silent about a day's work.
+
+  # Was the file touched on the target date, on any branch? This runs before
+  # the checkout is looked at, so a file that only exists on a feature branch
+  # still counts as work.
   was_modified = false
   Dir.chdir(repo_path) do
     author = `git config user.name`.strip
@@ -99,7 +95,13 @@ def get_llm_context_entries(repo_path, target_date)
     cmd = "git log --branches --remotes --no-merges --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
     was_modified = !`#{cmd}`.strip.empty?
   end
-  
+
+  # The entries themselves come from the checked-out copy, so a branch-only
+  # entry reports as "llm-context.md was updated" rather than by name. That
+  # over-reports; the alternative is to say nothing about a day's work.
+  llm_context_path = File.join(repo_path, 'llm-context.md')
+  return { entries: [], modified: was_modified } unless File.exist?(llm_context_path)
+
   # Read the file and look for date-stamped entries
   content = File.read(llm_context_path)
   
