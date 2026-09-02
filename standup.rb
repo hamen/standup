@@ -65,10 +65,14 @@ def get_commits(repo_path, target_date)
     # Get current git user name if not provided
     author = `git config user.name`.strip
     
-    # Git log command for the target date
+    # Git log command for the target date.
+    # --all, because the day's work often sits on a feature branch, or in a
+    # separate worktree, and the checkout the script runs in stays behind.
+    # --no-merges, because "Merge pull request #12" is not a standup line.
     date_str = target_date.to_s
-    cmd = "git log --since=\"#{date_str} 00:00:00\" --until=\"#{date_str} 23:59:59\" --author=\"#{author}\" --pretty=format:\"%s\" 2>/dev/null"
-    commits = `#{cmd}`.split("\n").reject(&:empty?)
+    cmd = "git log --all --no-merges --since=\"#{date_str} 00:00:00\" --until=\"#{date_str} 23:59:59\" --author=\"#{author}\" --pretty=format:\"%s\" 2>/dev/null"
+    # uniq, because --all sees a rebased branch and its old copy as two commits
+    commits = `#{cmd}`.split("\n").reject(&:empty?).uniq
     commits
   end
 rescue => e
@@ -88,7 +92,7 @@ def get_llm_context_entries(repo_path, target_date)
   Dir.chdir(repo_path) do
     author = `git config user.name`.strip
     date_str_full = target_date.to_s
-    cmd = "git log --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
+    cmd = "git log --all --no-merges --since=\"#{date_str_full} 00:00:00\" --until=\"#{date_str_full} 23:59:59\" --author=\"#{author}\" --name-only --pretty=format: -- llm-context.md 2>/dev/null"
     was_modified = !`#{cmd}`.strip.empty?
   end
   
@@ -194,12 +198,6 @@ if __FILE__ == $0
   date_label = options[:today] ? "Today" : "Yesterday"
 
   repos = find_git_repos(projects_root, verbose: options[:verbose])
-
-  # If repo_name_mapping is present, treat it as an allowlist.
-  # This lets you keep your standup focused on repos you actively track.
-  if repo_name_mapping && !repo_name_mapping.empty?
-    repos = repos.select { |repo| repo_name_mapping.key?(File.basename(repo)) }
-  end
 
   any_activity = false
 
