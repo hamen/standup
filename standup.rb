@@ -82,7 +82,7 @@ def exclude_list(value)
   return [] if value.nil?
 
   unless value.is_a?(Array) && value.all?(String)
-    raise "exclude_repos must be a list of repository directory names, one per line"
+    abort 'exclude_repos must be a list of repository directory names'
   end
 
   value
@@ -253,11 +253,21 @@ if __FILE__ == $0
   target_date = options[:today] ? Date.today : Date.today - 1
   date_label = options[:today] ? "Today" : "Yesterday"
 
+  # Repositories a published standup must not name. A list of what to hide,
+  # not of what to show, so a new repository appears on its own. Checked before
+  # anything is scanned, so a bad config fails at once.
+  excluded = exclude_list(cfg['exclude_repos'])
+
   repos = find_git_repos(projects_root, verbose: options[:verbose])
 
-  # Repositories a published standup must not name. A list of what to hide,
-  # not of what to show, so a new repository appears on its own.
-  excluded = exclude_list(cfg['exclude_repos'])
+  # An entry that matches nothing is usually a typo, and a typo here does not
+  # look like a mistake: the repository it was meant to hide is simply reported
+  # as usual. Say so, because that is the direction that leaks.
+  names = repos.map { |repo| File.basename(repo) }
+  (excluded - names).each do |name|
+    warn "exclude_repos names #{name}, which is not a repository in #{projects_root}"
+  end
+
   repos = repos.reject { |repo| excluded.include?(File.basename(repo)) }
 
   any_activity = false
