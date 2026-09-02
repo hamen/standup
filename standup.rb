@@ -52,10 +52,10 @@ def repo_display_name(repo_basename, repo_name_mapping)
   (repo_name_mapping && repo_name_mapping[repo_basename]) || repo_basename
 end
 
-def find_git_repos(root)
-  puts "Scanning #{root} for Git repositories..."
+def find_git_repos(root, verbose: false)
+  puts "Scanning #{root} for Git repositories..." if verbose
   repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
-  puts "Found #{repos.size} repositories."
+  puts "Found #{repos.size} repositories." if verbose
   repos
 end
 
@@ -193,39 +193,41 @@ if __FILE__ == $0
   target_date = options[:today] ? Date.today : Date.today - 1
   date_label = options[:today] ? "Today" : "Yesterday"
 
-  repos = find_git_repos(projects_root)
+  repos = find_git_repos(projects_root, verbose: options[:verbose])
 
-  puts "\n--- Daily Summary for #{date_label} (#{target_date}) ---"
-  
+  # If repo_name_mapping is present, treat it as an allowlist.
+  # This lets you keep your standup focused on repos you actively track.
+  if repo_name_mapping && !repo_name_mapping.empty?
+    repos = repos.select { |repo| repo_name_mapping.key?(File.basename(repo)) }
+  end
+
   any_activity = false
+
   repos.each do |repo|
     commits = get_commits(repo, target_date)
     llm_context = get_llm_context_entries(repo, target_date)
-    
-    # Skip if no commits and no llm-context entries
+
     next if commits.empty? && llm_context[:entries].empty? && !llm_context[:modified]
-    
+
     any_activity = true
     repo_name = File.basename(repo)
     display_name = repo_display_name(repo_name, repo_name_mapping)
-    puts "\n#{display_name}"
-    
-    # Show commits
-    commits.each { |commit| puts "  - #{commit}" } unless commits.empty?
-    
-    # Show llm-context.md entries
+
+    puts "#{display_name}\n"
+
+    commits.each { |commit| puts "• #{commit}" } unless commits.empty?
+
     unless llm_context[:entries].empty?
-      puts "  📝 llm-context.md entries:"
-      llm_context[:entries].each { |entry| puts "    • #{entry}" }
+      llm_context[:entries].each { |entry| puts "• 📝 #{entry}" }
     end
-    
-    # Show if file was modified but no date-stamped entries found
+
     if llm_context[:modified] && llm_context[:entries].empty?
-      puts "  📝 llm-context.md was updated (check for new ADRs or changes)"
+      puts "• 📝 llm-context.md was updated"
     end
+
+    puts
   end
-  
-  puts "\nNo activity found for #{date_label.downcase}." unless any_activity
-  puts "\n--- End of Summary ---\n"
+
+  puts "No activity found for #{date_label.downcase}." unless any_activity
 end
 
