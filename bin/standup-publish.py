@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -236,8 +237,21 @@ def for_x(text, seed):
 
 
 def post_to_x(text, seed):
+    # Every failure has to come back as a value, never as an exception. The
+    # offset file was advanced before this is called, so a raised TimeoutExpired
+    # — or a FileNotFoundError from a BIRD_BIN that points nowhere, which is the
+    # likely one under cron — takes the button press with it and the day cannot
+    # be retried at all.
     text = for_x(text, seed)
-    result = subprocess.run([BIRD, "tweet", text], capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run([BIRD, "tweet", text],
+                                capture_output=True, text=True, timeout=120)
+    except FileNotFoundError:
+        return False, f"bird not found at {BIRD} (set BIRD_BIN)"
+    except subprocess.TimeoutExpired:
+        return False, "bird timed out after 120s; it may or may not have posted"
+    except OSError as e:  # noqa: BLE001 - the reason has to reach the log
+        return False, f"could not run bird: {e}"[:300]
     if result.returncode != 0:
         return False, (result.stderr or result.stdout).strip()[:300]
     return True, (result.stdout or "").strip()[:300]
@@ -308,7 +322,10 @@ def main():
     # attaching. What goes to X is a different text, and approving a text you
     # cannot see is not approving anything: --preview renders it.
     if "--preview" in sys.argv:
-        pending = sys.argv[sys.argv.index("--preview") + 1]
+        try:
+            pending = sys.argv[sys.argv.index("--preview") + 1]
+        except IndexError:
+            die("--preview needs the pending id, e.g. --preview 2026-09-09")
         state = json.loads((STATE_DIR / f"pending-{pending}.json").read_text())
         print(for_x(strip_telegram_markup(state["text"]), pending))
         return
@@ -382,16 +399,25 @@ def main():
             lines.append(f"{'✅' if ok else '❌'} {name} — {detail or 'posted'}")
 
         log(f"[{key}] " + " | ".join(lines))
-        telegram(token, "sendMessage", chat_id=state["chat_id"],
-                 reply_to_message_id=state["message_id"],
-                 text="\n".join(lines))
 
+        # Record what was published BEFORE telling anyone about it.
+        #
+        # The other order looks harmless and is not: telegram() calls die() on a
+        # failed response, and the offset file was already advanced above, so a
+        # Telegram hiccup between the tweet and the status reply loses the whole
+        # record of the press. The next press then reposts to X. A duplicate on
+        # a public timeline is not something an apology undoes, and it would be
+        # caused by the one network call whose only job is to say what happened.
         if state.get("posted_x") and state.get("posted_wip"):
             path.unlink(missing_ok=True)
         else:
             # Keep what succeeded, so pressing the button again only retries the
             # destination that failed.
             path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+        telegram(token, "sendMessage", chat_id=state["chat_id"],
+                 reply_to_message_id=state["message_id"],
+                 text="\n".join(lines))
 
 
 if __name__ == "__main__":

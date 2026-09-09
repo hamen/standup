@@ -7,6 +7,7 @@ standup.yml
 # learn that. standup.env.example is documentation and is committed — *.env
 # does not match it.
 *.env
+!*.env.example
 wip-token
 
 # Working files that a `git add -A` sweeps up without anyone deciding to.

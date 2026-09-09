@@ -36,8 +36,38 @@ jobs:
         run: |
           bash -n bin/daily-standup.sh
           # A cron-shaped environment, because that is where PATH lookups fail
-          # and an interactive shell hides it.
-          env -i HOME="$HOME" PATH=/usr/bin:/bin bash bin/daily-standup.sh --check
+          # and an interactive shell hides it. A runner has no credentials and
+          # no standup.yml, which is exactly the state --check has to survive:
+          # its whole job is to report what is missing, so it must not exit on
+          # the first missing thing. It did, and this step is what caught it.
+          out=$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash bin/daily-standup.sh --check)
+          echo "$out"
+          echo "$out" | grep -q 'bot token:.*NOT SET' \
+            || { echo "--check did not report the missing credential"; exit 1; }
+          echo "$out" | grep -q 'report config:.*MISSING' \
+            || { echo "--check did not report the missing config"; exit 1; }
+
+      - name: A config path containing a space is one path
+        run: |
+          mkdir -p "/tmp/dir with space"
+          printf 'projects_root: ~/code\n' > "/tmp/dir with space/standup.yml"
+          out=$(STANDUP_CONFIG="/tmp/dir with space/standup.yml" \
+                TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
+                bash bin/daily-standup.sh 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q 'no usable report config' \
+            && { echo "the path was split on its space"; exit 1; } || true
+
+      - name: An empty config is refused like a missing one
+        env:
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          : > /tmp/empty.yml
+          out=$(STANDUP_CONFIG=/tmp/empty.yml bash bin/daily-standup.sh 2>&1) && {
+            echo "$out"; echo "an empty config was accepted"; exit 1; }
+          echo "$out" | grep -q 'no usable report config' \
+            || { echo "refused, but not for the reason we are testing"; exit 1; }
 
       # Assert the *reason*, not just a non-zero exit. A bare `if ! …` passes on
       # any failure at all — including one that happened after the guard, on a

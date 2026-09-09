@@ -11,8 +11,8 @@
 A single Ruby file that reads the Git repositories sitting in your projects
 directory and prints what you actually shipped yesterday, grouped by project.
 
-That file is the whole tool, and it needs nothing but Ruby and `git`. There is
-also an optional publisher in `bin/`, which turns the report into a Telegram
+That file is the reporter, and it needs nothing but Ruby and `git`. Alongside it
+in `bin/` there is an optional publisher, which turns the report into a Telegram
 message you approve with a button before anything is posted to X or wip.co. It
 is described at the end, and you can ignore it entirely.
 
@@ -147,7 +147,7 @@ history and can be reviewed:
   it to Telegram with three buttons — X, wip.co, both.
 - **`bin/standup-publish.py`** is run by cron every few minutes. It asks Telegram
   whether a button was pressed, and only then posts: to X with
-  [`bird`](https://github.com/hamen/bird-fork), to wip.co with `POST /v1/todos`.
+  a `bird` CLI, to wip.co with `POST /v1/todos`.
 
 **Nothing is published without a press.** An unpressed day leaves a state file
 and expires quietly. Each destination is recorded separately, so a day that

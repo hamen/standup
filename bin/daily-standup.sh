@@ -62,6 +62,32 @@ if [ -f "$CLAUDE_TOKEN_ENV" ]; then
   set -a; source "$CLAUDE_TOKEN_ENV"; set +a
 fi
 
+# ---- Check mode: what did all of that resolve to? ----
+#
+# Placed before the credential check on purpose, and this is the whole point of
+# the flag: --check has to work on a machine that has nothing set up yet, or it
+# cannot report what is missing. Put it after, and it dies on the first thing
+# absent instead of listing all of them — which is what happened, and what CI
+# caught. It sends nothing and always exits 0.
+#
+# Resolution order here mirrors what actually runs: the environment variable
+# first, then PATH, then the documented default. Printing PATH first would
+# name a binary the cron job will never call.
+if [ "${1:-}" = "--check" ]; then
+  cfg="${STANDUP_CONFIG:-$REPO_DIR/standup.yml}"
+  echo "repository:    $REPO_DIR"
+  echo "standup.rb:    $REPO_DIR/standup.rb $([ -f "$REPO_DIR/standup.rb" ] || echo '(MISSING)')"
+  echo "report config: $cfg $([ -f "$cfg" ] || echo '(MISSING — copy standup.yml.example)')"
+  echo "credentials:   $TELEGRAM_CREDS $([ -f "$TELEGRAM_CREDS" ] || echo '(MISSING — copy standup.env.example)')"
+  echo "bot token:     $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo set || echo 'NOT SET')"
+  echo "chat id:       $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo set || echo 'NOT SET')"
+  echo "claude:        ${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
+  echo "bird:          ${BIRD_BIN:-$(command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
+  echo "publisher:     $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
+  echo "state dir:     ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
+  exit 0
+fi
+
 if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
   echo "ERROR: Telegram credentials not found at $TELEGRAM_CREDS"
   exit 1
@@ -86,25 +112,6 @@ send_telegram() {
   echo "$resp" | grep -q '"ok":true' || echo "  Plain-text send also failed: $resp"
 }
 
-# ---- Check mode: what did all of the above resolve to? ----
-#
-# Nothing else answers that question without sending a real Telegram message,
-# and "it worked on my machine" is exactly how a cron job with a short PATH
-# fails quietly. --check sends nothing.
-if [ "${1:-}" = "--check" ]; then
-  echo "repository:   $REPO_DIR"
-  echo "standup.rb:   $REPO_DIR/standup.rb $([ -f "$REPO_DIR/standup.rb" ] || echo '(MISSING)')"
-  echo "report config: ${STANDUP_CONFIG:-$REPO_DIR/standup.yml} $([ -f "${STANDUP_CONFIG:-$REPO_DIR/standup.yml}" ] || echo '(MISSING — see standup.yml.example)')"
-  echo "credentials:  $TELEGRAM_CREDS $([ -f "$TELEGRAM_CREDS" ] || echo '(MISSING)')"
-  echo "bot token:    $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo 'set' || echo 'NOT SET')"
-  echo "chat id:      $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo 'set' || echo 'NOT SET')"
-  echo "claude:       $(command -v claude 2>/dev/null || echo "${CLAUDE_BIN:-$HOME/.local/bin/claude}")"
-  echo "bird:         $(command -v bird 2>/dev/null || echo "${BIRD_BIN:-$HOME/.npm-global/bin/bird}")"
-  echo "publisher:    $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
-  echo "state dir:    ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
-  exit 0
-fi
-
 # ---- Test mode ----
 if [ "${1:-}" = "--test" ]; then
   send_telegram "✅ Daily standup bot is working. $(date '+%Y-%m-%d %H:%M')"
@@ -128,17 +135,22 @@ STANDUP_CONFIG="${STANDUP_CONFIG:-$REPO_DIR/standup.yml}"
 #
 # Checked here and not earlier on purpose: --test and --check must still work on
 # a fresh clone, because proving the bot works is the first thing anyone does.
-if [ ! -f "$STANDUP_CONFIG" ]; then
-  echo "ERROR: no report config at $STANDUP_CONFIG"
+if [ ! -s "$STANDUP_CONFIG" ]; then
+  echo "ERROR: no usable report config at $STANDUP_CONFIG"
+  # -s, not -f: an empty file parses to an empty config, which is exactly the
+  # publish-everything case this guard exists to stop.
   echo "Copy standup.yml.example to that path and edit it, or set STANDUP_CONFIG."
   echo "Refusing to run: without it, every repository would be published by directory name."
   exit 1
 fi
 
 # Build standup args
-STANDUP_ARGS="--config $STANDUP_CONFIG"
+# An array, not a string: word splitting would turn a config path containing a
+# space into two arguments and the run would fail on a path that is perfectly
+# legal.
+STANDUP_ARGS=(--config "$STANDUP_CONFIG")
 if [ "${1:-}" = "--today" ]; then
-  STANDUP_ARGS="$STANDUP_ARGS --today"
+  STANDUP_ARGS+=(--today)
   DATE_LABEL="today"
 else
   DATE_LABEL="yesterday"
@@ -146,7 +158,7 @@ fi
 
 # ---- Run standup ----
 echo "[$TODAY] Running daily standup ($DATE_LABEL)..."
-RAW_STANDUP=$(ruby "$STANDUP_BIN" $STANDUP_ARGS 2>&1) || {
+RAW_STANDUP=$(ruby "$STANDUP_BIN" "${STANDUP_ARGS[@]}" 2>&1) || {
   echo "  Standup script failed: $RAW_STANDUP"
   send_telegram "⚠️ Daily standup failed: ${RAW_STANDUP:0:200}"
   exit 1
@@ -162,8 +174,6 @@ fi
 
 # ---- Format with Claude (claude -p) ----
 echo "  Formatting with Claude..."
-PROJECT_COUNT=$(echo "$RAW_STANDUP" | grep -c '^#')
-
 PROMPT="You are formatting a daily developer standup for Telegram.
 
 Date: $TODAY (this is $DATE_LABEL's activity)

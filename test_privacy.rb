@@ -51,17 +51,26 @@ offend(contents, failures, 'an API key with a value') do |line|
   line.match?(/api[_-]?key["'\s]*[:=]["'\s]*[A-Za-z0-9_\-]{12,}/i)
 end
 
+# No \b before the keyword. An underscore is a word character, so \bTOKEN never
+# matches WIP_TOKEN or TELEGRAM_BOT_TOKEN — which are the two names a real
+# credential would actually be assigned to here. The rule reported them safe.
 offend(contents, failures, 'an assigned secret') do |line|
-  line.match?(/\b(TOKEN|SECRET|PASSWORD|API_KEY)\s*=\s*["']?[A-Za-z0-9_\-]{16,}/i)
+  line.match?(/(?:^|[^A-Za-z])[A-Z_]*(TOKEN|SECRET|PASSWORD|API_KEY)\s*=\s*["']?[A-Za-z0-9_\-]{16,}/i)
 end
 
 # --- 2. Somebody's home directory ----------------------------------------
 #
-# No exemption for "obvious" placeholders. /home/you and /home/youruser used to
-# live in the example config and the README, and an exemption list is precisely
-# where a real path hides. Write ~ or /path/to instead.
+# No exemption for "obvious" placeholders. The example config and the README
+# used to spell out two of them, and an exemption list is precisely where a
+# real path eventually hides. Write ~ or /path/to instead.
+#
+# No trailing slash is required either: a bare home path at the end of a line
+# is exactly as much of a leak as one with a directory after it.
+#
+# Note this file must not spell out the shape it bans, or it fails itself —
+# which is a fair test of the rule.
 offend(contents, failures, 'an absolute home directory') do |line|
-  line.match?(%r{/home/[A-Za-z0-9._-]+/}) || line.match?(%r{/Users/[A-Za-z0-9._-]+/})
+  line.match?(%r{/(home|Users)/[A-Za-z0-9._-]+})
 end
 
 # --- 3. Private repository names ------------------------------------------
@@ -97,8 +106,20 @@ if File.file?(config)
   contents.each do |file, body|
     next if file == 'standup.yml.example'
 
+    markdown = file.end_with?('.md')
+    fenced = false
+
     body.each_line.with_index(1) do |line, n|
-      next if line.match?(/^\s*#/) # prose about the tooling, not a config value
+      # In Markdown, "#" starts a heading, not a comment — skipping those would
+      # blind the check to a name in a heading. What Markdown does need is its
+      # fenced example blocks skipped: this README documents an example config,
+      # and a placeholder there must not collide with a real name.
+      if markdown
+        fenced = !fenced if line.start_with?('```')
+        next if fenced || line.start_with?('```')
+      elsif line.match?(/^\s*#/)
+        next # a comment about the tooling, not a config value
+      end
 
       names.each do |name|
         next if name.length < 4
