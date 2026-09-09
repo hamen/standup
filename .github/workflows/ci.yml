@@ -47,45 +47,73 @@ jobs:
           echo "$out" | grep -q 'report config:.*MISSING' \
             || { echo "--check did not report the missing config"; exit 1; }
 
-      - name: A config path containing a space is one path
+      # A stub curl on PATH, so no step below can reach api.telegram.org. Two
+      # of these steps run the sender far enough to send, and a workflow that
+      # makes live calls with fake credentials is a workflow nobody can run on
+      # a fork.
+      - name: Stub the network
         run: |
-          mkdir -p "/tmp/dir with space"
-          printf 'projects_root: ~/code\n' > "/tmp/dir with space/standup.yml"
-          out=$(STANDUP_CONFIG="/tmp/dir with space/standup.yml" \
+          mkdir -p "$RUNNER_TEMP/stub"
+          cat > "$RUNNER_TEMP/stub/curl" <<'SH'
+          #!/usr/bin/env bash
+          echo '{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}'
+          SH
+          chmod +x "$RUNNER_TEMP/stub/curl"
+          echo "$RUNNER_TEMP/stub" >> "$GITHUB_PATH"
+
+      # --check, not the sender: the guard uses the whole STANDUP_CONFIG value,
+      # so a split argv would still reach it and the step would pass while
+      # proving nothing. --check prints the resolved path, so a split shows up
+      # as a truncated one.
+      - name: A config path containing a space stays one path
+        run: |
+          mkdir -p "$RUNNER_TEMP/dir with space"
+          printf 'projects_root: ~/code\n' > "$RUNNER_TEMP/dir with space/standup.yml"
+          out=$(STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" bash bin/daily-standup.sh --check)
+          echo "$out"
+          echo "$out" | grep -qF "report config: $RUNNER_TEMP/dir with space/standup.yml" \
+            || { echo "the path did not survive as one argument"; exit 1; }
+          # And the same path through the real argv, which is where the array matters.
+          out=$(STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" \
                 TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
                 bash bin/daily-standup.sh 2>&1 || true)
-          echo "$out"
           echo "$out" | grep -q 'no usable report config' \
-            && { echo "the path was split on its space"; exit 1; } || true
+            && { echo "the path was split before it reached standup.rb"; exit 1; } || true
+
+      # The guard sits after this on purpose, and the README tells a newcomer to
+      # run --test first. Nothing else notices if a later edit reorders them.
+      - name: --test still works on a clone with no report config
+        env:
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          out=$(bash bin/daily-standup.sh --test)
+          echo "$out"
+          echo "$out" | grep -q 'Test message sent' \
+            || { echo "--test no longer works without standup.yml"; exit 1; }
 
       - name: An empty config is refused like a missing one
         env:
           TELEGRAM_BOT_TOKEN: not-a-token
           TELEGRAM_CHAT_ID: not-a-chat
         run: |
-          : > /tmp/empty.yml
-          out=$(STANDUP_CONFIG=/tmp/empty.yml bash bin/daily-standup.sh 2>&1) && {
+          : > "$RUNNER_TEMP/empty.yml"
+          out=$(STANDUP_CONFIG="$RUNNER_TEMP/empty.yml" bash bin/daily-standup.sh 2>&1) && {
             echo "$out"; echo "an empty config was accepted"; exit 1; }
           echo "$out" | grep -q 'no usable report config' \
             || { echo "refused, but not for the reason we are testing"; exit 1; }
 
-      # Assert the *reason*, not just a non-zero exit. A bare `if ! …` passes on
-      # any failure at all — including one that happened after the guard, on a
-      # path that sends Telegram messages. STANDUP_CONFIG points somewhere that
-      # cannot exist, and the credentials are blanked, so this can never reach a
-      # send even if the guard is one day removed.
       - name: A missing report config is refused, not defaulted
         env:
           STANDUP_CONFIG: /nonexistent/standup.yml
           STANDUP_CONFIG_DIR: /nonexistent
           # Present but useless. Blank ones stop the script at the credentials
-          # check, several steps before the guard this test is about — so the
-          # test would pass without ever reaching it.
+          # check, several steps before the guard this test is about.
           TELEGRAM_BOT_TOKEN: not-a-token
           TELEGRAM_CHAT_ID: not-a-chat
         run: |
           out=$(bash bin/daily-standup.sh 2>&1) && {
             echo "$out"; echo "ran with no config — it would publish bare directory names"; exit 1; }
           echo "$out"
-          echo "$out" | grep -q 'no report config at /nonexistent/standup.yml' \
+          echo "$out" | grep -q 'no usable report config at /nonexistent/standup.yml' \
             || { echo "refused, but not for the reason we are testing"; exit 1; }

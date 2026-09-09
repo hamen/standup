@@ -81,8 +81,10 @@ if [ "${1:-}" = "--check" ]; then
   echo "credentials:   $TELEGRAM_CREDS $([ -f "$TELEGRAM_CREDS" ] || echo '(MISSING — copy standup.env.example)')"
   echo "bot token:     $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo set || echo 'NOT SET')"
   echo "chat id:       $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo set || echo 'NOT SET')"
-  echo "claude:        ${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
-  echo "bird:          ${BIRD_BIN:-$(command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
+  claude_at="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
+  bird_at="${BIRD_BIN:-$(command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
+  echo "claude:        $claude_at $([ -x "$claude_at" ] || echo '(MISSING — set CLAUDE_BIN)')"
+  echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
   echo "publisher:     $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
   echo "state dir:     ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
   exit 0

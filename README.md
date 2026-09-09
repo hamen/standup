@@ -160,7 +160,9 @@ publish time. The X form is sent to you as a reply, so you approve the text you
 will actually post.
 
 This half is not dependency-free: it needs `python3`, `curl`, a Claude CLI for
-the summary, and `bird` only if you publish to X.
+the summary, and `bird` only if you publish to X. `bin/daily-standup.sh` also
+uses `readlink -f` to find itself, which is GNU coreutils — it works on Linux,
+but not on a stock macOS.
 
 #### Setting it up
 
@@ -177,7 +179,7 @@ the button looks fine and collects nothing.
 For wip.co, put the API key alone in `~/.config/standup/wip-token`.
 
 Credentials live outside the repository. `standup.yml` is gitignored, and the
-publisher **refuses to run without it** rather than falling back to a default —
+sender **refuses to run without it** rather than falling back to a default —
 with no config there is no `exclude_repos`, and every repository under your
 projects root would be published by directory name.
 

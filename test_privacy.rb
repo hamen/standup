@@ -83,7 +83,10 @@ end
 config = File.join(ROOT, 'standup.yml')
 if File.file?(config)
   names = File.read(config).scan(/^\s*-\s*([A-Za-z0-9._-]+)\s*$/).flatten
-  names += File.read(config).scan(/^\s{2}([A-Za-z0-9._-]+):\s*["']?#/).flatten
+  # Every mapping key, not only the ones mapped to a hashtag. repo_name_mapping
+  # maps directory names to display names, and a directory mapped to a plain
+  # name is exactly as private as one mapped to "#something".
+  names += File.read(config).scan(/^\s{2}([A-Za-z0-9._-]+):/).flatten
   names.uniq!
 
   # This repository excludes itself from its own report, so its own name is in
@@ -103,23 +106,19 @@ if File.file?(config)
   # exclude_repos entry AND appears in the comments in bin/ that explain why the
   # standup has a bot of its own. Deleting that explanation to satisfy a test
   # would be the test making the code worse.
+  # Nothing is excluded by filename, and the example config and the README's
+  # fenced blocks least of all: those are the two places the real names lived,
+  # and removing published history was the price. An earlier draft skipped them
+  # to avoid a placeholder colliding with a real name. That is the wrong trade —
+  # if a placeholder here ever matches a real private repository, the right
+  # answer is to change the placeholder, and this test saying so is the feature.
   contents.each do |file, body|
-    next if file == 'standup.yml.example'
-
     markdown = file.end_with?('.md')
-    fenced = false
 
     body.each_line.with_index(1) do |line, n|
-      # In Markdown, "#" starts a heading, not a comment — skipping those would
-      # blind the check to a name in a heading. What Markdown does need is its
-      # fenced example blocks skipped: this README documents an example config,
-      # and a placeholder there must not collide with a real name.
-      if markdown
-        fenced = !fenced if line.start_with?('```')
-        next if fenced || line.start_with?('```')
-      elsif line.match?(/^\s*#/)
-        next # a comment about the tooling, not a config value
-      end
+      # In Markdown "#" opens a heading, not a comment, and skipping those would
+      # blind the check to a name in a heading.
+      next if !markdown && line.match?(/^\s*#/)
 
       names.each do |name|
         next if name.length < 4
