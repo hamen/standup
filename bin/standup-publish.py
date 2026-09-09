@@ -128,30 +128,6 @@ def ack(token, callback_query_id, text):
         log(f"could not acknowledge the button press ({e}); publishing anyway")
 
 
-def strip_telegram_markup(text):
-    """The morning message is Telegram Markdown. X and wip.co are not.
-
-    Only the asterisks go. An underscore in a commit subject is a character in
-    an identifier, not italics: on 2026-09-09 this deleted the one in
-    "Build config: dart_defines from production.env", and the X post would have
-    read "dartdefines". The formatter is asked for *bold* and rarely writes
-    _italics_, so deleting every underscore to catch a case that mostly does not
-    happen costs more than it saves.
-    """
-    return "\n".join(line.replace("*", "") for line in text.splitlines()).strip()
-
-
-def wip_projects():
-    """The projects as wip.co holds them, keyed by hashtag."""
-    url = "https://api.wip.co/v1/users/me/projects?" + urllib.parse.urlencode(
-        {"api_key": wip_key(), "limit": "100"}
-    )
-    with urllib.request.urlopen(url, timeout=30) as r:
-        body = json.load(r)
-    items = body if isinstance(body, list) else body.get("data", [])
-    return {p["hashtag"]: p for p in items if p.get("hashtag")}
-
-
 HASHTAG = re.compile(r"#([a-z0-9]+)")
 
 # A header as standup.rb emits it: the mapped hashtag, alone on its line.
@@ -227,14 +203,20 @@ def fit_telegram(text, limit=TELEGRAM_LIMIT):
     Whole project blocks go first, because half a project is worse than a named
     omission. If one block alone is too big, that block is cut by line.
     """
-    # Measured against the FINAL payload, to_markdown_v2 included. Measuring the
-    # escape alone was the same mistake this function exists to prevent, one
-    # layer up: to_markdown_v2 wraps the title and every project header in
-    # asterisks afterwards, so a report could pass this check and still be
-    # rejected — and the send would degrade to plain text, which is the failure
-    # the whole branch removes.
+    # Measured on the text a reader sees, not on the payload.
+    #
+    # Telegram applies the limit after it parses entities, so the backslashes
+    # and the emphasis asterisks this module adds do not count toward it. An
+    # earlier revision measured the escaped payload and then the rendered one;
+    # both trim reports that Telegram would have accepted, and on a subject full
+    # of full stops the escape inflates the count by a tenth or more.
+    #
+    # The failure modes are not symmetrical, which is why this is worth getting
+    # right rather than being conservative: trimming early silently drops a
+    # project from the report, while measuring too generously produces a
+    # rejection that the plain-text retry below already handles.
     def payload(t):
-        return tg_len(to_markdown_v2(t))
+        return tg_len(t)
 
     marker = "\n\n… trimmed to fit Telegram; the published version is complete."
     if payload(text) <= limit:
@@ -253,9 +235,51 @@ def fit_telegram(text, limit=TELEGRAM_LIMIT):
         lines = blocks[0].split("\n")
         while lines and payload("\n".join(lines)) > room:
             lines.pop()
+        # And if even one line is too long, cut the line. Dropping it would
+        # leave a message that is nothing but the trim marker.
+        if not lines:
+            first = blocks[0].split("\n")[0]
+            while first and payload(first) > room:
+                first = first[:-1]
+            lines = [first]
         kept = ["\n".join(lines)]
 
     return "\n\n".join(kept) + marker
+
+
+def strip_telegram_markup(text):
+    """The morning message is Telegram Markdown. X and wip.co are not.
+
+    Only the asterisks go. An underscore in a commit subject is a character in
+    an identifier, not italics: on 2026-09-09 this deleted the one in
+    "Build config: dart_defines from production.env", and the X post would have
+    read "dartdefines". The formatter is asked for *bold* and rarely writes
+    _italics_, so deleting every underscore to catch a case that mostly does not
+    happen costs more than it saves.
+    """
+    out = []
+    for line in text.splitlines():
+        bare = line.strip()
+        # Asterisks are removed only where they can only be markup: the title,
+        # and a project header, both of which are re-emphasised downstream
+        # anyway. Everywhere else an asterisk is a character somebody committed
+        # — "*.rb", "2 * 3" — and deleting it is the same data loss as the
+        # underscore this function exists to stop deleting.
+        if bare.startswith("📋") or FMT_HEADER.fullmatch(bare):
+            line = line.replace("*", "")
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def wip_projects():
+    """The projects as wip.co holds them, keyed by hashtag."""
+    url = "https://api.wip.co/v1/users/me/projects?" + urllib.parse.urlencode(
+        {"api_key": wip_key(), "limit": "100"}
+    )
+    with urllib.request.urlopen(url, timeout=30) as r:
+        body = json.load(r)
+    items = body if isinstance(body, list) else body.get("data", [])
+    return {p["hashtag"]: p for p in items if p.get("hashtag")}
 
 
 def repair_headers(raw, formatted):
@@ -478,7 +502,12 @@ def selftest():
     subject = "• Build config: dart_defines from production.env"
     assert "dart_defines" in strip_telegram_markup(f"*#alpha*\n{subject}"), \
         "an underscore in an identifier is not italics"
-    assert "*" not in strip_telegram_markup("*#alpha*"), "asterisks are markup and do go"
+    assert "*" not in strip_telegram_markup("*#alpha*"), "a header's asterisks are markup and do go"
+    # But an asterisk in a commit subject is a character somebody committed.
+    kept_star = strip_telegram_markup("*#alpha*\n• Rename every *.rb under lib/")
+    assert "*.rb" in kept_star, kept_star
+    assert "*#alpha*" not in kept_star and "#alpha" in kept_star, kept_star
+    assert "\\*\\.rb" in to_markdown_v2(kept_star), "a literal asterisk must be escaped, not dropped"
 
     tg = to_markdown_v2(f"\U0001F4CB Daily Standup — 2026-09-09\n\n#alpha\n{subject}")
     assert "dart\\_defines" in tg, tg
@@ -522,27 +551,31 @@ def selftest():
         for i in range(30))
     trimmed = fit_telegram(big)
     rendered = to_markdown_v2(trimmed)
-    assert tg_len(rendered) <= TELEGRAM_LIMIT, tg_len(rendered)
+    assert tg_len(trimmed) <= TELEGRAM_LIMIT, tg_len(trimmed)
     assert "trimmed to fit Telegram" in trimmed, "a trim has to say so"
     assert not re.search(r"(?<!\\)\\$", rendered), "the render ends in a dangling escape"
     # Trimming drops whole projects, never half of one.
     assert trimmed.count("#p0") == 1 and "• a commit subject, number 19." in trimmed
 
-    # The case the busy-day report above cannot catch: escaped text just under
-    # the limit, which the emphasis added afterwards pushes over.
-    headers = "\n\n".join(f"#project{i}\n• a subject." for i in range(40))
-    filler = "\U0001F4CB Daily Standup\n\n" + headers
-    while tg_len(escape_mdv2(filler)) < TELEGRAM_LIMIT - 40:
-        filler += "\n• another subject line here."
-    assert tg_len(escape_mdv2(filler)) <= TELEGRAM_LIMIT, "the fixture must fit before emphasis"
-    assert tg_len(to_markdown_v2(filler)) > TELEGRAM_LIMIT, \
-        "the fixture must exceed the limit only after emphasis is added"
-    assert tg_len(to_markdown_v2(fit_telegram(filler))) <= TELEGRAM_LIMIT, \
-        "the guard measured the escape instead of the payload"
+    # Escapes and emphasis are entities, not text: a report whose escaped form
+    # is over the limit but whose visible text is not must go out untouched.
+    dotted = "\U0001F4CB Daily Standup\n\n#alpha\n" + "\n".join(
+        "• a subject. with. a lot. of. full. stops." for _ in range(90))
+    assert tg_len(dotted) < TELEGRAM_LIMIT < tg_len(escape_mdv2(dotted)), \
+        "the fixture must be legal as text and over the limit once escaped"
+    assert fit_telegram(dotted) == dotted, \
+        "a report Telegram would accept was trimmed because the escape was measured"
 
     # One block larger than the whole budget still has to come back inside it.
     single = "#solo\n" + "\n".join(f"• subject number {j}." for j in range(600))
-    assert tg_len(to_markdown_v2(fit_telegram(single))) <= TELEGRAM_LIMIT
+    assert tg_len(fit_telegram(single)) <= TELEGRAM_LIMIT
+
+    # And one LINE longer than the budget is cut, not dropped: dropping it left
+    # a message consisting of the trim marker and nothing else.
+    overlong = "• " + "a very long subject. " * 400
+    fitted = fit_telegram(overlong)
+    assert tg_len(fitted) <= TELEGRAM_LIMIT, tg_len(fitted)
+    assert "a very long subject" in fitted, "the only line was dropped instead of cut"
 
     print("selftest ok")
 
@@ -562,6 +595,13 @@ def main():
     # backslashes are not prose.
     if "--telegram-markdown" in sys.argv:
         sys.stdout.write(to_markdown_v2(fit_telegram(strip_telegram_markup(sys.stdin.read()))))
+        return
+
+    # The same text, trimmed but not escaped: what the plain-text retry should
+    # send. Without it a report over the limit plus a renderer failure means no
+    # message arrives at all, which is the busy day fit_telegram exists for.
+    if "--telegram-plain" in sys.argv:
+        sys.stdout.write(fit_telegram(strip_telegram_markup(sys.stdin.read())))
         return
 
     if "--selftest" in sys.argv:

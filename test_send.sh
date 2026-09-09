@@ -40,7 +40,11 @@ chmod +x "$TMP/stub/curl"
 run() { # run <log> <args...>
   local log="$1"; shift
   : > "$log"; rm -f "$log.first"
+  # LC_ALL because env -i drops it: CPython coerces a C locale to UTF-8 on this
+  # build, so the emoji in the title survives, but that is a build option and
+  # not something a test should rely on.
   env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
+      LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
       ${FAIL_FIRST:+FAIL_FIRST=1} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
@@ -102,9 +106,55 @@ echo "$retry" | grep -q 'dart\\_defines' &&
 echo "$retry" | grep -q 'dart_defines' ||
   failures+=("the retry did not carry the report")
 
+# --- 3b. send_telegram's own retry, which test 3 does not reach ------------
+# Test 3 drives the report path. This drives the other send site, which carries
+# --test, the rest-day message and the standup-failed alarm.
+export FAIL_FIRST=1
+out=$(run "$TMP/test-retry.log" --test)
+unset FAIL_FIRST
+[ -n "$(call "$TMP/test-retry.log" 2)" ] ||
+  failures+=("a rejected --test was not retried")
+call "$TMP/test-retry.log" 2 | grep -q 'parse_mode' &&
+  failures+=("the --test retry still carried a parse_mode")
+echo "$out" | grep -q 'Test message sent' ||
+  failures+=("--test reported failure after a successful retry")
+
+# --- 3c. A report over Telegram's limit ------------------------------------
+# The trim has to reach the wire, and the plain-text retry has to be trimmed
+# too — otherwise a busy day plus any rejection means no message at all.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '📋 *Daily Standup*\n\n*#alpha*\n'
+for i in $(seq 1 400); do printf '• a long commit subject number %s, with words in it.\n' "$i"; done
+printf '\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+
+export FAIL_FIRST=1
+out=$(run "$TMP/big.log")
+unset FAIL_FIRST
+big_first=$(call "$TMP/big.log" 1)
+big_retry=$(call "$TMP/big.log" 2)
+echo "$big_first" | grep -q 'trimmed to fit Telegram' ||
+  failures+=("the oversized report was sent untrimmed")
+[ -n "$big_retry" ] || failures+=("the oversized report was not retried after rejection")
+echo "$big_retry" | grep -q 'trimmed to fit Telegram' ||
+  failures+=("the plain-text retry sent the untrimmed report, which Telegram also rejects")
+
+# Restore the ordinary formatter for anything added after this point.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+
 # --- 4. A broken renderer must not stop the message -----------------------
+cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good"
 printf 'not python\n' > "$WORK/bin/standup-publish.py"
 out=$(run "$TMP/broken.log" --test)
+cp "$TMP/publisher.good" "$WORK/bin/standup-publish.py"   # a later test must not inherit this
 call "$TMP/broken.log" 1 | grep -q 'parse_mode' &&
   failures+=("a doomed MarkdownV2 request was sent with unescaped text")
 call "$TMP/broken.log" 1 | grep -q 'text=' ||
