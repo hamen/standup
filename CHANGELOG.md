@@ -8,6 +8,17 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The report crashed on any day with a non-ASCII commit subject, when run
+  without a locale.** Ruby tags bytes from `git` with the locale's encoding;
+  with no `LANG` — which is what cron provides — that is US-ASCII, and the first
+  accented character raises *"invalid byte sequence in US-ASCII"*. A Romanian or
+  Italian commit subject was enough to kill the whole standup. It survived only
+  because the wrapper script sources a shell profile that happens to set `LANG`:
+  protection by accident, and none at all for anything invoking `standup.rb`
+  directly. Git output, the config and `llm-context.md` are now read as UTF-8
+  regardless of the environment, and a stray byte costs its own line rather than
+  the day's report.
+
 - **One underscore could break the whole Telegram message.** Legacy Markdown has
   no escape character, so a single unpaired `_` anywhere in the report is a
   syntax error for all of it. On 2026-09-09 the commit subject `Build config:

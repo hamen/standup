@@ -38,7 +38,7 @@ def load_config(explicit_path: nil, verbose: false)
   raise "Config file not found: #{explicit_path}" if path.nil? && explicit_path
   return { config: {}, path: nil } unless path
 
-  raw = File.read(path)
+  raw = as_utf8(File.read(path, mode: 'rb'))
   config = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
   puts "Loaded config: #{path}" if verbose
   { config: config, path: path }
@@ -64,6 +64,22 @@ def repo_display_name(repo_basename, repo_name_mapping)
   (repo_name_mapping && repo_name_mapping[repo_basename]) || repo_basename
 end
 
+# Bytes from outside this process, read as UTF-8 whatever the environment says.
+#
+# Ruby tags external bytes with the locale's encoding. Under cron there is no
+# LANG, so that encoding is US-ASCII, and the first accented character in a
+# commit subject then raises "invalid byte sequence in US-ASCII" on the split
+# that follows — the whole standup dies on an ordinary working day. Commit
+# messages, configs and notes are UTF-8 by convention, so say so rather than
+# letting the environment decide.
+#
+# scrub rather than raise for the rest: one repository with a stray byte in an
+# old commit message should cost that line, not the day's report.
+def as_utf8(bytes)
+  text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
+  text.valid_encoding? ? text : text.scrub('?')
+end
+
 # Run git in a repository and return its stdout, or "" if it failed.
 #
 # Every argument goes to git as one argv entry, so nothing here reaches a
@@ -71,7 +87,9 @@ end
 # and a name holding $(...) or a backtick used to run as a command.
 def git_capture(repo_path, *args)
   out, err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
-  return out if status.success?
+  return as_utf8(out) if status.success?
+
+  err = as_utf8(err)
 
   # A missing config key exits non-zero and says nothing, which is a normal
   # answer. Anything git does complain about is worth seeing, because the
@@ -159,7 +177,7 @@ def get_llm_context_entries(repo_path, target_date)
   return { entries: [], modified: was_modified } unless File.exist?(llm_context_path)
 
   # Read the file and look for date-stamped entries
-  content = File.read(llm_context_path)
+  content = as_utf8(File.read(llm_context_path, mode: 'rb'))
   
   # Look for date-stamped entries (#### YYYY-MM-DD – Title)
   # Handle both regular hyphens and en-dashes in dates

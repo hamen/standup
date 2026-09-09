@@ -44,6 +44,12 @@ def build_repo(path)
     git('checkout', '-q', '-b', 'feature')
     commit('the commit that must show up', YESTERDAY)
 
+    # A subject that is not ASCII, because most of them are not. This is what
+    # the no-locale case below reads: with no LANG, Ruby tags git's bytes
+    # US-ASCII and raises on the first character like these.
+    commit('seo(ro): Somnoroase păsărele, and a bedtime routine', YESTERDAY,
+           file: 'accented.txt')
+
     # An llm-context.md that exists only on that branch.
     commit('add llm-context on the feature branch', YESTERDAY, file: 'llm-context.md',
            content: "#### #{YESTERDAY} - branch-only entry\n")
@@ -353,6 +359,23 @@ Dir.mktmpdir do |root|
   _, bare_status = Open3.capture2e({ 'HOME' => fake_home },
                                    'ruby', SCRIPT, '--projects-root', root)
   failures << 'running with no config at all stopped working' unless bare_status.success?
+
+  # The report must survive an environment with no locale, which is the one
+  # cron provides.
+  #
+  # Ruby tags bytes from git with the locale's encoding. With no LANG that is
+  # US-ASCII, and the first accented character in a commit subject raises
+  # "invalid byte sequence in US-ASCII" — so a day with one Romanian or Italian
+  # commit killed the whole standup. It survived only because the wrapper script
+  # sources a shell profile that happens to set LANG, which is protection by
+  # accident: anything invoking standup.rb directly from cron crashed.
+  bare_env = { 'HOME' => fake_home, 'PATH' => ENV['PATH'], 'LANG' => nil, 'LC_ALL' => nil }
+  no_locale, no_locale_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
+                                                '--projects-root', root, '--config', config)
+
+  failures << 'the report crashed with no locale set' unless no_locale_status.success?
+  failures << 'a non-ASCII commit subject was lost with no locale set' unless
+    no_locale.include?('păsărele')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
