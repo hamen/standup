@@ -13,23 +13,34 @@ import os
 import pathlib
 import random
 import re
+import shutil
 import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
-STATE_DIR = pathlib.Path.home() / ".local/state/standup"
+STATE_DIR = pathlib.Path(
+    os.environ.get("STANDUP_STATE_DIR") or pathlib.Path.home() / ".local/state/standup"
+)
 OFFSET_FILE = STATE_DIR / "telegram-offset"
-# The standup's own bot first. The shared app-tools bot is polled by
-# claude-telegram-bot-ops, and reading the same update queue from two processes
-# means each press goes to whichever asked first — so the button would look
-# fine and collect nothing.
-TELEGRAM_ENVS = [
-    pathlib.Path.home() / ".config/standup/telegram.env",
-    pathlib.Path.home() / ".config/app-tools/telegram.env",
-]
-WIP_TOKEN_FILE = pathlib.Path.home() / ".config/standup/wip-token"
-BIRD = "/home/ivan/.npm-global/bin/bird"
+# The standup wants a bot of its own. Two processes reading one Telegram update
+# queue means each press goes to whichever asked first — so the button would
+# look fine and collect nothing.
+CONFIG_DIR = pathlib.Path(
+    os.environ.get("STANDUP_CONFIG_DIR") or pathlib.Path.home() / ".config/standup"
+)
+TELEGRAM_ENVS = [CONFIG_DIR / "telegram.env"]
+WIP_TOKEN_FILE = CONFIG_DIR / "wip-token"
+
+# Resolved, not hardcoded — but not left to PATH alone either. This runs from
+# cron, where PATH is short and holds none of the places a global npm install
+# puts its binaries, and --selftest never calls bird, so a PATH-only lookup
+# fails at the one moment nothing is watching: the post to X.
+BIRD = (
+    os.environ.get("BIRD_BIN")
+    or shutil.which("bird")
+    or str(pathlib.Path.home() / ".npm-global/bin/bird")
+)
 
 
 def log(msg):
@@ -92,7 +103,7 @@ def warn_conflict(token):
             "Another process is reading this bot's updates (HTTP 409), so button "
             "presses never arrive. Usually claude-telegram-bot.service was started: "
             "stop it, or give the standup a bot of its own in "
-            "~/.config/standup/telegram.env.")
+            f"{TELEGRAM_ENVS[0]}.")
     try:
         data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
         urllib.request.urlopen(

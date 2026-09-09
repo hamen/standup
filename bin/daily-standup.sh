@@ -11,9 +11,24 @@ set -euo pipefail
 #   ./daily-standup.sh              # yesterday's standup
 #   ./daily-standup.sh --today      # today's standup
 #   ./daily-standup.sh --test       # send a test ping
+#   ./daily-standup.sh --check      # print what it resolved, send nothing
+#
+# Everything it needs is either beside it in this repository or named by an
+# environment variable, so it runs from a clone rather than from one machine:
+#
+#   STANDUP_CONFIG_DIR   where the credentials live   (~/.config/standup)
+#   STANDUP_CONFIG       the report config            (<repo>/standup.yml)
+#   STANDUP_STATE_DIR    pending button presses       (~/.local/state/standup)
+#   CLAUDE_TOKEN_ENV     headless Claude Code auth    (~/.config/claude-code-token.env)
+#   CLAUDE_BIN           the Claude CLI               (whatever is on PATH)
 # ============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# readlink -f, not dirname alone: the README teaches symlinking this into
+# ~/.local/bin, and a bare dirname then resolves to ~/.local/bin, where neither
+# standup.rb nor standup-publish.py is.
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# standup.rb sits at the repository root; this script sits in bin/ beneath it.
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
 # ---- Source shell profile (cron runs with minimal env) ----
 if [ -f "$HOME/.zshrc" ]; then
@@ -31,24 +46,18 @@ elif [ -f "$HOME/.bashrc" ]; then
 fi
 
 # ---- Load Telegram credentials ----
-TELEGRAM_CREDS="$HOME/.config/app-tools/telegram.env"
+#
+# The standup wants a bot of its own, not one shared with another program. Two
+# processes reading one Telegram update queue means each button press goes to
+# whichever asked first, so the button looks fine and collects nothing.
+STANDUP_CONFIG_DIR="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}"
+TELEGRAM_CREDS="$STANDUP_CONFIG_DIR/telegram.env"
 if [ -f "$TELEGRAM_CREDS" ]; then
   set -a; source "$TELEGRAM_CREDS"; set +a
 fi
 
-# The standup speaks through its own bot when one is configured, overriding the
-# shared app-tools bot above. It has to: the shared bot is polled by
-# claude-telegram-bot-ops, and two readers of one Telegram update queue means
-# the publish button's presses land in whichever process asked first — which is
-# how a button that looks fine collects nothing.
-STANDUP_CREDS="$HOME/.config/standup/telegram.env"
-if [ -f "$STANDUP_CREDS" ]; then
-  set -a; source "$STANDUP_CREDS"; set +a
-  TELEGRAM_CREDS="$STANDUP_CREDS"
-fi
-
 # ---- Claude Code headless auth (cron has no interactive OAuth session) ----
-CLAUDE_TOKEN_ENV="$HOME/.config/claude-code-token.env"
+CLAUDE_TOKEN_ENV="${CLAUDE_TOKEN_ENV:-$HOME/.config/claude-code-token.env}"
 if [ -f "$CLAUDE_TOKEN_ENV" ]; then
   set -a; source "$CLAUDE_TOKEN_ENV"; set +a
 fi
@@ -77,6 +86,25 @@ send_telegram() {
   echo "$resp" | grep -q '"ok":true' || echo "  Plain-text send also failed: $resp"
 }
 
+# ---- Check mode: what did all of the above resolve to? ----
+#
+# Nothing else answers that question without sending a real Telegram message,
+# and "it worked on my machine" is exactly how a cron job with a short PATH
+# fails quietly. --check sends nothing.
+if [ "${1:-}" = "--check" ]; then
+  echo "repository:   $REPO_DIR"
+  echo "standup.rb:   $REPO_DIR/standup.rb $([ -f "$REPO_DIR/standup.rb" ] || echo '(MISSING)')"
+  echo "report config: ${STANDUP_CONFIG:-$REPO_DIR/standup.yml} $([ -f "${STANDUP_CONFIG:-$REPO_DIR/standup.yml}" ] || echo '(MISSING — see standup.yml.example)')"
+  echo "credentials:  $TELEGRAM_CREDS $([ -f "$TELEGRAM_CREDS" ] || echo '(MISSING)')"
+  echo "bot token:    $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo 'set' || echo 'NOT SET')"
+  echo "chat id:      $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo 'set' || echo 'NOT SET')"
+  echo "claude:       $(command -v claude 2>/dev/null || echo "${CLAUDE_BIN:-$HOME/.local/bin/claude}")"
+  echo "bird:         $(command -v bird 2>/dev/null || echo "${BIRD_BIN:-$HOME/.npm-global/bin/bird}")"
+  echo "publisher:    $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
+  echo "state dir:    ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
+  exit 0
+fi
+
 # ---- Test mode ----
 if [ "${1:-}" = "--test" ]; then
   send_telegram "✅ Daily standup bot is working. $(date '+%Y-%m-%d %H:%M')"
@@ -86,9 +114,26 @@ fi
 
 # ---- Config ----
 TODAY=$(date '+%Y-%m-%d')
-STANDUP_BIN="/home/ivan/code/standup/standup.rb"
-STANDUP_CONFIG="/home/ivan/code/standup/standup.yml"
-STANDUP_FLAG="${1:---config}"
+STANDUP_BIN="$REPO_DIR/standup.rb"
+STANDUP_CONFIG="${STANDUP_CONFIG:-$REPO_DIR/standup.yml}"
+
+# A missing report config is a leak, not an inconvenience, which is why this
+# refuses to run rather than carrying on with a default.
+#
+# standup.yml is gitignored, so a fresh clone has none, and standup.rb answers a
+# missing config with an empty one rather than an error. The report would then
+# have no repo_name_mapping and no exclude_repos — and this pipeline publishes
+# to X and wip.co. Every private repository under the projects root would be
+# named, under its own directory name, in public.
+#
+# Checked here and not earlier on purpose: --test and --check must still work on
+# a fresh clone, because proving the bot works is the first thing anyone does.
+if [ ! -f "$STANDUP_CONFIG" ]; then
+  echo "ERROR: no report config at $STANDUP_CONFIG"
+  echo "Copy standup.yml.example to that path and edit it, or set STANDUP_CONFIG."
+  echo "Refusing to run: without it, every repository would be published by directory name."
+  exit 1
+fi
 
 # Build standup args
 STANDUP_ARGS="--config $STANDUP_CONFIG"
@@ -137,7 +182,7 @@ Format this as a concise, scannable Telegram message:
 - Use Telegram Markdown: SINGLE asterisk for bold (*bold*), NOT double (**bold**). Use _italic_ for italic.
 - Output ONLY the formatted message, nothing else"
 
-CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo /home/ivan/.local/bin/claude)}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 ANALYSIS=$(echo "$PROMPT" | timeout 120 "$CLAUDE_BIN" -p --model haiku 2>/dev/null) || ANALYSIS=""
 
 # Fallback: if Claude failed, send raw standup
@@ -170,7 +215,7 @@ $RAW_STANDUP"
 # either of them without that press.
 echo "  Sending to Telegram..."
 
-STATE_DIR="$HOME/.local/state/standup"
+STATE_DIR="${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
 mkdir -p "$STATE_DIR"
 PENDING_ID="$TODAY"
 # One button per destination, so a day already published to one place can still
