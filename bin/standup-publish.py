@@ -257,6 +257,34 @@ def post_to_wip(text):
         return False, str(e)[:300]
 
 
+def publish_pending(state, target, posters, save):
+    """Post to each requested destination, writing down each success at once.
+
+    The write has to happen after every individual post, not once at the end,
+    because everything after a successful post can fail: the next destination,
+    the status reply, the process. The update offset was already advanced before
+    any of this ran, so a failure that loses the record also loses the press —
+    and the next press starts again from "nothing has been posted". For X that
+    means the same standup tweeted twice, and a duplicate on a public timeline
+    is not something an apology undoes.
+
+    So: post, remember, then move on. `save` is called with the state after each
+    destination, and the caller decides where that goes.
+    """
+    lines = []
+    for name, code, already, fn in posters:
+        if target not in (code, "both"):
+            continue
+        if state.get(already):
+            lines.append(f"✅ {name} — already posted, skipped")
+            continue
+        ok, detail = fn()
+        state[already] = ok
+        save(state)
+        lines.append(f"{'✅' if ok else '❌'} {name} — {detail or 'posted'}")
+    return lines
+
+
 def pending_states():
     if not STATE_DIR.exists():
         return []
@@ -300,6 +328,51 @@ def selftest():
     # A project this standup never had must not be invented into a header.
     kept, _ = repair_headers(raw, "*gamma*\n\u2022 three\n\n*alpha*\n\u2022 one")
     assert "*gamma*" in kept and "#gamma" not in kept, kept
+    # A success must be on disk before the next thing that can fail runs.
+    # Without that, X posting and wip.co failing loses the X success, and the
+    # next press tweets the same standup again.
+    saved = []
+    st = {"id": "d"}
+    def explode():
+        raise RuntimeError("wip.co is down")
+    # The exception is allowed to escape — the process dying is not the problem.
+    # The problem would be it dying with the X success only in memory.
+    try:
+        publish_pending(
+            st, "both",
+            (("X", "x", "posted_x", lambda: (True, "https://x.com/i/1")),
+             ("wip.co", "wip", "posted_wip", explode)),
+            lambda s: saved.append(dict(s)),
+        )
+        raise AssertionError("the failing destination should have raised")
+    except RuntimeError:
+        pass
+    assert saved and saved[0].get("posted_x") is True, \
+        "the X success was not written down before wip.co was attempted"
+    assert st["posted_x"] is True and "posted_wip" not in st, st
+
+    # And the ordinary path still records both, and skips what is already done.
+    saved.clear()
+    st = {"id": "d", "posted_x": True}
+    def must_not_run():
+        raise AssertionError("a destination already posted must not be posted again")
+    lines = publish_pending(
+        st, "both",
+        (("X", "x", "posted_x", must_not_run),
+         ("wip.co", "wip", "posted_wip", lambda: (True, "ok"))),
+        lambda s: saved.append(dict(s)),
+    )
+    assert any("already posted" in l for l in lines), lines
+    assert st["posted_wip"] is True and saved[-1]["posted_wip"] is True
+
+    # A destination not asked for is not touched.
+    st = {"id": "d"}
+    publish_pending(st, "wip",
+                    (("X", "x", "posted_x", must_not_run),
+                     ("wip.co", "wip", "posted_wip", lambda: (True, "ok"))),
+                    lambda s: None)
+    assert "posted_x" not in st, st
+
     print("selftest ok")
 
 
@@ -366,32 +439,26 @@ def main():
         text = strip_telegram_markup(state["text"])
         ack(token, cb["id"], "Pubblico…")
 
-        # Each destination is remembered on its own. A half-done day — X posted,
-        # wip.co refused — must be retryable without tweeting it twice, and a
-        # duplicate on a public timeline is not something an apology undoes.
-        lines = []
-        for name, code, already, fn in (("X", "x", "posted_x", lambda t: post_to_x(t, key)),
-                                        ("wip.co", "wip", "posted_wip", post_to_wip)):
-            if target not in (code, "both"):
-                continue
-            if state.get(already):
-                lines.append(f"✅ {name} — already posted, skipped")
-                continue
-            ok, detail = fn(text)
-            state[already] = ok
-            lines.append(f"{'✅' if ok else '❌'} {name} — {detail or 'posted'}")
+        # Each destination is remembered on its own, the moment it succeeds, so
+        # a half-done day — X posted, wip.co refused — is retryable without
+        # tweeting it twice.
+        lines = publish_pending(
+            state, target,
+            (("X", "x", "posted_x", lambda: post_to_x(text, key)),
+             ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))),
+            lambda s: path.write_text(json.dumps(s, ensure_ascii=False, indent=2)),
+        )
 
         log(f"[{key}] " + " | ".join(lines))
+
+        # Only once nothing is left to retry. Everything below here can fail
+        # without costing anything, because the file already says what happened.
+        if state.get("posted_x") and state.get("posted_wip"):
+            path.unlink(missing_ok=True)
+
         telegram(token, "sendMessage", chat_id=state["chat_id"],
                  reply_to_message_id=state["message_id"],
                  text="\n".join(lines))
-
-        if state.get("posted_x") and state.get("posted_wip"):
-            path.unlink(missing_ok=True)
-        else:
-            # Keep what succeeded, so pressing the button again only retries the
-            # destination that failed.
-            path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
