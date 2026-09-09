@@ -23,14 +23,25 @@ def load_config(explicit_path: nil, verbose: false)
     end
 
   path = candidate_paths.find { |p| File.file?(p) }
+
+  # An explicitly named config that is not there is an error, not an empty
+  # config. Falling back silently is what made a leak out of a typo: on
+  # 2026-09-09 a config path was mangled before it reached here, this returned
+  # {} rather than complaining, and the report ran with no exclude_repos and no
+  # name mapping — every repository under the projects root, named by its
+  # directory, in a message with publish buttons on it.
+  #
+  # Asking for a specific file and getting a silent default is never what the
+  # caller wanted. Finding nothing when nothing was asked for still is: that
+  # path below keeps working, and is what makes the tool usable with no config
+  # at all.
+  raise "Config file not found: #{explicit_path}" if path.nil? && explicit_path
   return { config: {}, path: nil } unless path
 
   raw = File.read(path)
   config = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
   puts "Loaded config: #{path}" if verbose
   { config: config, path: path }
-rescue Errno::ENOENT
-  raise "Config file not found: #{explicit_path}"
 rescue Psych::SyntaxError => e
   raise "Invalid YAML in config file #{path}: #{e.message}"
 end

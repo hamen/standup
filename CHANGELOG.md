@@ -4,6 +4,36 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The publisher lives here now.** `bin/daily-standup.sh` and
+  `bin/standup-publish.py` turn the report into a Telegram message with an
+  approval button, and post to X and wip.co once it is pressed. They worked for
+  months from an unversioned directory, which meant two thirds of the project
+  had no history and no review, and anyone cloning this repository got a report
+  printer while the README told them publishing was "a few lines of shell". They
+  are imported unchanged and then de-hardcoded: nothing names a home directory
+  any more, and every path is resolved or set by environment variable.
+- **`bin/daily-standup.sh --check`**, which prints every path it resolved and
+  sends nothing. Nothing else answered that question without posting a real
+  message, and a cron job with a short `PATH` fails in exactly the way an
+  interactive shell hides.
+- **Continuous integration.** The suites existed; nothing ran them but a person.
+- **`test_privacy.rb`**, which fails on a committed credential, an absolute home
+  directory, or a private repository name. This repository is public and its
+  pipeline posts publicly. The example config and the README did once carry real
+  project names, and removing them meant rewriting published history.
+
+### Changed
+
+- **A missing `standup.yml` is now refused, not defaulted.** That file is
+  gitignored, so a fresh clone has none, and `standup.rb` answers a missing
+  config with an empty one. The report would then have no `exclude_repos` — and
+  this pipeline publishes. Every repository under the projects root would have
+  been named, by directory name, in public.
+
 ## [1.0.0] — 2026-09-02
 
 First tagged release. `standup` had been working for months, and reporting a

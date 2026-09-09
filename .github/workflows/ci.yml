@@ -1,0 +1,157 @@
+# Until now "the tests pass" meant someone had run them on their laptop, which
+# is the same as the problem this repository was created to fix: two halves of
+# one pipeline, and nothing watching whether they still agree.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: The report reads the day's commits, and only those
+        run: ruby test_standup.rb
+
+      # No dependency step: standup-publish.py imports the standard library
+      # only — json, os, pathlib, random, re, shutil, subprocess, sys, urllib.
+      - name: The publisher's own checks
+        run: python3 bin/standup-publish.py --selftest
+
+      # This one is deliberately partial here, and says so when it runs. The
+      # private repository names live in standup.yml, which is gitignored and
+      # therefore never on a runner, so only the credential and home-directory
+      # rules can fire in CI. The full check runs where the file exists.
+      - name: Nothing private is committed
+        run: |
+          out=$(ruby test_privacy.rb)
+          echo "$out"
+          # The name check cannot run here — standup.yml is gitignored — and a
+          # skip that says nothing reads as a pass. Assert that it announces
+          # itself, so the day it silently stops running is the day CI notices.
+          echo "$out" | grep -q 'name check SKIPPED: no standup.yml' \
+            || { echo "the privacy test no longer says which check it skipped"; exit 1; }
+
+      - name: The shell script parses and resolves its paths
+        run: |
+          bash -n bin/daily-standup.sh
+          # A cron-shaped environment, because that is where PATH lookups fail
+          # and an interactive shell hides it. A runner has no credentials and
+          # no standup.yml, which is exactly the state --check has to survive:
+          # its whole job is to report what is missing, so it must not exit on
+          # the first missing thing. It did, and this step is what caught it.
+          out=$(env -i HOME="$HOME" PATH=/usr/bin:/bin bash bin/daily-standup.sh --check)
+          echo "$out"
+          echo "$out" | grep -q 'bot token:.*NOT SET' \
+            || { echo "--check did not report the missing credential"; exit 1; }
+          echo "$out" | grep -q 'report config:.*MISSING' \
+            || { echo "--check did not report the missing config"; exit 1; }
+          # The parent of bin/, not bin/ itself. A regression to $SCRIPT_DIR
+          # would name a standup.rb that does not exist, and every other
+          # assertion here would still pass.
+          echo "$out" | grep -qF "standup.rb:    $PWD/standup.rb" \
+            || { echo "standup.rb did not resolve to the repository root"; exit 1; }
+          # The documented fallbacks, which are what a machine without either
+          # binary on PATH actually gets. A regression to a bare `command -v`
+          # would print nothing useful here.
+          echo "$out" | grep -q 'claude:.*\.local/bin/claude' \
+            || { echo "--check did not fall back to the documented claude path"; exit 1; }
+          echo "$out" | grep -q 'bird:.*\.npm-global/bin/bird' \
+            || { echo "--check did not fall back to the documented bird path"; exit 1; }
+
+      # A stub curl on PATH, so no step below can reach api.telegram.org. Two
+      # of these steps run the sender far enough to send, and a workflow that
+      # makes live calls with fake credentials is a workflow nobody can run on
+      # a fork.
+      - name: Stub the network
+        run: |
+          mkdir -p "$RUNNER_TEMP/stub"
+          cat > "$RUNNER_TEMP/stub/curl" <<'SH'
+          #!/usr/bin/env bash
+          echo '{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}'
+          SH
+          chmod +x "$RUNNER_TEMP/stub/curl"
+          echo "$RUNNER_TEMP/stub" >> "$GITHUB_PATH"
+
+      # --check, not the sender: the guard uses the whole STANDUP_CONFIG value,
+      # so a split argv would still reach it and the step would pass while
+      # proving nothing. --check prints the resolved path, so a split shows up
+      # as a truncated one.
+      - name: A config path containing a space stays one path
+        run: |
+          mkdir -p "$RUNNER_TEMP/dir with space"
+          printf 'projects_root: ~/code\n' > "$RUNNER_TEMP/dir with space/standup.yml"
+          out=$(STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" bash bin/daily-standup.sh --check)
+          echo "$out"
+          echo "$out" | grep -qF "report config: $RUNNER_TEMP/dir with space/standup.yml" \
+            || { echo "the path did not survive as one argument"; exit 1; }
+          # And the argv itself, which is the only thing that actually proves the
+          # array. A split path does not produce a distinctive error — standup.rb
+          # would just fall back to its defaults and report the wrong tree — so
+          # asserting on a message could never catch it. A stub ruby prints what
+          # it was handed.
+          cat > "$RUNNER_TEMP/stub/ruby" <<'SH'
+          #!/usr/bin/env bash
+          printf 'ARGV[%s]\n' "$@"
+          exit 1
+          SH
+          chmod +x "$RUNNER_TEMP/stub/ruby"
+          # env -i with an empty HOME, so no shell profile is sourced. The
+          # script sources one when it exists, and a profile that rebuilds PATH
+          # discards the stub — which is how this assertion silently proved
+          # nothing the first time it was written.
+          mkdir -p "$RUNNER_TEMP/nohome"
+          out=$(env -i HOME="$RUNNER_TEMP/nohome" PATH="$RUNNER_TEMP/stub:/usr/bin:/bin" \
+                STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" \
+                TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
+                bash bin/daily-standup.sh 2>&1 || true)
+          rm -f "$RUNNER_TEMP/stub/ruby"
+          echo "$out"
+          echo "$out" | grep -qF "ARGV[$RUNNER_TEMP/dir with space/standup.yml]" \
+            || { echo "standup.rb did not receive the config path as one argument"; exit 1; }
+
+      # The guard sits after this on purpose, and the README tells a newcomer to
+      # run --test first. Nothing else notices if a later edit reorders them.
+      - name: --test still works on a clone with no report config
+        env:
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          out=$(bash bin/daily-standup.sh --test)
+          echo "$out"
+          echo "$out" | grep -q 'Test message sent' \
+            || { echo "--test no longer works without standup.yml"; exit 1; }
+
+      - name: An empty config is refused like a missing one
+        env:
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          : > "$RUNNER_TEMP/empty.yml"
+          out=$(STANDUP_CONFIG="$RUNNER_TEMP/empty.yml" bash bin/daily-standup.sh 2>&1) && {
+            echo "$out"; echo "an empty config was accepted"; exit 1; }
+          echo "$out" | grep -q 'no usable report config' \
+            || { echo "refused, but not for the reason we are testing"; exit 1; }
+
+      - name: A missing report config is refused, not defaulted
+        env:
+          STANDUP_CONFIG: /nonexistent/standup.yml
+          STANDUP_CONFIG_DIR: /nonexistent
+          # Present but useless. Blank ones stop the script at the credentials
+          # check, several steps before the guard this test is about.
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          out=$(bash bin/daily-standup.sh 2>&1) && {
+            echo "$out"; echo "ran with no config — it would publish bare directory names"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q 'no usable report config at /nonexistent/standup.yml' \
+            || { echo "refused, but not for the reason we are testing"; exit 1; }
