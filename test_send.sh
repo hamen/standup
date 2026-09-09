@@ -56,6 +56,7 @@ run() { # run <log> <args...>
   env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
       LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
       ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${FAIL_LAST:+FAIL_LAST=1} \
+      ${TMPDIR:+TMPDIR=$TMPDIR} \
       ${CLAUDE_BIN:+CLAUDE_BIN=$CLAUDE_BIN} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
@@ -229,26 +230,26 @@ compgen -G "$TMP/fakehome/.local/state/standup/pending-*" > /dev/null &&
 # Asserted on what reached curl, not on --check: --check prints "set" for a
 # credential rather than its value, so it cannot tell which one won — which is
 # exactly how the first version of this test passed with the restore removed.
+# One profile at a time. The script prefers .zshrc when it exists, so writing
+# both meant the .bashrc branch — a different block, with its own set +eu —
+# was never taken.
 for rc_file in .zshrc .bashrc; do
+  rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
   printf 'export CLAUDE_BIN=/profile/wins/claude\nexport TELEGRAM_CHAT_ID=profile-chat\n' \
     > "$TMP/fakehome/$rc_file"
-done
-rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
-out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override.log")
-rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
-grep -q 'chat_id=not-a-chat' "$TMP/override.log" ||
-  failures+=("a shell profile redirected where the standup is posted")
-grep -q 'chat_id=profile-chat' "$TMP/override.log" &&
-  failures+=("the report went to the chat id the profile exported")
+  rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+  out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override-$rc_file.log")
 
-# And the same for a non-credential override, through --check.
-for rc_file in .zshrc .bashrc; do
-  printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/$rc_file"
+  grep -q 'chat_id=not-a-chat' "$TMP/override-$rc_file.log" ||
+    failures+=("$rc_file redirected where the standup is posted")
+  grep -q 'chat_id=profile-chat' "$TMP/override-$rc_file.log" &&
+    failures+=("$rc_file's chat id was used for the report")
+
+  out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override-$rc_file-check.log" --check)
+  echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
+    failures+=("$rc_file overrode the CLAUDE_BIN set on the cron line")
 done
-out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override2.log" --check)
 rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
-echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
-  failures+=("a shell profile overrode the CLAUDE_BIN set on the cron line")
 
 # --- 7. The X preview failing must not cost the run ------------------------
 # It is the last thing the script does, and a bare curl under set -e would
@@ -264,6 +265,38 @@ echo "$out" | grep -q 'waiting for the publish button' ||
   failures+=("the run did not report success after a failed X preview")
 compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" > /dev/null ||
   failures+=("the pending state was lost when the X preview failed")
+
+# --- 8. No temporary file for the renderer's diagnostic --------------------
+# mktemp fails when TMPDIR points nowhere. That must cost the diagnostic and
+# nothing else.
+#
+# 8a: a WORKING renderer with no temp file must still produce MarkdownV2. An
+# earlier version fell back to /dev/null here, and the success path then ran
+# `rm -f /dev/null`, which fails for an ordinary user — so the function
+# returned non-zero and the report quietly went out unformatted. Delivered,
+# and wrong, which is the hardest kind of failure to notice.
+out=$(TMPDIR=/nonexistent-tmpdir run "$TMP/notmp-ok.log" --test)
+call "$TMP/notmp-ok.log" 1 | grep -q 'parse_mode=MarkdownV2' ||
+  failures+=("a broken TMPDIR silently downgraded the report to plain text")
+# And it must do it quietly. An earlier version fell back to /dev/null, whose
+# cleanup then failed for an ordinary user and put "cannot remove" in the cron
+# log every single morning — harmless, and exactly the kind of daily noise that
+# trains everyone to stop reading that log.
+echo "$out" | grep -qi 'cannot remove' &&
+  failures+=("the run put a spurious rm failure in the log")
+
+# 8b: a BROKEN renderer with no temp file must still deliver, and still say so.
+cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good3"
+printf 'not python\n' > "$WORK/bin/standup-publish.py"
+out=$(TMPDIR=/nonexistent-tmpdir run "$TMP/notmp.log" --test)
+rc=$?
+cp "$TMP/publisher.good3" "$WORK/bin/standup-publish.py"
+[ "$rc" -eq 0 ] ||
+  failures+=("a missing TMPDIR turned a deliverable message into a failure")
+call "$TMP/notmp.log" 1 | grep -q 'text=' ||
+  failures+=("no message was sent when mktemp could not provide a scratch file")
+echo "$out" | grep -q 'Could not render MarkdownV2' ||
+  failures+=("the renderer failure went unreported without a temp file")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'

@@ -58,7 +58,9 @@ CRON_PATH="$PATH"
 _OVERRIDES=(CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
             STANDUP_STATE_DIR TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
 for _v in "${_OVERRIDES[@]}"; do
-  [ -n "${!_v:-}" ] && printf -v "_caller_$_v" '%s' "${!_v}"
+  # ${_v+set}, not -n: a caller that writes VAR= on the cron line means "empty",
+  # and that has to win over a profile export too.
+  [ -n "${!_v+set}" ] && printf -v "_caller_$_v" '%s' "${!_v}"
 done
 
 if [ -f "$HOME/.zshrc" ]; then
@@ -82,7 +84,7 @@ set -euo pipefail
 
 for _v in "${_OVERRIDES[@]}"; do
   _saved="_caller_$_v"
-  [ -n "${!_saved:-}" ] && export "$_v=${!_saved}"
+  [ -n "${!_saved+set}" ] && export "$_v=${!_saved}"
   unset "$_saved"
 done
 unset _v _saved _OVERRIDES
@@ -165,12 +167,16 @@ telegram_markdown() {
   # cannot give us a file we simply lose the diagnostic, which is the smaller
   # loss by far.
   err=$(mktemp 2>/dev/null) || err=""
+  # `|| rc=$?` rather than a bare assignment: under set -e a bare one aborts
+  # the caller before the error path below can run, and it only looks safe
+  # today because every call site happens to be a conditional. That dependency
+  # is invisible from here, which is how it would eventually be broken.
+  rc=0
   if [ -n "$err" ]; then
-    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err")
+    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err") || rc=$?
   else
-    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>/dev/null)
+    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>/dev/null) || rc=$?
   fi
-  rc=$?
   if [ "$rc" -eq 0 ]; then
     [ -n "$err" ] && rm -f "$err"
     printf '%s' "$out"
@@ -438,9 +444,18 @@ state = {"id": pending_id,
          "posted_x": False, "posted_wip": False}
 
 tmp = path + ".partial"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(state, fh, ensure_ascii=False, indent=2)
-os.replace(tmp, path)
+try:
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+except BaseException:
+    # A disk that fills part-way through would otherwise leave .partial behind
+    # for good. The poller ignores it, but nobody ever cleans it up either.
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print(result["message_id"])
 PYEOF
   ); then
@@ -466,7 +481,7 @@ PYEOF
 
 ${X_PREVIEW}" > /dev/null || echo "  The X preview could not be sent; the button still works"
   else
-    echo "  X preview failed; the button still works, you just cannot see the X form"
+    echo "  The X preview could not be sent; the button still works"
   fi
   echo "[$TODAY] Daily standup sent, waiting for the publish button."
 else
