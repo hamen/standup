@@ -196,6 +196,14 @@ Dir.mktmpdir do |root|
   # published under its own directory name.
   build_odd_name_repo(File.join(root, 'repo-întârziere'),
                       'Accented Dir User', 'the accented-directory commit')
+  # And one that a non-ASCII exclude_repos entry has to hide. If the entry
+  # stops matching, this commit is published.
+  build_odd_name_repo(File.join(root, 'hidden-întârziere'),
+                      'Hidden Dir User', 'the hidden-directory commit')
+  # A broken repository whose path is not ASCII, so git's own error message —
+  # which git_capture retags and warns with — carries characters that used to
+  # be the problem.
+  build_broken_repo(File.join(root, 'broken-întârziere'))
   build_broken_repo(File.join(root, 'broken-repo'))
   build_unborn_repo(File.join(root, 'unborn-repo'))
 
@@ -409,15 +417,18 @@ Dir.mktmpdir do |root|
   # and the one where a wrong answer is a repository published under a name
   # nobody chose. Loaded in the same no-locale child.
   accented_config = File.join(Dir.tmpdir, "standup-accented-#{Process.pid}.yml")
-  File.write(accented_config,
-             "repo_name_mapping:\n  demo-repo: \"#întârziere\"\n" \
-             "  repo-întârziere: \"#accenteddir\"\n")
+  # binwrite: written through the suite's own default_external, a C-locale run
+  # would transcode these characters before the child ever saw them, and the
+  # test would assert something that was never in the file.
+  File.binwrite(accented_config,
+                "repo_name_mapping:\n  demo-repo: \"#întârziere\"\n" \
+                "  repo-întârziere: \"#accenteddir\"\n" \
+                "exclude_repos:\n  - hidden-întârziere\n")
   accented, accented_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
                                               '--projects-root', root,
                                               '--config', accented_config,
                                               unsetenv_others: true)
   accented = accented.dup.force_encoding(Encoding::UTF_8)
-  File.delete(accented_config)
 
   failures << 'a config with non-ASCII names crashed with no locale set' unless
     accented_status.success?
@@ -425,6 +436,21 @@ Dir.mktmpdir do |root|
     accented.include?('#întârziere')
   failures << 'a repository with a non-ASCII directory name lost its mapping' unless
     accented.include?('#accenteddir')
+  # The consequence that matters: an exclude_repos entry that stops matching
+  # publishes the repository it was written to hide.
+  failures << 'a non-ASCII exclude_repos entry stopped matching' if
+    accented.include?('the hidden-directory commit')
+  failures << 'exclude_repos wrongly reported a non-ASCII name as unknown' if
+    accented.include?('which is not a repository')
+
+  # Printing is the other half, and it is not covered by retagging the input.
+  # Ruby writes a String's bytes to an IO with no external encoding set, and
+  # $stdout has none — so a UTF-8 report reaches a US-ASCII terminal unchanged
+  # rather than raising on conversion. Two reviewers expected a crash here.
+  # This assertion is what pins that, so a future `set_encoding` cannot quietly
+  # reintroduce one.
+  failures << 'the report could not be printed under no locale' unless
+    accented.include?('#întârziere')
 
   # The scrub path, checked directly. Getting genuinely invalid bytes into a
   # commit message through git is not reliable — git normalises them on the way
@@ -461,14 +487,15 @@ Dir.mktmpdir do |root|
   # hide is published as usual.
   bad_config = File.join(Dir.tmpdir, "standup-bad-bytes-#{Process.pid}.yml")
   File.binwrite(bad_config, "exclude_repos:\n  - demo\xC3(repo\n")
-  bad_out, bad_status = Open3.capture2e({ 'HOME' => fake_home },
-                                        'ruby', SCRIPT, '--projects-root', root,
-                                        '--config', bad_config)
+  bad_out, bad_status = Open3.capture2e(bare_env, 'ruby', SCRIPT, '--projects-root', root,
+                                        '--config', bad_config, unsetenv_others: true)
   failures << 'a config with invalid UTF-8 was silently repaired instead of refused' if
     bad_status.success?
   failures << 'the invalid-config error does not say which file' unless
     bad_out.include?('standup-bad-bytes')
-  File.delete(bad_config)
+
+
+  [accented_config, bad_config].each { |f| File.delete(f) if f && File.exist?(f) }
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'

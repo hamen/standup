@@ -17,7 +17,10 @@ All notable changes to this project are recorded here. The format follows
   protection by accident, and none at all for anything invoking `standup.rb`
   directly. Git output, the config and `llm-context.md` are now read as UTF-8
   regardless of the environment, and a stray byte is replaced with `?`
-  rather than killing the day's report.
+  rather than killing the day's report. The config is the exception: it is read
+  exactly or refused, because a repaired byte inside an `exclude_repos` entry
+  changes the name, the entry stops matching, and the repository it was written
+  to hide gets published.
 
 - **One underscore could break the whole Telegram message.** Legacy Markdown has
   no escape character, so a single unpaired `_` anywhere in the report is a
