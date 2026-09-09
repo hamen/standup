@@ -17,7 +17,7 @@ trap 'rm -rf "$TMP"' EXIT
 failures=()
 
 WORK="$TMP/work"
-mkdir -p "$WORK/bin" "$TMP/stub" "$TMP/home"
+mkdir -p "$WORK/bin" "$TMP/stub" "$TMP/fakehome"
 cp "$ROOT/bin/daily-standup.sh" "$ROOT/bin/standup-publish.py" "$WORK/bin/"
 cp "$ROOT/standup.rb" "$WORK/"
 printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
@@ -40,7 +40,7 @@ chmod +x "$TMP/stub/curl"
 run() { # run <log> <args...>
   local log="$1"; shift
   : > "$log"; rm -f "$log.first"
-  env -i HOME="$TMP/home" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
+  env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
       ${FAIL_FIRST:+FAIL_FIRST=1} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
@@ -81,7 +81,7 @@ echo "$first" | grep -q 'inline_keyboard' ||
   failures+=("the report lost its publish buttons")
 
 # The state file must hold the UNESCAPED text: that is what X and wip.co get.
-state=$(cat "$TMP/home/.local/state/standup/pending-"*.json 2>/dev/null)
+state=$(cat "$TMP/fakehome/.local/state/standup/pending-"*.json 2>/dev/null)
 [ -n "$state" ] || failures+=("no pending state was written")
 case "$state" in
   *'dart\\_defines'*) failures+=("the state file holds escaped text; X would publish backslashes") ;;
