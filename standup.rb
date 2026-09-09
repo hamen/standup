@@ -103,8 +103,9 @@ end
 def git_capture(repo_path, *args)
   out, err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
   out = as_utf8(out)
-  err = as_utf8(err)
   return out if status.success?
+
+  err = as_utf8(err)
 
   # A missing config key exits non-zero and says nothing, which is a normal
   # answer. Anything git does complain about is worth seeing, because the
@@ -134,6 +135,13 @@ end
 
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
+  # No retagging here, deliberately. A review asked for it on the grounds that
+  # a path picks up the locale's encoding like git's output does, and a
+  # repository whose directory name is not ASCII would then miss its
+  # repo_name_mapping entry. Checked rather than assumed: Ruby tags Dir results
+  # with the FILESYSTEM encoding, which is UTF-8 on Linux and macOS whatever
+  # default_external happens to be. The test below pins that with a repository
+  # whose directory name carries diacritics.
   repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
   puts "Found #{repos.size} repositories." if verbose
   repos

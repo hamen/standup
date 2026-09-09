@@ -16,8 +16,8 @@ All notable changes to this project are recorded here. The format follows
   because the wrapper script sources a shell profile that happens to set `LANG`:
   protection by accident, and none at all for anything invoking `standup.rb`
   directly. Git output, the config and `llm-context.md` are now read as UTF-8
-  regardless of the environment, and a stray byte costs its own line rather than
-  the day's report.
+  regardless of the environment, and a stray byte is replaced with `?`
+  rather than killing the day's report.
 
 - **One underscore could break the whole Telegram message.** Legacy Markdown has
   no escape character, so a single unpaired `_` anywhere in the report is a
