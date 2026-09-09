@@ -6,6 +6,25 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **One underscore could break the whole Telegram message.** Legacy Markdown has
+  no escape character, so a single unpaired `_` anywhere in the report is a
+  syntax error for all of it. On 2026-09-09 the commit subject `Build config:
+  dart_defines from production.env` carried exactly one; Telegram answered
+  *"Can't find end of the entity starting at byte offset 896"* — the byte of that
+  underscore — and the send fell back to plain text, every asterisk showing raw
+  and nothing bold. The report now goes out as MarkdownV2, escaped here rather
+  than hoped for, with the emphasis added afterwards. A commit subject can hold
+  any character.
+- **The X and wip.co text lost underscores too.** Stripping Telegram markup
+  deleted every `_`, so that same subject would have been published as
+  `dartdefines`. Only asterisks are stripped now.
+- **A long day could exceed Telegram's 4096-character limit**, and escaping only
+  inflates the text. The message is trimmed on whole project blocks, before
+  escaping so a cut cannot split an escape pair, and says that it was trimmed.
+  The published text stays complete.
+
 ### Added
 
 - **The publisher lives here now.** `bin/daily-standup.sh` and

@@ -129,12 +129,16 @@ def ack(token, callback_query_id, text):
 
 
 def strip_telegram_markup(text):
-    """The morning message is Telegram Markdown. X and wip.co are not."""
-    out = []
-    for line in text.splitlines():
-        line = line.replace("**", "").replace("*", "").replace("_", "")
-        out.append(line)
-    return "\n".join(out).strip()
+    """The morning message is Telegram Markdown. X and wip.co are not.
+
+    Only the asterisks go. An underscore in a commit subject is a character in
+    an identifier, not italics: on 2026-09-09 this deleted the one in
+    "Build config: dart_defines from production.env", and the X post would have
+    read "dartdefines". The formatter is asked for *bold* and rarely writes
+    _italics_, so deleting every underscore to catch a case that mostly does not
+    happen costs more than it saves.
+    """
+    return "\n".join(line.replace("*", "") for line in text.splitlines()).strip()
 
 
 def wip_projects():
@@ -155,6 +159,84 @@ RAW_HEADER = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_-]*)")
 # The same header after the formatter, which may have bolded it and may have
 # eaten the "#". Anything with a space in it is a title or a trailer, not a header.
 FMT_HEADER = re.compile(r"\*?#?([A-Za-z0-9][A-Za-z0-9_-]*)\*?")
+
+
+# Every character MarkdownV2 gives a meaning to. All of them are escaped,
+# without asking whether this one looks like markup: guessing is what legacy
+# Markdown does, and guessing is the bug.
+MDV2_SPECIAL = re.compile(r"([_*\[\]()~`>#+\-=|{}.!\\])")
+
+
+def escape_mdv2(text):
+    return MDV2_SPECIAL.sub(r"\\\1", text)
+
+
+def to_markdown_v2(text):
+    """Render the report for Telegram, with the emphasis put in here.
+
+    Legacy Markdown has no escape character, so a single unpaired "_" anywhere
+    in the message is a syntax error for the whole message. On 2026-09-09 the
+    commit subject "Build config: dart_defines from production.env" carried
+    exactly one, Telegram answered "Can't find end of the entity starting at
+    byte offset 896" — the byte of that underscore — and the send fell back to
+    plain text. The report arrived with every asterisk showing raw and nothing
+    bold, which reads as "the formatting is broken", and it hid a repair that
+    had in fact worked.
+
+    So: escape everything as MarkdownV2, then add the two emphases that are ours
+    to add — the title, and each project header. A commit subject can then hold
+    any character it likes, because none of them are markup any more.
+
+    The input must be unescaped text. This is not idempotent and cannot be: a
+    report legitimately containing a backslash has to have it escaped, so
+    escaped output is a different kind of value from source text, not a fixed
+    point.
+    """
+    out = []
+    for i, line in enumerate(text.split("\n")):
+        stripped = line.strip()
+        header = RAW_HEADER.fullmatch(stripped) or (i == 0 and stripped.startswith("📋"))
+        out.append(f"*{escape_mdv2(stripped)}*" if header and stripped else escape_mdv2(line))
+    return "\n".join(out)
+
+
+# Telegram rejects a message over 4096 characters. Escaping only inflates the
+# text — every "." and "-" gains a backslash — so a busy day that fitted before
+# can stop fitting exactly when the report matters most.
+TELEGRAM_LIMIT = 4096
+
+
+def fit_telegram(text, limit=TELEGRAM_LIMIT):
+    """Trim the report to what Telegram will accept, on a boundary that reads.
+
+    Trimming happens BEFORE escaping, never after: an escape is a two-character
+    pair, and a cut landing between the backslash and its character leaves a
+    dangling backslash — which Telegram rejects, which is the very failure this
+    module exists to remove, reintroduced by its own guard.
+
+    Whole project blocks go first, because half a project is worse than a named
+    omission. If one block alone is too big, that block is cut by line.
+    """
+    marker = "\n\n… trimmed to fit Telegram; the published version is complete."
+    if len(escape_mdv2(text)) <= limit:
+        return text
+
+    room = limit - len(escape_mdv2(marker))
+    blocks = re.split(r"\n\s*\n", text)
+    kept = []
+    for block in blocks:
+        candidate = kept + [block]
+        if len(escape_mdv2("\n\n".join(candidate))) > room:
+            break
+        kept = candidate
+
+    if not kept:  # even the first block does not fit; cut it by line
+        lines = blocks[0].split("\n")
+        while lines and len(escape_mdv2("\n".join(lines))) > room:
+            lines.pop()
+        kept = ["\n".join(lines)]
+
+    return "\n\n".join(kept) + marker
 
 
 def repair_headers(raw, formatted):
@@ -373,6 +455,54 @@ def selftest():
                     lambda s: None)
     assert "posted_x" not in st, st
 
+    # --- The 2026-09-09 underscore, both halves of it ---------------------
+    subject = "• Build config: dart_defines from production.env"
+    assert "dart_defines" in strip_telegram_markup(f"*#alpha*\n{subject}"), \
+        "an underscore in an identifier is not italics"
+    assert "*" not in strip_telegram_markup("*#alpha*"), "asterisks are markup and do go"
+
+    tg = to_markdown_v2(f"\U0001F4CB Daily Standup — 2026-09-09\n\n#alpha\n{subject}")
+    assert "dart\\_defines" in tg, tg
+    assert "*\\#alpha*" in tg, "a project header is bold"
+    assert tg.splitlines()[0] == "*\U0001F4CB Daily Standup — 2026\\-09\\-09*", tg.splitlines()[0]
+    assert "\\." in tg, "a full stop is reserved in MarkdownV2 and must be escaped"
+
+    # Every reserved character, including a literal backslash. Four assertions
+    # would not support "a commit subject can hold anything".
+    for ch in "_*[]()~`>#+-=|{}.!\\":
+        rendered = to_markdown_v2(f"• a subject with {ch} in it")
+        assert f"\\{ch}" in rendered, f"{ch!r} was not escaped: {rendered!r}"
+
+    # A bullet that opens with "#" is an issue reference, not a header. Headers
+    # are re-detected by pattern after markup is stripped, so this is the
+    # plausible false positive.
+    issue = to_markdown_v2("#alpha\n• #123 was the culprit")
+    assert issue.splitlines()[0].startswith("*"), "the header lost its emphasis"
+    assert not issue.splitlines()[1].startswith("*"), "a bullet was turned into a header"
+
+    # No idempotence assertion: escaping a raw backslash and treating escaped
+    # output as already-escaped are mutually exclusive, and the loop above
+    # requires the former.
+
+    # --- The length guard --------------------------------------------------
+    small = "\U0001F4CB Daily Standup\n\n#alpha\n• one\n\n#beta\n• two"
+    assert fit_telegram(small) == small, "a report that fits must not be touched"
+
+    big = "\U0001F4CB Daily Standup\n\n" + "\n\n".join(
+        f"#p{i}\n" + "\n".join(f"• a commit subject, number {j}." for j in range(20))
+        for i in range(30))
+    trimmed = fit_telegram(big)
+    rendered = to_markdown_v2(trimmed)
+    assert len(rendered) <= TELEGRAM_LIMIT, len(rendered)
+    assert "trimmed to fit Telegram" in trimmed, "a trim has to say so"
+    assert not re.search(r"(?<!\\)\\$", rendered), "the render ends in a dangling escape"
+    # Trimming drops whole projects, never half of one.
+    assert trimmed.count("#p0") == 1 and "• a commit subject, number 19." in trimmed
+
+    # One block larger than the whole budget still has to come back inside it.
+    single = "#solo\n" + "\n".join(f"• subject number {j}." for j in range(600))
+    assert len(to_markdown_v2(fit_telegram(single))) <= TELEGRAM_LIMIT
+
     print("selftest ok")
 
 
@@ -384,6 +514,13 @@ def main():
         pending = sys.argv[sys.argv.index("--preview") + 1]
         state = json.loads((STATE_DIR / f"pending-{pending}.json").read_text())
         print(for_x(strip_telegram_markup(state["text"]), pending))
+        return
+
+    # Reads the report on stdin and writes what Telegram should receive. Kept
+    # out of the state file on purpose: X and wip.co get the unescaped text, and
+    # backslashes are not prose.
+    if "--telegram-markdown" in sys.argv:
+        sys.stdout.write(to_markdown_v2(fit_telegram(strip_telegram_markup(sys.stdin.read()))))
         return
 
     if "--selftest" in sys.argv:

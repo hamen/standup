@@ -141,6 +141,12 @@ jobs:
           echo "$out" | grep -q 'no usable report config' \
             || { echo "refused, but not for the reason we are testing"; exit 1; }
 
+      # The renderer has its own tests; this one covers the wiring, which is
+      # where the failure this branch fixes actually lived — correct text sent
+      # with the wrong parse_mode.
+      - name: The report reaches Telegram escaped
+        run: bash test_send.sh
+
       - name: A missing report config is refused, not defaulted
         env:
           STANDUP_CONFIG: /nonexistent/standup.yml
