@@ -63,6 +63,13 @@ def build_repo(path)
     ENV.delete('GIT_COMMITTER_DATE')
     git('checkout', '-q', 'main')
 
+    # An llm-context.md entry in the CHECKOUT, with characters that are not
+    # ASCII. The branch-only ones above are reported as "was updated" without
+    # ever being read; this is the one that exercises reading the file, which
+    # is the other place the locale used to decide the encoding.
+    commit('note the delay', YESTERDAY, file: 'llm-context.md',
+           content: "#### #{YESTERDAY} - una întârziere, e un più lungo\n")
+
     # An uncommitted change, stashed yesterday. Its stash commits are not work.
     File.write('file.txt', "stashed edit\n")
     ENV['GIT_COMMITTER_DATE'] = "#{YESTERDAY} 14:00:00 +0000"
@@ -369,13 +376,53 @@ Dir.mktmpdir do |root|
   # commit killed the whole standup. It survived only because the wrapper script
   # sources a shell profile that happens to set LANG, which is protection by
   # accident: anything invoking standup.rb directly from cron crashed.
-  bare_env = { 'HOME' => fake_home, 'PATH' => ENV['PATH'], 'LANG' => nil, 'LC_ALL' => nil }
+  # unsetenv_others, because an Open3 env hash MERGES with the parent. An
+  # inherited LC_CTYPE — normal when working over ssh from a Mac — or a
+  # RUBYOPT=-E would keep a UTF-8 locale alive in the child, and this test would
+  # pass without the fix while looking like it had proved something.
+  bare_env = { 'HOME' => fake_home, 'PATH' => ENV['PATH'] }
   no_locale, no_locale_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
-                                                '--projects-root', root, '--config', config)
+                                                '--projects-root', root, '--config', config,
+                                                unsetenv_others: true)
+  # If the suite itself runs under a C locale, capture2e tags this US-ASCII and
+  # the comparison below raises instead of failing.
+  no_locale = no_locale.dup.force_encoding(Encoding::UTF_8)
 
   failures << 'the report crashed with no locale set' unless no_locale_status.success?
   failures << 'a non-ASCII commit subject was lost with no locale set' unless
     no_locale.include?('păsărele')
+  failures << 'a non-ASCII llm-context entry was lost with no locale set' unless
+    no_locale.include?('întârziere')
+
+  # The scrub path, checked directly. Getting genuinely invalid bytes into a
+  # commit message through git is not reliable — git normalises them on the way
+  # in — and a test that silently stops exercising what it names is worse than
+  # no test. standup.rb only runs its main block when invoked as a program, so
+  # requiring it here is safe.
+  require_relative 'standup'
+
+  bad = as_utf8("a subject with a bad byte: \xC3( here")
+  failures << 'an invalid byte was passed through instead of scrubbed' unless
+    bad.valid_encoding?
+  failures << 'scrubbing threw away the rest of the subject' unless
+    bad.include?('a subject with a bad byte') && bad.include?('here')
+
+  good = as_utf8('Somnoroase păsărele'.dup.force_encoding(Encoding::ASCII_8BIT))
+  failures << 'valid UTF-8 was altered on the way through' unless
+    good == 'Somnoroase păsărele'
+
+  # And the config, which must NOT be repaired: a scrubbed byte inside an
+  # exclude_repos entry changes the name, so the repository it was meant to
+  # hide is published as usual.
+  bad_config = File.join(root, 'bad-bytes.yml')
+  File.binwrite(bad_config, "exclude_repos:\n  - demo\xC3(repo\n")
+  bad_out, bad_status = Open3.capture2e({ 'HOME' => fake_home },
+                                        'ruby', SCRIPT, '--projects-root', root,
+                                        '--config', bad_config)
+  failures << 'a config with invalid UTF-8 was silently repaired instead of refused' if
+    bad_status.success?
+  failures << 'the invalid-config error does not say which file' unless
+    bad_out.include?('bad-bytes.yml')
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'

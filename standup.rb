@@ -38,7 +38,7 @@ def load_config(explicit_path: nil, verbose: false)
   raise "Config file not found: #{explicit_path}" if path.nil? && explicit_path
   return { config: {}, path: nil } unless path
 
-  raw = as_utf8(File.read(path, mode: 'rb'))
+  raw = config_utf8(File.binread(path), path)
   config = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
   puts "Loaded config: #{path}" if verbose
   { config: config, path: path }
@@ -73,11 +73,26 @@ end
 # messages, configs and notes are UTF-8 by convention, so say so rather than
 # letting the environment decide.
 #
-# scrub rather than raise for the rest: one repository with a stray byte in an
-# old commit message should cost that line, not the day's report.
+# Scrubbing is right for what this reads OUT of repositories: one stray byte in
+# an old commit message should cost that character, not the day's report.
+#
+# It is exactly wrong for the config, which is why that has its own function
+# below. A scrubbed byte inside an exclude_repos entry changes the name, the
+# name then matches no repository, and the repository it was meant to hide is
+# reported as usual — into a message with publish buttons on it. Silent repair
+# is the wrong answer to a question about what must not be published.
 def as_utf8(bytes)
   text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
   text.valid_encoding? ? text : text.scrub('?')
+end
+
+# The config, which must be exactly what was written or nothing at all.
+def config_utf8(bytes, path)
+  text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
+  return text if text.valid_encoding?
+
+  raise "Config file #{path} is not valid UTF-8. Every name in it decides what " \
+        "is published, so it is read exactly or not at all."
 end
 
 # Run git in a repository and return its stdout, or "" if it failed.
@@ -87,9 +102,9 @@ end
 # and a name holding $(...) or a backtick used to run as a command.
 def git_capture(repo_path, *args)
   out, err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
-  return as_utf8(out) if status.success?
-
+  out = as_utf8(out)
   err = as_utf8(err)
+  return out if status.success?
 
   # A missing config key exits non-zero and says nothing, which is a normal
   # answer. Anything git does complain about is worth seeing, because the
@@ -177,7 +192,7 @@ def get_llm_context_entries(repo_path, target_date)
   return { entries: [], modified: was_modified } unless File.exist?(llm_context_path)
 
   # Read the file and look for date-stamped entries
-  content = as_utf8(File.read(llm_context_path, mode: 'rb'))
+  content = as_utf8(File.binread(llm_context_path))
   
   # Look for date-stamped entries (#### YYYY-MM-DD – Title)
   # Handle both regular hyphens and en-dashes in dates
