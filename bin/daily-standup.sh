@@ -48,8 +48,17 @@ CRON_PATH="$PATH"
 # Insurance rather than a repair: no profile on this machine exports any of
 # these. It costs six lines and removes a class of failure that would look like
 # the override simply being ignored.
-for _v in CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR STANDUP_STATE_DIR; do
-  [ -n "${!_v:-}" ] && eval "_caller_$_v=\${$_v}"
+# printf -v, never eval: eval re-parses the value, so a path holding $(...) or
+# a backtick would be executed rather than stored — the same shell-injection
+# shape standup.rb already avoids for git author names.
+#
+# The credentials are in the list because a profile exporting either of them
+# silently changes WHERE the standup is posted, which is the worst version of
+# this failure and the least visible.
+_OVERRIDES=(CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
+            STANDUP_STATE_DIR TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
+for _v in "${_OVERRIDES[@]}"; do
+  [ -n "${!_v:-}" ] && printf -v "_caller_$_v" '%s' "${!_v}"
 done
 
 if [ -f "$HOME/.zshrc" ]; then
@@ -71,11 +80,12 @@ fi
 # anyway so the script's options do not depend on that detail staying true.
 set -euo pipefail
 
-for _v in CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR STANDUP_STATE_DIR; do
+for _v in "${_OVERRIDES[@]}"; do
   _saved="_caller_$_v"
   [ -n "${!_saved:-}" ] && export "$_v=${!_saved}"
+  unset "$_saved"
 done
-unset _v _saved
+unset _v _saved _OVERRIDES
 
 # ---- Load Telegram credentials ----
 #
@@ -149,15 +159,29 @@ fi
 PY_UTF8=(env PYTHONUTF8=1 PYTHONIOENCODING=utf-8)
 
 telegram_markdown() {
-  local out err
-  err=$(mktemp) || err=/dev/null
-  if out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err"); then
-    rm -f "$err"
+  local out err rc
+  # No /dev/null fallback here: rm -f /dev/null fails for an ordinary user, and
+  # under set -e that would abort a run that was going perfectly well. If mktemp
+  # cannot give us a file we simply lose the diagnostic, which is the smaller
+  # loss by far.
+  err=$(mktemp 2>/dev/null) || err=""
+  if [ -n "$err" ]; then
+    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err")
+  else
+    out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>/dev/null)
+  fi
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    [ -n "$err" ] && rm -f "$err"
     printf '%s' "$out"
     return 0
   fi
-  echo "  Could not render MarkdownV2: $(head -c 300 "$err" | iconv -f utf-8 -t utf-8 -c 2>/dev/null || head -c 300 "$err")" >&2
-  rm -f "$err"
+  if [ -n "$err" ]; then
+    echo "  Could not render MarkdownV2: $(head -c 300 "$err" | iconv -f utf-8 -t utf-8 -c 2>/dev/null || head -c 300 "$err")" >&2
+    rm -f "$err"
+  else
+    echo "  Could not render MarkdownV2 (no temp file for the reason)" >&2
+  fi
   return 1
 }
 
@@ -393,18 +417,30 @@ if echo "$RESP" | grep -q '"ok":true'; then
   # state file is a dead button, and a state file without the id it belongs to
   # cannot be replied to. Text through the environment, not argv, because it is
   # long and multi-line and that is where quoting breaks.
-  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" python3 - \
+  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" "${PY_UTF8[@]}" python3 - \
       "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" <<'PYEOF'
 import json, os, sys
 
+# encoding="utf-8" explicitly, and PY_UTF8 on the interpreter above. The report
+# is Italian and Romanian and starts with an emoji; cron has no locale, so
+# writing it through the platform default raises UnicodeEncodeError — after
+# Telegram has already accepted the message. That is the failure this whole
+# block exists to prevent, and it would have arrived through the fix for it.
+#
+# Written to a temporary file and renamed, so the poller can never read a
+# half-written state: os.replace is atomic within a filesystem.
 path, pending_id = sys.argv[1:3]
 result = json.loads(os.environ["RESP"])["result"]
-json.dump({"id": pending_id,
-           "message_id": int(result["message_id"]),
-           "chat_id": int(result["chat"]["id"]),
-           "text": os.environ["ANALYSIS"],
-           "posted_x": False, "posted_wip": False},
-          open(path, "w"), ensure_ascii=False, indent=2)
+state = {"id": pending_id,
+         "message_id": int(result["message_id"]),
+         "chat_id": int(result["chat"]["id"]),
+         "text": os.environ["ANALYSIS"],
+         "posted_x": False, "posted_wip": False}
+
+tmp = path + ".partial"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(state, fh, ensure_ascii=False, indent=2)
+os.replace(tmp, path)
 print(result["message_id"])
 PYEOF
   ); then

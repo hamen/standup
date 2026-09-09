@@ -33,6 +33,11 @@ if [ -n "${FAIL_FIRST:-}" ] && [ ! -f "$CURL_LOG.first" ]; then
   echo '{"ok":false,"description":"Bad Request: stubbed failure"}'
   exit 0
 fi
+# The X preview is a reply, and the only call carrying reply_to_message_id.
+if [ -n "${FAIL_LAST:-}" ] && printf '%s\n' "$@" | grep -q reply_to_message_id; then
+  echo '{"ok":false,"description":"Bad Request: stubbed preview failure"}'
+  exit 7
+fi
 # Accepted, but not the shape the script expects. This is what killed it.
 if [ -n "${OK_BUT_ODD:-}" ]; then
   echo '{"ok":true,"result":{"chat":{"id":1}}}'
@@ -50,7 +55,8 @@ run() { # run <log> <args...>
   # not something a test should rely on.
   env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
       LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
-      ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${CLAUDE_BIN:+CLAUDE_BIN=$CLAUDE_BIN} \
+      ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${FAIL_LAST:+FAIL_LAST=1} \
+      ${CLAUDE_BIN:+CLAUDE_BIN=$CLAUDE_BIN} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -198,6 +204,10 @@ echo "$out" | grep -q 'Sending the report unformatted' ||
 # The report is already in the chat at this point. The script used to die here
 # on an unguarded substitution: no pending state, two buttons that could never
 # work, and a log with neither a "sent" line nor an error in it.
+# The state directory is emptied first. Earlier successful runs leave their own
+# pending files here, and a check that globs the directory would have matched
+# those and passed no matter what this run did.
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
 export OK_BUT_ODD=1
 out=$(run "$TMP/odd.log")
 rc=$?
@@ -206,24 +216,54 @@ unset OK_BUT_ODD
   failures+=("a report with no usable state reported success")
 echo "$out" | grep -q 'WITHOUT a working publish button' ||
   failures+=("a dead publish button was not reported")
-# And nothing half-written may be left behind for the poller to act on.
-if compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" > /dev/null; then
-  bad_state=$(cat "$TMP/fakehome"/.local/state/standup/pending-*.json)
-  case "$bad_state" in
-    *'"message_id"'*) : ;;
-    *) failures+=("a pending state was written without a message id") ;;
-  esac
-fi
+# Nothing at all may be left for the poller: not a half-written file, and not
+# the .partial the atomic write uses on its way there.
+compgen -G "$TMP/fakehome/.local/state/standup/pending-*" > /dev/null &&
+  failures+=("a pending state was left behind for a report whose button is dead")
 
 # --- 6. A cron-line override beats a profile that exports the same name ----
-# The README documents setting CLAUDE_BIN and BIRD_BIN on the cron line. The
-# profile is sourced after those are already in the environment, so without the
-# restore it would silently win and the override would look ignored.
-printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/.bashrc"
-CLAUDE_BIN=/cron/line/claude out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override.log" --check)
-rm -f "$TMP/fakehome/.bashrc"
+# The README documents setting these on the cron line. The profile is sourced
+# after they are already in the environment, so without the restore it wins and
+# the override looks ignored.
+#
+# Asserted on what reached curl, not on --check: --check prints "set" for a
+# credential rather than its value, so it cannot tell which one won — which is
+# exactly how the first version of this test passed with the restore removed.
+for rc_file in .zshrc .bashrc; do
+  printf 'export CLAUDE_BIN=/profile/wins/claude\nexport TELEGRAM_CHAT_ID=profile-chat\n' \
+    > "$TMP/fakehome/$rc_file"
+done
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override.log")
+rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
+grep -q 'chat_id=not-a-chat' "$TMP/override.log" ||
+  failures+=("a shell profile redirected where the standup is posted")
+grep -q 'chat_id=profile-chat' "$TMP/override.log" &&
+  failures+=("the report went to the chat id the profile exported")
+
+# And the same for a non-credential override, through --check.
+for rc_file in .zshrc .bashrc; do
+  printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/$rc_file"
+done
+out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override2.log" --check)
+rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
 echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
   failures+=("a shell profile overrode the CLAUDE_BIN set on the cron line")
+
+# --- 7. The X preview failing must not cost the run ------------------------
+# It is the last thing the script does, and a bare curl under set -e would
+# abort after the report, the state file and the buttons were all in place.
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+export FAIL_LAST=1
+out=$(run "$TMP/preview.log")
+rc=$?
+unset FAIL_LAST
+[ "$rc" -eq 0 ] ||
+  failures+=("a failed X preview aborted a run that had otherwise succeeded")
+echo "$out" | grep -q 'waiting for the publish button' ||
+  failures+=("the run did not report success after a failed X preview")
+compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" > /dev/null ||
+  failures+=("the pending state was lost when the X preview failed")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'
