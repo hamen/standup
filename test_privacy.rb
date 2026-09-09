@@ -11,6 +11,7 @@
 # this is a test.
 
 require 'open3'
+require 'yaml'
 
 ROOT = __dir__
 failures = []
@@ -82,12 +83,22 @@ end
 # reads as a pass.
 config = File.join(ROOT, 'standup.yml')
 if File.file?(config)
-  names = File.read(config).scan(/^\s*-\s*([A-Za-z0-9._-]+)\s*$/).flatten
-  # Every mapping key, not only the ones mapped to a hashtag. repo_name_mapping
-  # maps directory names to display names, and a directory mapped to a plain
-  # name is exactly as private as one mapped to "#something".
-  names += File.read(config).scan(/^\s{2}([A-Za-z0-9._-]+):/).flatten
-  names.uniq!
+  # Parsed as YAML, not scanned with a regex. `- "quoted-name"` and
+  # `"quoted-name": "#project"` are both perfectly ordinary YAML and both
+  # escaped the pattern version — and a private name that escapes this check is
+  # the entire failure this test exists to prevent.
+  #
+  # Every mapping key, too, not only those mapped to a hashtag: repo_name_mapping
+  # maps directories to display names generally, and one mapped to a plain name
+  # is exactly as private as one mapped to "#something".
+  parsed = begin
+    YAML.safe_load(File.read(config)) || {}
+  rescue Psych::SyntaxError => e
+    abort "standup.yml is not valid YAML, so the name check cannot run: #{e.message}"
+  end
+  names = Array(parsed['exclude_repos']).grep(String)
+  names += Array(parsed['repo_name_mapping']).to_h.keys.grep(String) if parsed['repo_name_mapping']
+  names = names.map(&:strip).reject(&:empty?).uniq
 
   # This repository excludes itself from its own report, so its own name is in
   # that list — and its own name is, unavoidably, all over its own README, its
@@ -101,25 +112,25 @@ if File.file?(config)
   own ||= File.basename(Open3.capture2('git', '-C', ROOT, 'rev-parse', '--show-toplevel').first.strip)
   names.delete(own)
 
-  # A name is matched as a whole word, never as a substring of prose. Round 2 of
-  # the plan review caught the substring version: `app-tools` is a real
-  # exclude_repos entry AND appears in the comments in bin/ that explain why the
-  # standup has a bot of its own. Deleting that explanation to satisfy a test
-  # would be the test making the code worse.
+  # A name is matched as a whole word, never as a substring of prose. The
+  # substring version failed on an excluded directory whose name also appeared,
+  # innocently, inside longer words elsewhere in the repository — and a test
+  # that makes you delete an explanation to stay green is making the code worse.
+  #
+  # This comment cannot name the example, for the same reason the home-directory
+  # rule cannot spell out the shape it bans: the check reads this file too.
   # Nothing is excluded by filename, and the example config and the README's
   # fenced blocks least of all: those are the two places the real names lived,
   # and removing published history was the price. An earlier draft skipped them
   # to avoid a placeholder colliding with a real name. That is the wrong trade —
   # if a placeholder here ever matches a real private repository, the right
   # answer is to change the placeholder, and this test saying so is the feature.
+  # Nothing is skipped — not comments, not headings, not fenced blocks. An
+  # earlier draft skipped "#" comments in code so that a legacy comment naming
+  # a tool would not trip it. No such comment survives here, and the exemption
+  # only blinded the check in the files where names actually get pasted.
   contents.each do |file, body|
-    markdown = file.end_with?('.md')
-
     body.each_line.with_index(1) do |line, n|
-      # In Markdown "#" opens a heading, not a comment, and skipping those would
-      # blind the check to a name in a heading.
-      next if !markdown && line.match?(/^\s*#/)
-
       names.each do |name|
         next if name.length < 4
 

@@ -5,6 +5,7 @@ name: tests
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -46,6 +47,11 @@ jobs:
             || { echo "--check did not report the missing credential"; exit 1; }
           echo "$out" | grep -q 'report config:.*MISSING' \
             || { echo "--check did not report the missing config"; exit 1; }
+          # The parent of bin/, not bin/ itself. A regression to $SCRIPT_DIR
+          # would name a standup.rb that does not exist, and every other
+          # assertion here would still pass.
+          echo "$out" | grep -qF "standup.rb:    $PWD/standup.rb" \
+            || { echo "standup.rb did not resolve to the repository root"; exit 1; }
 
       # A stub curl on PATH, so no step below can reach api.telegram.org. Two
       # of these steps run the sender far enough to send, and a workflow that
@@ -73,12 +79,30 @@ jobs:
           echo "$out"
           echo "$out" | grep -qF "report config: $RUNNER_TEMP/dir with space/standup.yml" \
             || { echo "the path did not survive as one argument"; exit 1; }
-          # And the same path through the real argv, which is where the array matters.
-          out=$(STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" \
+          # And the argv itself, which is the only thing that actually proves the
+          # array. A split path does not produce a distinctive error — standup.rb
+          # would just fall back to its defaults and report the wrong tree — so
+          # asserting on a message could never catch it. A stub ruby prints what
+          # it was handed.
+          cat > "$RUNNER_TEMP/stub/ruby" <<'SH'
+          #!/usr/bin/env bash
+          printf 'ARGV[%s]\n' "$@"
+          exit 1
+          SH
+          chmod +x "$RUNNER_TEMP/stub/ruby"
+          # env -i with an empty HOME, so no shell profile is sourced. The
+          # script sources one when it exists, and a profile that rebuilds PATH
+          # discards the stub — which is how this assertion silently proved
+          # nothing the first time it was written.
+          mkdir -p "$RUNNER_TEMP/nohome"
+          out=$(env -i HOME="$RUNNER_TEMP/nohome" PATH="$RUNNER_TEMP/stub:/usr/bin:/bin" \
+                STANDUP_CONFIG="$RUNNER_TEMP/dir with space/standup.yml" \
                 TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
                 bash bin/daily-standup.sh 2>&1 || true)
-          echo "$out" | grep -q 'no usable report config' \
-            && { echo "the path was split before it reached standup.rb"; exit 1; } || true
+          rm -f "$RUNNER_TEMP/stub/ruby"
+          echo "$out"
+          echo "$out" | grep -qF "ARGV[$RUNNER_TEMP/dir with space/standup.yml]" \
+            || { echo "standup.rb did not receive the config path as one argument"; exit 1; }
 
       # The guard sits after this on purpose, and the README tells a newcomer to
       # run --test first. Nothing else notices if a later edit reorders them.

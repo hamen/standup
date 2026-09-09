@@ -77,7 +77,10 @@ if [ "${1:-}" = "--check" ]; then
   cfg="${STANDUP_CONFIG:-$REPO_DIR/standup.yml}"
   echo "repository:    $REPO_DIR"
   echo "standup.rb:    $REPO_DIR/standup.rb $([ -f "$REPO_DIR/standup.rb" ] || echo '(MISSING)')"
-  echo "report config: $cfg $([ -f "$cfg" ] || echo '(MISSING — copy standup.yml.example)')"
+  # -s, matching the guard below. With -f an empty config reports as present
+  # here and is then refused at run time, so --check would describe a run that
+  # cannot happen.
+  echo "report config: $cfg $([ -s "$cfg" ] || echo '(MISSING or EMPTY — copy standup.yml.example)')"
   echo "credentials:   $TELEGRAM_CREDS $([ -f "$TELEGRAM_CREDS" ] || echo '(MISSING — copy standup.env.example)')"
   echo "bot token:     $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo set || echo 'NOT SET')"
   echo "chat id:       $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo set || echo 'NOT SET')"
