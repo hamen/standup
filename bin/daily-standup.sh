@@ -58,7 +58,7 @@ CRON_PATH="$PATH"
 _OVERRIDES=(CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
             STANDUP_STATE_DIR TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
 for _v in "${_OVERRIDES[@]}"; do
-  # ${_v+set}, not -n: a caller that writes VAR= on the cron line means "empty",
+  # ${!_v+set}, not -n: a caller that writes VAR= on the cron line means "empty",
   # and that has to win over a profile export too.
   [ -n "${!_v+set}" ] && printf -v "_caller_$_v" '%s' "${!_v}"
 done
@@ -376,6 +376,11 @@ echo "  Sending to Telegram..."
 
 STATE_DIR="${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
 mkdir -p "$STATE_DIR"
+# A kill between writing the temporary state and renaming it leaves a .partial
+# behind that nothing else ever removes. The poller ignores them; they just
+# accumulate. Swept here rather than at write time, because the write is
+# precisely when the process may not survive to clean up after itself.
+rm -f "$STATE_DIR"/pending-*.json.partial
 PENDING_ID="$TODAY"
 # One button per destination, so a day already published to one place can still
 # be sent to the other. Each destination is recorded on its own, so pressing the
@@ -473,13 +478,19 @@ PYEOF
   # state file holds the wip.co text, and that is what wip.co must receive.
   X_PREVIEW=$(python3 "$SCRIPT_DIR/standup-publish.py" --preview "$PENDING_ID" 2>/dev/null || true)
   if [ -n "$X_PREVIEW" ]; then
-    curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    PREVIEW_RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
       --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
       --data-urlencode "reply_to_message_id=${MESSAGE_ID}" \
       --data-urlencode "disable_web_page_preview=true" \
       --data-urlencode "text=🐦 Su X esce così:
 
-${X_PREVIEW}" > /dev/null || echo "  The X preview could not be sent; the button still works"
+${X_PREVIEW}") || PREVIEW_RESP=""
+    # The body, not just curl's exit code. Telegram rejects with HTTP 200 and
+    # {"ok":false}, so curl succeeds and the rejection would go unmentioned —
+    # the preview is how you approve what goes to X, and its silent absence is
+    # the one failure nobody would think to look for.
+    echo "$PREVIEW_RESP" | grep -q '"ok":true' ||
+      echo "  The X preview could not be sent; the button still works: ${PREVIEW_RESP:0:200}"
   else
     echo "  The X preview could not be sent; the button still works"
   fi
