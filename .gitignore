@@ -2,4 +2,20 @@
 standup.yml
 .standup.yml
 
+# Credentials. Shapes, not names: the next secret to land here will not be
+# called telegram.env, and a public repository is an unforgiving place to
+# learn that. standup.env.example is documentation and is committed — *.env
+# does not match it.
+*.env
+wip-token
 
+# Working files that a `git add -A` sweeps up without anyone deciding to.
+# This is not hypothetical: tools drop firebase-debug.log into the working
+# directory, and five .bak-* copies of these very scripts existed before they
+# were version-controlled.
+*.log
+*.bak
+*.bak-*
+*.bak.*
+.claude/
+__pycache__/

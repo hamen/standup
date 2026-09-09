@@ -1,0 +1,61 @@
+# Until now "the tests pass" meant someone had run them on their laptop, which
+# is the same as the problem this repository was created to fix: two halves of
+# one pipeline, and nothing watching whether they still agree.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: The report reads the day's commits, and only those
+        run: ruby test_standup.rb
+
+      # No dependency step: standup-publish.py imports the standard library
+      # only — json, os, pathlib, random, re, shutil, subprocess, sys, urllib.
+      - name: The publisher's own checks
+        run: python3 bin/standup-publish.py --selftest
+
+      # This one is deliberately partial here, and says so when it runs. The
+      # private repository names live in standup.yml, which is gitignored and
+      # therefore never on a runner, so only the credential and home-directory
+      # rules can fire in CI. The full check runs where the file exists.
+      - name: Nothing private is committed
+        run: ruby test_privacy.rb
+
+      - name: The shell script parses and resolves its paths
+        run: |
+          bash -n bin/daily-standup.sh
+          # A cron-shaped environment, because that is where PATH lookups fail
+          # and an interactive shell hides it.
+          env -i HOME="$HOME" PATH=/usr/bin:/bin bash bin/daily-standup.sh --check
+
+      # Assert the *reason*, not just a non-zero exit. A bare `if ! …` passes on
+      # any failure at all — including one that happened after the guard, on a
+      # path that sends Telegram messages. STANDUP_CONFIG points somewhere that
+      # cannot exist, and the credentials are blanked, so this can never reach a
+      # send even if the guard is one day removed.
+      - name: A missing report config is refused, not defaulted
+        env:
+          STANDUP_CONFIG: /nonexistent/standup.yml
+          STANDUP_CONFIG_DIR: /nonexistent
+          # Present but useless. Blank ones stop the script at the credentials
+          # check, several steps before the guard this test is about — so the
+          # test would pass without ever reaching it.
+          TELEGRAM_BOT_TOKEN: not-a-token
+          TELEGRAM_CHAT_ID: not-a-chat
+        run: |
+          out=$(bash bin/daily-standup.sh 2>&1) && {
+            echo "$out"; echo "ran with no config — it would publish bare directory names"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -q 'no report config at /nonexistent/standup.yml' \
+            || { echo "refused, but not for the reason we are testing"; exit 1; }

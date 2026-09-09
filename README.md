@@ -5,11 +5,16 @@
 <p align="center">
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-f5c518"></a>
   <img alt="Ruby 3.x" src="https://img.shields.io/badge/ruby-3.x-8fb7a0">
-  <img alt="No dependencies" src="https://img.shields.io/badge/dependencies-none-9aa7b8">
+  <img alt="The reporter has no dependencies" src="https://img.shields.io/badge/reporter-no%20dependencies-9aa7b8">
 </p>
 
 A single Ruby file that reads the Git repositories sitting in your projects
 directory and prints what you actually shipped yesterday, grouped by project.
+
+That file is the whole tool, and it needs nothing but Ruby and `git`. There is
+also an optional publisher in `bin/`, which turns the report into a Telegram
+message you approve with a button before anything is posted to X or wip.co. It
+is described at the end, and you can ignore it entirely.
 
 It looks one level down — `~/code/my-app/.git`, not `~/code/work/my-app/.git` —
 so repositories filed inside a subdirectory are not picked up.
@@ -91,7 +96,7 @@ Without the flag, the first of `~/.standup.yml` and `./standup.yml` that exists.
 4. `~/code`, then `~/projects`
 
 ```yaml
-projects_root: /home/you/code
+projects_root: ~/code
 
 # Directory name -> the name the report prints. Hashtags are the common case.
 repo_name_mapping:
@@ -132,8 +137,74 @@ post.
 Keep private work out with `exclude_repos` before you publish anywhere. A
 repository name is a small thing to leak and an awkward one to take back.
 
-A daily cron that pipes the output somewhere — Telegram, an API, your notes —
-is a few lines of shell around `standup`; the tool itself stays a reader.
+### The publisher in `bin/`
+
+`standup` itself only reads and prints. What is in `bin/` is the pipeline built
+around it, kept here rather than in somebody's home directory so that it has a
+history and can be reviewed:
+
+- **`bin/daily-standup.sh`** runs the report, has an LLM summarise it, and sends
+  it to Telegram with three buttons — X, wip.co, both.
+- **`bin/standup-publish.py`** is run by cron every few minutes. It asks Telegram
+  whether a button was pressed, and only then posts: to X with
+  [`bird`](https://github.com/hamen/bird-fork), to wip.co with `POST /v1/todos`.
+
+**Nothing is published without a press.** An unpressed day leaves a state file
+and expires quietly. Each destination is recorded separately, so a day that
+reached X but not wip.co can be retried without tweeting it twice.
+
+The two texts differ on purpose. wip.co needs the hashtags, because that is what
+attaches a todo to a project there; on X a row of hashtags is just noise, so
+they are swapped for each project's name and website, read from wip.co at
+publish time. The X form is sent to you as a reply, so you approve the text you
+will actually post.
+
+This half is not dependency-free: it needs `python3`, `curl`, a Claude CLI for
+the summary, and `bird` only if you publish to X.
+
+#### Setting it up
+
+```console
+$ cp standup.yml.example standup.yml     # who to report on, and who to hide
+$ mkdir -p ~/.config/standup
+$ cp standup.env.example ~/.config/standup/telegram.env   # then edit it
+```
+
+Give the standup a bot of its own rather than sharing one. Telegram hands each
+update to whichever process asks first, so two programs polling one bot means
+the button looks fine and collects nothing.
+
+For wip.co, put the API key alone in `~/.config/standup/wip-token`.
+
+Credentials live outside the repository. `standup.yml` is gitignored, and the
+publisher **refuses to run without it** rather than falling back to a default —
+with no config there is no `exclude_repos`, and every repository under your
+projects root would be published by directory name.
+
+Check what it resolved before trusting it to a scheduler:
+
+```console
+$ bin/daily-standup.sh --check    # prints every path it found, sends nothing
+$ bin/daily-standup.sh --test     # sends one ping, to prove the bot works
+```
+
+#### Cron
+
+```cron
+# Send the standup. Set CLAUDE_BIN: cron's PATH is short.
+30 7 * * * CLAUDE_BIN=/path/to/claude /path/to/standup/bin/daily-standup.sh >> /tmp/daily-standup.log 2>&1
+
+# Collect the button press. Publishes nothing on its own. BIRD_BIN for the
+# same reason — a global npm install is not on cron's PATH.
+*/5 7-12 * * * BIRD_BIN=/path/to/bird /usr/bin/python3 /path/to/standup/bin/standup-publish.py >> /tmp/standup-publish.log 2>&1
+```
+
+Both lines redirect to a log on purpose. A scheduled job that exits non-zero
+with nowhere to say so is indistinguishable from a quiet morning.
+
+Everything is overridable by environment variable: `STANDUP_CONFIG`,
+`STANDUP_CONFIG_DIR`, `STANDUP_STATE_DIR`, `CLAUDE_BIN`, `CLAUDE_TOKEN_ENV`,
+`BIRD_BIN`.
 
 ## `llm-context.md`
 

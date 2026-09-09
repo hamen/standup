@@ -1,4 +1,4 @@
-projects_root: /home/youruser/code
+projects_root: ~/code
 
 # Optional: map repo directory names to display names (often hashtags)
 # Useful if you use project hashtags on communities like wip.co
