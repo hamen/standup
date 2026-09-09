@@ -82,13 +82,19 @@ end
 # reported as usual — into a message with publish buttons on it. Silent repair
 # is the wrong answer to a question about what must not be published.
 def as_utf8(bytes)
-  text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
+  text = retag_utf8(bytes)
   text.valid_encoding? ? text : text.scrub('?')
+end
+
+# The retag itself, shared so the two policies above and below cannot drift
+# apart on what "read this as UTF-8" means.
+def retag_utf8(bytes)
+  bytes.dup.force_encoding(Encoding::UTF_8)
 end
 
 # The config, which must be exactly what was written or nothing at all.
 def config_utf8(bytes, path)
-  text = bytes.to_s.dup.force_encoding(Encoding::UTF_8)
+  text = retag_utf8(bytes)
   return text if text.valid_encoding?
 
   raise "Config file #{path} is not valid UTF-8. Every name in it decides what " \
@@ -135,14 +141,21 @@ end
 
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
-  # No retagging here, deliberately. A review asked for it on the grounds that
-  # a path picks up the locale's encoding like git's output does, and a
-  # repository whose directory name is not ASCII would then miss its
-  # repo_name_mapping entry. Checked rather than assumed: Ruby tags Dir results
-  # with the FILESYSTEM encoding, which is UTF-8 on Linux and macOS whatever
-  # default_external happens to be. The test below pins that with a repository
-  # whose directory name carries diacritics.
-  repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
+  # force_encoding, not scrub: the bytes must reach git untouched, and only the
+  # tag needs to be consistent with the config's.
+  #
+  # This is insurance rather than a fix for something observed. CRuby derives
+  # the filesystem encoding from the locale on Linux, so under cron it should be
+  # US-ASCII and a directory name with diacritics should come back invalid — at
+  # which point a repo_name_mapping lookup misses and, worse, an exclude_repos
+  # entry stops matching and publishes what it was written to hide. Measured on
+  # two builds here (3.3.8 and 3.4.10), Encoding.find('filesystem') does report
+  # US-ASCII and the names still come back UTF-8 and valid, because Ruby falls
+  # back to UTF-8 for non-ASCII filesystem bytes. So this line changes nothing
+  # today. It stays because the cost is one tag and the failure it guards is a
+  # private repository published under its own name.
+  repos = Dir.glob(File.join(root, '*', '.git'))
+              .map { |dot_git| File.dirname(dot_git).dup.force_encoding(Encoding::UTF_8) }
   puts "Found #{repos.size} repositories." if verbose
   repos
 end

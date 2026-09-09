@@ -7,6 +7,15 @@
 
 ENV['TZ'] = 'UTC' # the log window below has no offset, so git reads it as local time
 
+# The suite reads its children's stdout, and that arrives tagged with the
+# SUITE's own locale. Run the suite where there is no LANG — a container, or a
+# reviewer checking this very fix with `env -i` — and every match? and split
+# over an accented fixture raises before a single assertion runs. That is the
+# harness failing while looking like the product failing, which is worse than
+# either. The product does its own retagging; this is only for the test.
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
+
 require 'date'
 require 'fileutils'
 require 'open3'
@@ -152,6 +161,12 @@ end
 # The report is blocks separated by blank lines, each headed by the repository
 # name. Splitting it that way lets an assertion name the repository it means.
 def report_blocks(stdout)
+  # The suite reads a child's stdout, which arrives tagged with the SUITE's
+  # locale. Run the suite itself with no LANG — which is how it runs in a
+  # container, and how a reviewer asked for it to be run — and this split
+  # raises on the first accented character in the fixture. That is the harness
+  # failing, not the product, and it is exactly the confusion worth avoiding.
+  stdout = stdout.dup.force_encoding(Encoding::UTF_8) # belt and braces; see the top of this file
   stdout.split(/\n{2,}/).each_with_object({}) do |block, acc|
     lines = block.lines.map(&:chomp).reject(&:empty?)
     next if lines.empty?
@@ -410,8 +425,11 @@ Dir.mktmpdir do |root|
   failures << 'the report crashed with no locale set' unless no_locale_status.success?
   failures << 'a non-ASCII commit subject was lost with no locale set' unless
     no_locale.include?('păsărele')
+  # A fragment that appears ONLY in llm-context.md. "întârziere" is also a
+  # fixture directory name in this same run, so asserting on it proved the
+  # directory was listed, not that the note was ever read.
   failures << 'a non-ASCII llm-context entry was lost with no locale set' unless
-    no_locale.include?('întârziere')
+    no_locale.include?('più lungo')
 
   # A valid config that is not ASCII: the third input path this change touches,
   # and the one where a wrong answer is a repository published under a name
@@ -443,14 +461,18 @@ Dir.mktmpdir do |root|
   failures << 'exclude_repos wrongly reported a non-ASCII name as unknown' if
     accented.include?('which is not a repository')
 
-  # Printing is the other half, and it is not covered by retagging the input.
-  # Ruby writes a String's bytes to an IO with no external encoding set, and
-  # $stdout has none — so a UTF-8 report reaches a US-ASCII terminal unchanged
-  # rather than raising on conversion. Two reviewers expected a crash here.
-  # This assertion is what pins that, so a future `set_encoding` cannot quietly
-  # reintroduce one.
-  failures << 'the report could not be printed under no locale' unless
-    accented.include?('#întârziere')
+  # Printing is the other half, and retagging the input does not cover it.
+  # Ruby writes a String's bytes to an IO that has no external encoding set,
+  # and $stdout has none, so a UTF-8 report reaches a US-ASCII terminal
+  # unchanged instead of raising on conversion. Two reviewers expected a crash
+  # here; it does not happen, on a pipe or on a redirected file.
+  #
+  # Pinned independently of the checks above: the child reports what it sees,
+  # so a future set_encoding at startup fails here rather than in production.
+  printing, = Open3.capture2e(bare_env, 'ruby', '-e',
+                              'print $stdout.external_encoding.inspect', unsetenv_others: true)
+  failures << "stdout gained an external encoding (#{printing}); UTF-8 output can now raise" unless
+    printing.strip == 'nil'
 
   # The scrub path, checked directly. Getting genuinely invalid bytes into a
   # commit message through git is not reliable — git normalises them on the way
@@ -473,7 +495,9 @@ Dir.mktmpdir do |root|
   # unlike a commit message is a plain file nothing normalises on the way in.
   # The unit check above would not notice someone reverting that call to
   # File.read.
-  bad_note = File.join(root, 'demo-repo', 'llm-context.md')
+  # Its own repository, not demo-repo's file: overwriting that mid-suite made
+  # every earlier assertion depend on the order these blocks happen to run in.
+  bad_note = File.join(root, 'repo-întârziere', 'llm-context.md')
   File.binwrite(bad_note, "#### #{YESTERDAY} - a note with a bad \xC3( byte\n")
   noted, noted_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
                                         '--projects-root', root, '--config', config,
@@ -481,6 +505,10 @@ Dir.mktmpdir do |root|
   noted = noted.dup.force_encoding(Encoding::UTF_8)
   failures << 'an invalid byte in llm-context.md killed the report' unless noted_status.success?
   failures << 'the report emitted invalid bytes from llm-context.md' unless noted.valid_encoding?
+  # And the entry still has to be reported. Returning nothing for it, or
+  # truncating it at the bad byte, would have passed both checks above.
+  failures << 'the note with the bad byte was dropped instead of scrubbed' unless
+    noted.include?('a note with a bad') && noted.include?('byte')
 
   # And the config, which must NOT be repaired: a scrubbed byte inside an
   # exclude_repos entry changes the name, so the repository it was meant to
