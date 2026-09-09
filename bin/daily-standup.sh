@@ -104,22 +104,90 @@ if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
   exit 1
 fi
 
-send_telegram() {
-  local message="$1"
-  local resp
-  resp=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${message}" \
-    --data-urlencode "parse_mode=Markdown")
-  if echo "$resp" | grep -q '"ok":true'; then
+# Render a report as MarkdownV2, or hand back what we were given.
+#
+# Guarded at every call site, and this is not defensive habit: the script runs
+# under `set -euo pipefail`, send_telegram below is the function that reports
+# THAT standup.rb just failed, and the publisher this pipes through is the file
+# most likely to be mid-edit. An unguarded command substitution there would let
+# a broken publisher silence the one message whose whole job is to be loud.
+#
+# On failure the caller sends the unescaped text with no parse_mode, which is
+# ugly and correct, rather than nothing at all — and it says why, because a
+# renderer that silently stops working would look like Telegram being slow.
+# PYTHONUTF8/PYTHONIOENCODING because cron often runs with LANG unset or LANG=C.
+# Modern CPython coerces that to a UTF-8 locale and the emoji in the title
+# survives, but that coercion is a build option, and the failure it prevents is
+# precisely the one this file exists to fix: the renderer dies, the report goes
+# out unformatted, and it looks like Telegram being slow.
+PY_UTF8=(env PYTHONUTF8=1 PYTHONIOENCODING=utf-8)
+
+telegram_markdown() {
+  local out err
+  err=$(mktemp)
+  if out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err"); then
+    rm -f "$err"
+    printf '%s' "$out"
     return 0
   fi
-  # Markdown rejected (e.g. unbalanced entities) — retry as plain text so the
-  # message still gets delivered, and surface the error instead of hiding it.
-  echo "  Telegram Markdown send failed: $resp"
+  echo "  Could not render MarkdownV2: $(head -c 300 "$err" | iconv -f utf-8 -t utf-8 -c 2>/dev/null || head -c 300 "$err")" >&2
+  rm -f "$err"
+  return 1
+}
+
+# The same report, trimmed to Telegram's limit but not escaped: what the
+# plain-text retry should carry. Sending the untrimmed text there means a busy
+# day plus any rejection produces no message at all — which is worse than the
+# unformatted message this fallback exists to guarantee. Falls back to the
+# original if even this cannot run.
+telegram_plain() {
+  local out
+  if out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-plain 2>/dev/null) \
+     && [ -n "$out" ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  # The renderer is the thing that failed, so the last resort cannot use it.
+  # A blunt cut in the shell, well inside the 4096 limit — this is the path
+  # where the alternative is no message at all, and a truncated standup beats
+  # silence. 3800 leaves room for the notice and for any character Telegram
+  # counts as two.
+  if [ "${#1}" -gt 3800 ]; then
+    printf '%s\n\n… truncated; the renderer is not working.' "${1:0:3800}"
+  else
+    printf '%s' "$1"
+  fi
+}
+
+send_telegram() {
+  local message="$1"
+  local resp escaped
+  resp=""
+  # Only attempt MarkdownV2 when there is something escaped to send. Sending the
+  # raw text with parse_mode=MarkdownV2 is a request that cannot succeed — an
+  # unescaped "." is a syntax error there — so it would buy a guaranteed
+  # rejection and a line of noise before the retry below does the real work.
+  if escaped=$(telegram_markdown "$message") && [ -n "$escaped" ]; then
+    resp=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+      --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+      --data-urlencode "text=${escaped}" \
+      --data-urlencode "parse_mode=MarkdownV2") || resp=""
+    if echo "$resp" | grep -q '"ok":true'; then
+      return 0
+    fi
+  fi
+  # Retry as plain text so the message still arrives, and say why rather than
+  # hiding it. The retry sends the UNESCAPED text: resending the escaped payload
+  # without a parse_mode would display \#alpha and dart\_defines, which is a
+  # worse failure than the one being recovered from.
+  #
+  # Only report a rejected send when one was actually attempted — when the
+  # renderer failed, telegram_markdown has already said so, and blaming Telegram
+  # here would send the reader looking in the wrong place.
+  [ -n "$resp" ] && echo "  Telegram MarkdownV2 send failed: $resp"
   resp=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${message}")
+    --data-urlencode "text=$(telegram_plain "$message")") || resp=""
   # Return the truth. The final echo used to be the last command, so this
   # function returned 0 after both attempts had failed — and --test then printed
   # "Test message sent" having sent nothing at all, which is the one thing that
@@ -214,7 +282,7 @@ Format this as a concise, scannable Telegram message:
 - Use plain language, not commit-speak
 - Add a brief one-line summary at the end with total project count
 - Keep it short — this is a standup, not a changelog
-- Use Telegram Markdown: SINGLE asterisk for bold (*bold*), NOT double (**bold**). Use _italic_ for italic.
+- Bold ONLY the project hashtag on its own line, with single asterisks (*#project*), never double. Use no other markup anywhere — no italics, no inline bold, no code spans. Every other character is escaped before sending, so a stray marker is published literally to X and wip.co rather than rendered.
 - Output ONLY the formatted message, nothing else"
 
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
@@ -258,20 +326,30 @@ PENDING_ID="$TODAY"
 # same button twice is a no-op rather than a duplicate.
 KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"🐦 X\",\"callback_data\":\"publish:${PENDING_ID}:x\"},{\"text\":\"📋 wip.co\",\"callback_data\":\"publish:${PENDING_ID}:wip\"}],[{\"text\":\"🚀 Entrambi\",\"callback_data\":\"publish:${PENDING_ID}:both\"}]]}"
 
-RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-  --data-urlencode "text=${ANALYSIS}" \
-  --data-urlencode "parse_mode=Markdown" \
-  --data-urlencode "reply_markup=${KEYBOARD}")
-
-if ! echo "$RESP" | grep -q '"ok":true'; then
-  # Markdown rejected (unbalanced entities, usually). Retry as plain text so the
-  # message and its button still arrive, and say why rather than hiding it.
-  echo "  Telegram Markdown send failed: $RESP"
+# The state file keeps ANALYSIS unescaped — that text is what X and wip.co
+# receive when the button is pressed, and backslashes are not prose. Only what
+# Telegram sees is escaped.
+RESP=""
+if ESCAPED=$(telegram_markdown "$ANALYSIS") && [ -n "$ESCAPED" ]; then
   RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=${ANALYSIS}" \
-    --data-urlencode "reply_markup=${KEYBOARD}")
+    --data-urlencode "text=${ESCAPED}" \
+    --data-urlencode "parse_mode=MarkdownV2" \
+    --data-urlencode "reply_markup=${KEYBOARD}") || RESP=""
+else
+  echo "  Sending the report unformatted"
+fi
+
+if ! echo "$RESP" | grep -q '"ok":true'; then
+  # Retry as plain text so the report and its buttons still arrive. The
+  # UNESCAPED text, not the payload above: resending that without a parse_mode
+  # would show \#alpha and dart\_defines to the reader.
+  # Only when a send was actually attempted — see send_telegram above.
+  [ -n "$RESP" ] && echo "  Telegram MarkdownV2 send failed: $RESP"
+  RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=$(telegram_plain "$ANALYSIS")" \
+    --data-urlencode "reply_markup=${KEYBOARD}") || RESP=""
 fi
 
 if echo "$RESP" | grep -q '"ok":true'; then
