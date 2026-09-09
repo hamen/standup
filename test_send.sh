@@ -141,6 +141,9 @@ echo "$big_first" | grep -q 'trimmed to fit Telegram' ||
 [ -n "$big_retry" ] || failures+=("the oversized report was not retried after rejection")
 echo "$big_retry" | grep -q 'trimmed to fit Telegram' ||
   failures+=("the plain-text retry sent the untrimmed report, which Telegram also rejects")
+# Without the keyboard there is nothing to press, so the day cannot be published.
+echo "$big_retry" | grep -q 'inline_keyboard' ||
+  failures+=("the retry lost the publish buttons")
 
 # Restore the ordinary formatter for anything added after this point.
 cat > "$TMP/stub/claude" <<'SH'
@@ -149,6 +152,13 @@ cat > /dev/null
 printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
 SH
 chmod +x "$TMP/stub/claude"
+
+# --- 3d. The retry keeps its buttons on an ordinary report -----------------
+export FAIL_FIRST=1
+out=$(run "$TMP/retry2.log")
+unset FAIL_FIRST
+call "$TMP/retry2.log" 2 | grep -q 'inline_keyboard' ||
+  failures+=("the ordinary retry lost the publish buttons")
 
 # --- 4. A broken renderer must not stop the message -----------------------
 cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good"
@@ -163,6 +173,21 @@ echo "$out" | grep -q 'Test message sent' ||
   failures+=("a broken renderer made --test fail instead of falling back")
 echo "$out" | grep -q 'Could not render MarkdownV2' ||
   failures+=("a broken renderer failed silently")
+
+# --- 4b. A broken renderer on the REPORT path, which is a different branch --
+cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good2"
+printf 'not python\n' > "$WORK/bin/standup-publish.py"
+out=$(run "$TMP/broken-report.log")
+cp "$TMP/publisher.good2" "$WORK/bin/standup-publish.py"
+first=$(call "$TMP/broken-report.log" 1)
+echo "$first" | grep -q 'parse_mode' &&
+  failures+=("the report path sent a doomed MarkdownV2 request with unescaped text")
+echo "$first" | grep -q 'dart_defines' ||
+  failures+=("a broken renderer stopped the report going out at all")
+echo "$first" | grep -q 'inline_keyboard' ||
+  failures+=("the unformatted report lost its publish buttons")
+echo "$out" | grep -q 'Sending the report unformatted' ||
+  failures+=("the report path did not say it was falling back")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'

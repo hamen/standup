@@ -223,26 +223,43 @@ def fit_telegram(text, limit=TELEGRAM_LIMIT):
         return text
 
     room = limit - payload(marker)
-    blocks = re.split(r"\n\s*\n", text)
+
+    # Split on project headers, not on blank lines. A blank line is wherever the
+    # formatter felt like one — put one between two bullets and a "block" is
+    # half a project, so half a project is what gets dropped.
+    blocks, current = [], []
+    for line in text.split("\n"):
+        if RAW_HEADER.fullmatch(line.strip()) and current:
+            blocks.append("\n".join(current).strip("\n"))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current).strip("\n"))
+
     kept = []
     for block in blocks:
         candidate = kept + [block]
-        if payload("\n\n".join(candidate)) > room:
-            break
-        kept = candidate
+        if payload("\n\n".join(candidate)) <= room:
+            kept = candidate
+            continue
 
-    if not kept:  # even the first block does not fit; cut it by line
-        lines = blocks[0].split("\n")
-        while lines and payload("\n".join(lines)) > room:
+        # This block does not fit whole. Cut it by line rather than dropping it:
+        # an oversized first project used to leave the reader with a title and a
+        # trim marker and no commits at all, because the by-line path could only
+        # run when nothing had been kept — and a report always has a title.
+        lines = block.split("\n")
+        while lines and payload("\n\n".join(kept + ["\n".join(lines)])) > room:
             lines.pop()
-        # And if even one line is too long, cut the line. Dropping it would
-        # leave a message that is nothing but the trim marker.
+        # If even its first line is too long, cut the line itself.
         if not lines:
-            first = blocks[0].split("\n")[0]
-            while first and payload(first) > room:
+            first = block.split("\n")[0]
+            while first and payload("\n\n".join(kept + [first])) > room:
                 first = first[:-1]
-            lines = [first]
-        kept = ["\n".join(lines)]
+            lines = [first] if first else []
+        if lines:
+            kept.append("\n".join(lines))
+        break  # nothing after an overflowing block can fit either
 
     return "\n\n".join(kept) + marker
 
@@ -265,7 +282,12 @@ def strip_telegram_markup(text):
         # anyway. Everywhere else an asterisk is a character somebody committed
         # — "*.rb", "2 * 3" — and deleting it is the same data loss as the
         # underscore this function exists to stop deleting.
-        if bare.startswith("📋") or FMT_HEADER.fullmatch(bare):
+        # Tested with the asterisks removed, so **#alpha** is recognised as the
+        # header it is. FMT_HEADER allows one asterisk a side, and a formatter
+        # that reaches for ** despite the prompt used to have its stars deleted
+        # by the old blanket replace; matching on the bare token restores that
+        # without deleting asterisks anywhere else.
+        if bare.startswith("📋") or FMT_HEADER.fullmatch(bare.replace("*", "")):
             line = line.replace("*", "")
         out.append(line)
     return "\n".join(out).strip()
@@ -569,6 +591,33 @@ def selftest():
     # One block larger than the whole budget still has to come back inside it.
     single = "#solo\n" + "\n".join(f"• subject number {j}." for j in range(600))
     assert tg_len(fit_telegram(single)) <= TELEGRAM_LIMIT
+
+    # The case opencode found: a title, then a first project bigger than the
+    # whole budget. The by-line cut used to be unreachable once anything had
+    # been kept, so the reader got a title and a marker and no commits.
+    fat = ("\U0001F4CB Daily Standup\n\n#alpha\n"
+           + "\n".join(f"• subject number {j}, with some words." for j in range(300))
+           + "\n\n#beta\n• a later project")
+    cut = fit_telegram(fat)
+    assert tg_len(cut) <= TELEGRAM_LIMIT, tg_len(cut)
+    assert "subject number 0" in cut, "the oversized project was dropped, not cut"
+    assert cut.count("•") > 20, f"only {cut.count(chr(8226))} bullets survived"
+
+    # A blank line inside a project is not a project boundary. Splitting on one
+    # drops half a project and keeps the rest.
+    spaced = ("\U0001F4CB Daily Standup\n\n#alpha\n• one\n\n• two after a blank line\n\n"
+              + "\n\n".join(f"#p{i}\n" + "\n".join(f"• filler {j} here." for j in range(40))
+                             for i in range(20)))
+    trimmed_spaced = fit_telegram(spaced)
+    if "#alpha" in trimmed_spaced:
+        assert "• two after a blank line" in trimmed_spaced, \
+            "a project was split at a blank line and half of it dropped"
+
+    # A header the formatter wrote with double asterisks.
+    assert strip_telegram_markup("**#alpha**\n• one").startswith("#alpha"), \
+        "a **bold** header kept its asterisks"
+    assert "*\\#alpha*" in to_markdown_v2(strip_telegram_markup("**#alpha**\n• one")), \
+        "a **bold** header was not re-emphasised"
 
     # And one LINE longer than the budget is cut, not dropped: dropping it left
     # a message consisting of the trim marker and nothing else.

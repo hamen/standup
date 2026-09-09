@@ -130,7 +130,7 @@ telegram_markdown() {
     printf '%s' "$out"
     return 0
   fi
-  echo "  Could not render MarkdownV2: $(head -c 300 "$err")" >&2
+  echo "  Could not render MarkdownV2: $(head -c 300 "$err" | iconv -f utf-8 -t utf-8 -c 2>/dev/null || head -c 300 "$err")" >&2
   rm -f "$err"
   return 1
 }
@@ -141,8 +141,22 @@ telegram_markdown() {
 # unformatted message this fallback exists to guarantee. Falls back to the
 # original if even this cannot run.
 telegram_plain() {
-  printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-plain 2>/dev/null \
-    || printf '%s' "$1"
+  local out
+  if out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-plain 2>/dev/null) \
+     && [ -n "$out" ]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  # The renderer is the thing that failed, so the last resort cannot use it.
+  # A blunt cut in the shell, well inside the 4096 limit — this is the path
+  # where the alternative is no message at all, and a truncated standup beats
+  # silence. 3800 leaves room for the notice and for any character Telegram
+  # counts as two.
+  if [ "${#1}" -gt 3800 ]; then
+    printf '%s\n\n… truncated; the renderer is not working.' "${1:0:3800}"
+  else
+    printf '%s' "$1"
+  fi
 }
 
 send_telegram() {
