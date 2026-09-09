@@ -33,10 +33,51 @@ if [ -n "${FAIL_FIRST:-}" ] && [ ! -f "$CURL_LOG.first" ]; then
   echo '{"ok":false,"description":"Bad Request: stubbed failure"}'
   exit 0
 fi
+# The X preview is a reply, and the only call carrying reply_to_message_id.
+if [ -n "${FAIL_LAST:-}" ] && printf '%s\n' "$@" | grep -q reply_to_message_id; then
+  echo '{"ok":false,"description":"Bad Request: stubbed preview failure"}'
+  exit 7
+fi
+# The same rejection the way Telegram actually sends one: HTTP 200 with a body
+# saying no, which curl reports as complete success.
+if [ -n "${REJECT_PREVIEW:-}" ] && printf '%s\n' "$@" | grep -q reply_to_message_id; then
+  echo '{"ok":false,"description":"Bad Request: message to reply not found"}'
+  exit 0
+fi
+# Accepted, but not the shape the script expects. This is what killed it.
+if [ -n "${OK_BUT_ODD:-}" ]; then
+  echo '{"ok":true,"result":{"chat":{"id":1}}}'
+  exit 0
+fi
 echo '{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}'
 SH
 chmod +x "$TMP/stub/curl"
 
+# As above, but with the locale and the Python UTF-8 variables removed — the
+# environment cron actually provides. The script is supposed to supply those
+# itself; nothing else here proves it does.
+run_no_utf8() {
+  local log="$1"; shift
+  : > "$log"; rm -f "$log.first"
+  # LC_ALL=C and PYTHONCOERCECLOCALE=0: the environment cron gives the script,
+  # with CPython's own C-locale promotion turned off as well.
+  #
+  # Even so, this build reports getpreferredencoding()=utf-8, so removing the
+  # script's encoding="utf-8" and PYTHONUTF8 does NOT make this test fail here.
+  # Measured, both ways round. What it pins is that the state file round-trips
+  # non-ASCII under the environment cron provides; on a build where the default
+  # is not UTF-8 it would also catch their removal. Keeping them is explicitness
+  # that costs nothing, not something this suite can prove locally.
+  env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
+      LC_ALL=C PYTHONCOERCECLOCALE=0 \
+      TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
+      bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
+}
+
+# ${CLAUDE_BIN+...}, not ${CLAUDE_BIN:+...}: the colon form drops an empty
+# value, so a test for "empty beats the profile" would never hand the child
+# the empty value it is testing. That is how the first version of test 11
+# failed against correct code.
 run() { # run <log> <args...>
   local log="$1"; shift
   : > "$log"; rm -f "$log.first"
@@ -45,7 +86,9 @@ run() { # run <log> <args...>
   # not something a test should rely on.
   env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
       LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
-      ${FAIL_FIRST:+FAIL_FIRST=1} \
+      ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${FAIL_LAST:+FAIL_LAST=1} \
+      ${REJECT_PREVIEW:+REJECT_PREVIEW=1} ${TMPDIR:+TMPDIR=$TMPDIR} \
+      ${CLAUDE_BIN+CLAUDE_BIN=$CLAUDE_BIN} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -188,6 +231,157 @@ echo "$first" | grep -q 'inline_keyboard' ||
   failures+=("the unformatted report lost its publish buttons")
 echo "$out" | grep -q 'Sending the report unformatted' ||
   failures+=("the report path did not say it was falling back")
+
+# --- 5. Accepted by Telegram, but not the shape we expected ----------------
+# The report is already in the chat at this point. The script used to die here
+# on an unguarded substitution: no pending state, two buttons that could never
+# work, and a log with neither a "sent" line nor an error in it.
+# The state directory is emptied first. Earlier successful runs leave their own
+# pending files here, and a check that globs the directory would have matched
+# those and passed no matter what this run did.
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+export OK_BUT_ODD=1
+out=$(run "$TMP/odd.log")
+rc=$?
+unset OK_BUT_ODD
+[ "$rc" -ne 0 ] ||
+  failures+=("a report with no usable state reported success")
+echo "$out" | grep -q 'WITHOUT a working publish button' ||
+  failures+=("a dead publish button was not reported")
+# Nothing at all may be left for the poller: not a half-written file, and not
+# the .partial the atomic write uses on its way there.
+compgen -G "$TMP/fakehome/.local/state/standup/pending-*" > /dev/null &&
+  failures+=("a pending state was left behind for a report whose button is dead")
+
+# --- 6. A cron-line override beats a profile that exports the same name ----
+# The README documents setting these on the cron line. The profile is sourced
+# after they are already in the environment, so without the restore it wins and
+# the override looks ignored.
+#
+# Asserted on what reached curl, not on --check: --check prints "set" for a
+# credential rather than its value, so it cannot tell which one won — which is
+# exactly how the first version of this test passed with the restore removed.
+# One profile at a time. The script prefers .zshrc when it exists, so writing
+# both meant the .bashrc branch — a different block, with its own set +eu —
+# was never taken.
+for rc_file in .zshrc .bashrc; do
+  rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
+  printf 'export CLAUDE_BIN=/profile/wins/claude\nexport TELEGRAM_CHAT_ID=profile-chat\n' \
+    > "$TMP/fakehome/$rc_file"
+  rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+  out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override-$rc_file.log")
+
+  grep -q 'chat_id=not-a-chat' "$TMP/override-$rc_file.log" ||
+    failures+=("$rc_file redirected where the standup is posted")
+  grep -q 'chat_id=profile-chat' "$TMP/override-$rc_file.log" &&
+    failures+=("$rc_file's chat id was used for the report")
+
+  out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override-$rc_file-check.log" --check)
+  echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
+    failures+=("$rc_file overrode the CLAUDE_BIN set on the cron line")
+done
+rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
+
+# --- 7. The X preview failing must not cost the run ------------------------
+# It is the last thing the script does, and a bare curl under set -e would
+# abort after the report, the state file and the buttons were all in place.
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+export FAIL_LAST=1
+out=$(run "$TMP/preview.log")
+rc=$?
+unset FAIL_LAST
+[ "$rc" -eq 0 ] ||
+  failures+=("a failed X preview aborted a run that had otherwise succeeded")
+echo "$out" | grep -q 'waiting for the publish button' ||
+  failures+=("the run did not report success after a failed X preview")
+compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" > /dev/null ||
+  failures+=("the pending state was lost when the X preview failed")
+
+# --- 8. No temporary file for the renderer's diagnostic --------------------
+# mktemp fails when TMPDIR points nowhere. That must cost the diagnostic and
+# nothing else.
+#
+# 8a: a WORKING renderer with no temp file must still produce MarkdownV2. An
+# earlier version fell back to /dev/null here, and the success path then ran
+# `rm -f /dev/null`, which fails for an ordinary user — so the function
+# returned non-zero and the report quietly went out unformatted. Delivered,
+# and wrong, which is the hardest kind of failure to notice.
+out=$(TMPDIR=/nonexistent-tmpdir run "$TMP/notmp-ok.log" --test)
+call "$TMP/notmp-ok.log" 1 | grep -q 'parse_mode=MarkdownV2' ||
+  failures+=("a broken TMPDIR silently downgraded the report to plain text")
+# And it must do it quietly. An earlier version fell back to /dev/null, whose
+# cleanup then failed for an ordinary user and put "cannot remove" in the cron
+# log every single morning — harmless, and exactly the kind of daily noise that
+# trains everyone to stop reading that log.
+echo "$out" | grep -qi 'cannot remove' &&
+  failures+=("the run put a spurious rm failure in the log")
+
+# 8b: a BROKEN renderer with no temp file must still deliver, and still say so.
+cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good3"
+printf 'not python\n' > "$WORK/bin/standup-publish.py"
+out=$(TMPDIR=/nonexistent-tmpdir run "$TMP/notmp.log" --test)
+rc=$?
+cp "$TMP/publisher.good3" "$WORK/bin/standup-publish.py"
+[ "$rc" -eq 0 ] ||
+  failures+=("a missing TMPDIR turned a deliverable message into a failure")
+call "$TMP/notmp.log" 1 | grep -q 'text=' ||
+  failures+=("no message was sent when mktemp could not provide a scratch file")
+echo "$out" | grep -q 'Could not render MarkdownV2' ||
+  failures+=("the renderer failure went unreported without a temp file")
+
+# --- 9. A preview Telegram rejects with HTTP 200 ---------------------------
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+export REJECT_PREVIEW=1
+out=$(run "$TMP/reject.log")
+unset REJECT_PREVIEW
+echo "$out" | grep -q 'The X preview could not be sent' ||
+  failures+=("a preview Telegram refused was reported as sent")
+echo "$out" | grep -q 'waiting for the publish button' ||
+  failures+=("a refused preview cost the run its success")
+
+# --- 10. The state file, written with no locale at all ---------------------
+# Every other test hands the script a UTF-8 environment. This one does not, and
+# asserts the pending file the poller depends on comes back correct — text,
+# integer ids, and both posted flags false — parsed rather than grepped.
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '📋 *Daily Standup*\n\n*#alpha*\n• Somnoroase păsărele, e un più lungo\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+out=$(run_no_utf8 "$TMP/nolocale.log")
+rc=$?
+[ "$rc" -eq 0 ] ||
+  failures+=("the report could not be written with no locale: $out")
+
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+if [ -z "$state_file" ]; then
+  failures+=("no pending state was written under a C locale")
+else
+  # Parsed, not grepped: the fields are what the poller depends on, and the
+  # writer was rewritten wholesale in this branch.
+  python3 - "$state_file" <<'PYEOF' || echo "STATE_BAD"
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "păsărele" in s["text"] and "più lungo" in s["text"], "text lost its characters"
+assert isinstance(s["message_id"], int) and isinstance(s["chat_id"], int), "ids are not integers"
+assert s["posted_x"] is False and s["posted_wip"] is False, "a fresh state claims to be posted"
+assert s["id"], "no pending id"
+PYEOF
+  [ $? -eq 0 ] || failures+=("the pending state written under a C locale is wrong")
+fi
+compgen -G "$TMP/fakehome/.local/state/standup/pending-*.partial" > /dev/null &&
+  failures+=("a .partial file was left behind by a successful write")
+
+# --- 11. An override deliberately set to empty ----------------------------
+# VAR= on the cron line means "empty", and has to beat a profile export just
+# like any other value. Only non-empty ones used to be saved.
+printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/.zshrc"
+out=$(CLAUDE_BIN= run "$TMP/empty.log" --check)
+rm -f "$TMP/fakehome/.zshrc"
+echo "$out" | grep -q 'claude:.*/profile/wins/claude' &&
+  failures+=("an empty CLAUDE_BIN on the cron line did not clear the profile export")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'

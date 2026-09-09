@@ -8,6 +8,16 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The standup could be sent and then leave a button that did nothing.** The
+  message id and chat id were pulled out of Telegram's response with unguarded
+  command substitutions, under `set -e`. A response Telegram accepted but shaped
+  unexpectedly — `"ok":true` with no `result.message_id` — killed the script
+  there, *after* the report was already in the chat: no pending state was
+  written, so both publish buttons were dead, and the log carried neither a
+  "sent" line nor an error. Parsing and the state write are now one guarded
+  step, and a failure says plainly that the report went out but its buttons will
+  not work.
+
 - **The report crashed on any day with a non-ASCII commit subject, when run
   without a locale.** Ruby tags bytes from `git` with the locale's encoding;
   with no `LANG` — which is what cron provides — that is US-ASCII, and the first
