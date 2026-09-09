@@ -33,6 +33,11 @@ if [ -n "${FAIL_FIRST:-}" ] && [ ! -f "$CURL_LOG.first" ]; then
   echo '{"ok":false,"description":"Bad Request: stubbed failure"}'
   exit 0
 fi
+# Accepted, but not the shape the script expects. This is what killed it.
+if [ -n "${OK_BUT_ODD:-}" ]; then
+  echo '{"ok":true,"result":{"chat":{"id":1}}}'
+  exit 0
+fi
 echo '{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}'
 SH
 chmod +x "$TMP/stub/curl"
@@ -45,7 +50,7 @@ run() { # run <log> <args...>
   # not something a test should rely on.
   env -i HOME="$TMP/fakehome" PATH="$TMP/stub:/usr/bin:/bin" CURL_LOG="$log" \
       LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
-      ${FAIL_FIRST:+FAIL_FIRST=1} \
+      ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${CLAUDE_BIN:+CLAUDE_BIN=$CLAUDE_BIN} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -188,6 +193,37 @@ echo "$first" | grep -q 'inline_keyboard' ||
   failures+=("the unformatted report lost its publish buttons")
 echo "$out" | grep -q 'Sending the report unformatted' ||
   failures+=("the report path did not say it was falling back")
+
+# --- 5. Accepted by Telegram, but not the shape we expected ----------------
+# The report is already in the chat at this point. The script used to die here
+# on an unguarded substitution: no pending state, two buttons that could never
+# work, and a log with neither a "sent" line nor an error in it.
+export OK_BUT_ODD=1
+out=$(run "$TMP/odd.log")
+rc=$?
+unset OK_BUT_ODD
+[ "$rc" -ne 0 ] ||
+  failures+=("a report with no usable state reported success")
+echo "$out" | grep -q 'WITHOUT a working publish button' ||
+  failures+=("a dead publish button was not reported")
+# And nothing half-written may be left behind for the poller to act on.
+if compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" > /dev/null; then
+  bad_state=$(cat "$TMP/fakehome"/.local/state/standup/pending-*.json)
+  case "$bad_state" in
+    *'"message_id"'*) : ;;
+    *) failures+=("a pending state was written without a message id") ;;
+  esac
+fi
+
+# --- 6. A cron-line override beats a profile that exports the same name ----
+# The README documents setting CLAUDE_BIN and BIRD_BIN on the cron line. The
+# profile is sourced after those are already in the environment, so without the
+# restore it would silently win and the override would look ignored.
+printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/.bashrc"
+CLAUDE_BIN=/cron/line/claude out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override.log" --check)
+rm -f "$TMP/fakehome/.bashrc"
+echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
+  failures+=("a shell profile overrode the CLAUDE_BIN set on the cron line")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'

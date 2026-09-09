@@ -37,6 +37,21 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 CRON_PATH="$PATH"
 
 # ---- Source shell profile (cron runs with minimal env) ----
+#
+# The profile is sourced for PATH, which cron does not give us. It is also a
+# file that can export anything, and everything it exports lands on top of what
+# the cron line set — including the variables the README tells you to set on
+# the cron line. So the caller's values are put back afterwards: an override
+# written where the documentation says to write it has to win over a profile
+# that happens to mention the same name.
+#
+# Insurance rather than a repair: no profile on this machine exports any of
+# these. It costs six lines and removes a class of failure that would look like
+# the override simply being ignored.
+for _v in CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR STANDUP_STATE_DIR; do
+  [ -n "${!_v:-}" ] && eval "_caller_$_v=\${$_v}"
+done
+
 if [ -f "$HOME/.zshrc" ]; then
   export SHELL=/bin/zsh
   set +eu
@@ -50,6 +65,17 @@ elif [ -f "$HOME/.bashrc" ]; then
   source "$HOME/.bashrc" 2>/dev/null || true
   set -eu
 fi
+
+# set +eu turns off only -e and -u, so -o pipefail survives the block above —
+# measured, not assumed, because a review expected otherwise. Restated in full
+# anyway so the script's options do not depend on that detail staying true.
+set -euo pipefail
+
+for _v in CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR STANDUP_STATE_DIR; do
+  _saved="_caller_$_v"
+  [ -n "${!_saved:-}" ] && export "$_v=${!_saved}"
+done
+unset _v _saved
 
 # ---- Load Telegram credentials ----
 #
@@ -124,7 +150,7 @@ PY_UTF8=(env PYTHONUTF8=1 PYTHONIOENCODING=utf-8)
 
 telegram_markdown() {
   local out err
-  err=$(mktemp)
+  err=$(mktemp) || err=/dev/null
   if out=$(printf '%s' "$1" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --telegram-markdown 2>"$err"); then
     rm -f "$err"
     printf '%s' "$out"
@@ -353,18 +379,41 @@ if ! echo "$RESP" | grep -q '"ok":true'; then
 fi
 
 if echo "$RESP" | grep -q '"ok":true'; then
-  MESSAGE_ID=$(echo "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["message_id"])')
-  CHAT_ID=$(echo "$RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin)["result"]["chat"]["id"])')
-  # ANALYSIS goes through the environment, not argv: it is multi-line and long,
-  # and argv quoting is where this kind of thing breaks.
-  export ANALYSIS
-  python3 - "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" "$MESSAGE_ID" "$CHAT_ID" <<'PYEOF'
+  # Parse the response and write the state file in one guarded step.
+  #
+  # These were two unguarded command substitutions, and the script runs under
+  # set -e. A response Telegram accepted but shaped unexpectedly — "ok":true
+  # with no result.message_id — made the extraction raise and killed the script
+  # right here, AFTER the report was already in the chat. The reader got a
+  # standup with two buttons that could never do anything, because no pending
+  # state was ever written, and the log said nothing at all: no "sent" line, no
+  # error, just a run that stopped.
+  #
+  # Together in one call because the two have to agree: a message id without a
+  # state file is a dead button, and a state file without the id it belongs to
+  # cannot be replied to. Text through the environment, not argv, because it is
+  # long and multi-line and that is where quoting breaks.
+  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" python3 - \
+      "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" <<'PYEOF'
 import json, os, sys
-path, pending_id, message_id, chat_id = sys.argv[1:5]
-json.dump({"id": pending_id, "message_id": int(message_id), "chat_id": int(chat_id),
-           "text": os.environ["ANALYSIS"], "posted_x": False, "posted_wip": False},
+
+path, pending_id = sys.argv[1:3]
+result = json.loads(os.environ["RESP"])["result"]
+json.dump({"id": pending_id,
+           "message_id": int(result["message_id"]),
+           "chat_id": int(result["chat"]["id"]),
+           "text": os.environ["ANALYSIS"],
+           "posted_x": False, "posted_wip": False},
           open(path, "w"), ensure_ascii=False, indent=2)
+print(result["message_id"])
 PYEOF
+  ); then
+    echo "  The report was sent, but its state could not be recorded."
+    echo "  The publish buttons on that message will do nothing. Response was: ${RESP:0:300}"
+    echo "[$TODAY] Daily standup sent, but WITHOUT a working publish button."
+    exit 1
+  fi
+
   # Show the X form too, as a reply. The message above is the wip.co form: the
   # hashtags are what attach a todo to a project there. On X they are just a row
   # of words, so standup-publish.py swaps them for the project name and site —
@@ -379,7 +428,7 @@ PYEOF
       --data-urlencode "disable_web_page_preview=true" \
       --data-urlencode "text=🐦 Su X esce così:
 
-${X_PREVIEW}" > /dev/null
+${X_PREVIEW}" > /dev/null || echo "  The X preview could not be sent; the button still works"
   else
     echo "  X preview failed; the button still works, you just cannot see the X form"
   fi
