@@ -330,6 +330,30 @@ Dir.mktmpdir do |root|
   failures << 'excluding every active repository did not report a quiet day' unless
     silent.include?('No activity found')
 
+  # A config that was asked for by name and is not there must stop the run.
+  #
+  # This is not hypothetical. On 2026-09-09 a config path was split before it
+  # reached here, standup.rb answered with an empty config, and the report ran
+  # with no exclude_repos: every repository under the projects root, named by
+  # its directory, in a message with publish buttons attached to it. A silent
+  # default is the wrong answer to "read this file".
+  missing_out, missing_status = Open3.capture2e({ 'HOME' => fake_home },
+                                                'ruby', SCRIPT, '--projects-root', root,
+                                                '--config', File.join(root, 'not-here.yml'))
+
+  failures << 'a config named on the command line and missing did not stop the run' if
+    missing_status.success?
+  failures << 'the missing-config error does not name the file' unless
+    missing_out.include?('not-here.yml')
+  failures << 'a report was printed despite the missing config' if
+    missing_out.include?('the shell-name commit')
+
+  # And the opposite: no --config at all still falls back, which is what makes
+  # the tool usable with no configuration.
+  _, bare_status = Open3.capture2e({ 'HOME' => fake_home },
+                                   'ruby', SCRIPT, '--projects-root', root)
+  failures << 'running with no config at all stopped working' unless bare_status.success?
+
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
   else

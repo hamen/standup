@@ -132,8 +132,10 @@ if File.file?(config)
   contents.each do |file, body|
     body.each_line.with_index(1) do |line, n|
       names.each do |name|
-        next if name.length < 4
-
+        # No length floor. It used to skip anything under four characters, which
+        # is exactly the shape of the names most likely to be missed — a repo
+        # called "api" or "wip" could sit in any tracked file. The whole-word
+        # match below is what keeps short names from firing on prose.
         failures << "the private repository name #{name.inspect}: #{file}:#{n}" if
           line.match?(/(?<![A-Za-z0-9._-])#{Regexp.escape(name)}(?![A-Za-z0-9._-])/)
       end

@@ -31,7 +31,14 @@ jobs:
       # therefore never on a runner, so only the credential and home-directory
       # rules can fire in CI. The full check runs where the file exists.
       - name: Nothing private is committed
-        run: ruby test_privacy.rb
+        run: |
+          out=$(ruby test_privacy.rb)
+          echo "$out"
+          # The name check cannot run here — standup.yml is gitignored — and a
+          # skip that says nothing reads as a pass. Assert that it announces
+          # itself, so the day it silently stops running is the day CI notices.
+          echo "$out" | grep -q 'name check SKIPPED: no standup.yml' \
+            || { echo "the privacy test no longer says which check it skipped"; exit 1; }
 
       - name: The shell script parses and resolves its paths
         run: |
@@ -52,6 +59,13 @@ jobs:
           # assertion here would still pass.
           echo "$out" | grep -qF "standup.rb:    $PWD/standup.rb" \
             || { echo "standup.rb did not resolve to the repository root"; exit 1; }
+          # The documented fallbacks, which are what a machine without either
+          # binary on PATH actually gets. A regression to a bare `command -v`
+          # would print nothing useful here.
+          echo "$out" | grep -q 'claude:.*\.local/bin/claude' \
+            || { echo "--check did not fall back to the documented claude path"; exit 1; }
+          echo "$out" | grep -q 'bird:.*\.npm-global/bin/bird' \
+            || { echo "--check did not fall back to the documented bird path"; exit 1; }
 
       # A stub curl on PATH, so no step below can reach api.telegram.org. Two
       # of these steps run the sender far enough to send, and a workflow that

@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -90,7 +91,6 @@ def telegram(token, method, **params):
             # rather than dying quietly in a cron log.
             warn_conflict(token)
             die("another process is polling this bot (HTTP 409); the publish button is dead until it stops")
-        raise
     if not body.get("ok"):
         die(f"telegram {method} failed: {body}")
     return body["result"]

@@ -30,6 +30,12 @@ SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # standup.rb sits at the repository root; this script sits in bin/ beneath it.
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 
+# The PATH as the scheduler handed it over, before any profile below widens it.
+# --check reports bird against this one: bird is run by standup-publish.py, which
+# is invoked directly by cron and sources no profile at all. Resolving it against
+# the widened PATH would report a binary that the poller cannot see.
+CRON_PATH="$PATH"
+
 # ---- Source shell profile (cron runs with minimal env) ----
 if [ -f "$HOME/.zshrc" ]; then
   export SHELL=/bin/zsh
@@ -85,7 +91,7 @@ if [ "${1:-}" = "--check" ]; then
   echo "bot token:     $([ -n "${TELEGRAM_BOT_TOKEN:-}" ] && echo set || echo 'NOT SET')"
   echo "chat id:       $([ -n "${TELEGRAM_CHAT_ID:-}" ] && echo set || echo 'NOT SET')"
   claude_at="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
-  bird_at="${BIRD_BIN:-$(command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
+  bird_at="${BIRD_BIN:-$(PATH="$CRON_PATH" command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
   echo "claude:        $claude_at $([ -x "$claude_at" ] || echo '(MISSING — set CLAUDE_BIN)')"
   echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
   echo "publisher:     $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
@@ -114,14 +120,25 @@ send_telegram() {
   resp=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${message}")
-  echo "$resp" | grep -q '"ok":true' || echo "  Plain-text send also failed: $resp"
+  # Return the truth. The final echo used to be the last command, so this
+  # function returned 0 after both attempts had failed — and --test then printed
+  # "Test message sent" having sent nothing at all, which is the one thing that
+  # flag exists to tell you.
+  if echo "$resp" | grep -q '"ok":true'; then
+    return 0
+  fi
+  echo "  Plain-text send also failed: $resp"
+  return 1
 }
 
 # ---- Test mode ----
 if [ "${1:-}" = "--test" ]; then
-  send_telegram "✅ Daily standup bot is working. $(date '+%Y-%m-%d %H:%M')"
-  echo "Test message sent."
-  exit 0
+  if send_telegram "✅ Daily standup bot is working. $(date '+%Y-%m-%d %H:%M')"; then
+    echo "Test message sent."
+    exit 0
+  fi
+  echo "Test message NOT sent — see the error above."
+  exit 1
 fi
 
 # ---- Config ----
@@ -140,7 +157,10 @@ STANDUP_CONFIG="${STANDUP_CONFIG:-$REPO_DIR/standup.yml}"
 #
 # Checked here and not earlier on purpose: --test and --check must still work on
 # a fresh clone, because proving the bot works is the first thing anyone does.
-if [ ! -s "$STANDUP_CONFIG" ]; then
+# Not just non-empty: a file of blank lines, or one holding nothing but "---",
+# is a zero-byte config as far as the report is concerned, and the whole point
+# of this guard is what an empty config publishes.
+if [ ! -s "$STANDUP_CONFIG" ] || ! grep -qE '^[[:space:]]*[^#[:space:]-]' "$STANDUP_CONFIG"; then
   echo "ERROR: no usable report config at $STANDUP_CONFIG"
   # -s, not -f: an empty file parses to an empty config, which is exactly the
   # publish-everything case this guard exists to stop.
