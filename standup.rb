@@ -38,7 +38,7 @@ def load_config(explicit_path: nil, verbose: false)
   raise "Config file not found: #{explicit_path}" if path.nil? && explicit_path
   return { config: {}, path: nil } unless path
 
-  raw = File.read(path)
+  raw = config_utf8(File.binread(path), path)
   config = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
   puts "Loaded config: #{path}" if verbose
   { config: config, path: path }
@@ -64,6 +64,43 @@ def repo_display_name(repo_basename, repo_name_mapping)
   (repo_name_mapping && repo_name_mapping[repo_basename]) || repo_basename
 end
 
+# Bytes from outside this process, read as UTF-8 whatever the environment says.
+#
+# Ruby tags external bytes with the locale's encoding. Under cron there is no
+# LANG, so that encoding is US-ASCII, and the first accented character in a
+# commit subject then raises "invalid byte sequence in US-ASCII" on the split
+# that follows — the whole standup dies on an ordinary working day. Commit
+# messages, configs and notes are UTF-8 by convention, so say so rather than
+# letting the environment decide.
+#
+# Scrubbing is right for what this reads OUT of repositories: one stray byte in
+# an old commit message should cost that character, not the day's report.
+#
+# It is exactly wrong for the config, which is why that has its own function
+# below. A scrubbed byte inside an exclude_repos entry changes the name, the
+# name then matches no repository, and the repository it was meant to hide is
+# reported as usual — into a message with publish buttons on it. Silent repair
+# is the wrong answer to a question about what must not be published.
+def as_utf8(bytes)
+  text = retag_utf8(bytes)
+  text.valid_encoding? ? text : text.scrub('?')
+end
+
+# The retag itself, shared so the two policies above and below cannot drift
+# apart on what "read this as UTF-8" means.
+def retag_utf8(bytes)
+  bytes.dup.force_encoding(Encoding::UTF_8)
+end
+
+# The config, which must be exactly what was written or nothing at all.
+def config_utf8(bytes, path)
+  text = retag_utf8(bytes)
+  return text if text.valid_encoding?
+
+  raise "Config file #{path} is not valid UTF-8. Every name in it decides what " \
+        "is published, so it is read exactly or not at all."
+end
+
 # Run git in a repository and return its stdout, or "" if it failed.
 #
 # Every argument goes to git as one argv entry, so nothing here reaches a
@@ -71,7 +108,10 @@ end
 # and a name holding $(...) or a backtick used to run as a command.
 def git_capture(repo_path, *args)
   out, err, status = Open3.capture3('git', '-C', repo_path.to_s, *args)
+  out = as_utf8(out)
   return out if status.success?
+
+  err = as_utf8(err)
 
   # A missing config key exits non-zero and says nothing, which is a normal
   # answer. Anything git does complain about is worth seeing, because the
@@ -101,7 +141,21 @@ end
 
 def find_git_repos(root, verbose: false)
   puts "Scanning #{root} for Git repositories..." if verbose
-  repos = Dir.glob(File.join(root, '*', '.git')).map { |dot_git| File.dirname(dot_git) }
+  # force_encoding, not scrub: the bytes must reach git untouched, and only the
+  # tag needs to be consistent with the config's.
+  #
+  # This is insurance rather than a fix for something observed. CRuby derives
+  # the filesystem encoding from the locale on Linux, so under cron it should be
+  # US-ASCII and a directory name with diacritics should come back invalid — at
+  # which point a repo_name_mapping lookup misses and, worse, an exclude_repos
+  # entry stops matching and publishes what it was written to hide. Measured on
+  # two builds here (3.3.8 and 3.4.10), Encoding.find('filesystem') does report
+  # US-ASCII and the names still come back UTF-8 and valid, because Ruby falls
+  # back to UTF-8 for non-ASCII filesystem bytes. So this line changes nothing
+  # today. It stays because the cost is one tag and the failure it guards is a
+  # private repository published under its own name.
+  repos = Dir.glob(File.join(root, '*', '.git'))
+              .map { |dot_git| File.dirname(dot_git).dup.force_encoding(Encoding::UTF_8) }
   puts "Found #{repos.size} repositories." if verbose
   repos
 end
@@ -159,7 +213,7 @@ def get_llm_context_entries(repo_path, target_date)
   return { entries: [], modified: was_modified } unless File.exist?(llm_context_path)
 
   # Read the file and look for date-stamped entries
-  content = File.read(llm_context_path)
+  content = as_utf8(File.binread(llm_context_path))
   
   # Look for date-stamped entries (#### YYYY-MM-DD – Title)
   # Handle both regular hyphens and en-dashes in dates

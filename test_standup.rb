@@ -7,6 +7,15 @@
 
 ENV['TZ'] = 'UTC' # the log window below has no offset, so git reads it as local time
 
+# The suite reads its children's stdout, and that arrives tagged with the
+# SUITE's own locale. Run the suite where there is no LANG — a container, or a
+# reviewer checking this very fix with `env -i` — and every match? and split
+# over an accented fixture raises before a single assertion runs. That is the
+# harness failing while looking like the product failing, which is worse than
+# either. The product does its own retagging; this is only for the test.
+Encoding.default_external = Encoding::UTF_8
+Encoding.default_internal = nil
+
 require 'date'
 require 'fileutils'
 require 'open3'
@@ -44,6 +53,12 @@ def build_repo(path)
     git('checkout', '-q', '-b', 'feature')
     commit('the commit that must show up', YESTERDAY)
 
+    # A subject that is not ASCII, because most of them are not. This is what
+    # the no-locale case below reads: with no LANG, Ruby tags git's bytes
+    # US-ASCII and raises on the first character like these.
+    commit('seo(ro): Somnoroase păsărele, and a bedtime routine', YESTERDAY,
+           file: 'accented.txt')
+
     # An llm-context.md that exists only on that branch.
     commit('add llm-context on the feature branch', YESTERDAY, file: 'llm-context.md',
            content: "#### #{YESTERDAY} - branch-only entry\n")
@@ -56,6 +71,13 @@ def build_repo(path)
     git('merge', '--no-ff', '-q', '-m', 'Merge pull request #99 from feature', 'feature')
     ENV.delete('GIT_COMMITTER_DATE')
     git('checkout', '-q', 'main')
+
+    # An llm-context.md entry in the CHECKOUT, with characters that are not
+    # ASCII. The branch-only ones above are reported as "was updated" without
+    # ever being read; this is the one that exercises reading the file, which
+    # is the other place the locale used to decide the encoding.
+    commit('note the delay', YESTERDAY, file: 'llm-context.md',
+           content: "#### #{YESTERDAY} - una întârziere, e un più lungo\n")
 
     # An uncommitted change, stashed yesterday. Its stash commits are not work.
     File.write('file.txt', "stashed edit\n")
@@ -139,6 +161,12 @@ end
 # The report is blocks separated by blank lines, each headed by the repository
 # name. Splitting it that way lets an assertion name the repository it means.
 def report_blocks(stdout)
+  # The suite reads a child's stdout, which arrives tagged with the SUITE's
+  # locale. Run the suite itself with no LANG — which is how it runs in a
+  # container, and how a reviewer asked for it to be run — and this split
+  # raises on the first accented character in the fixture. That is the harness
+  # failing, not the product, and it is exactly the confusion worth avoiding.
+  stdout = stdout.dup.force_encoding(Encoding::UTF_8) # belt and braces; see the top of this file
   stdout.split(/\n{2,}/).each_with_object({}) do |block, acc|
     lines = block.lines.map(&:chomp).reject(&:empty?)
     next if lines.empty?
@@ -176,6 +204,21 @@ Dir.mktmpdir do |root|
                       'Regex [Meta] User', 'the regex-name commit')
   build_unidentified_repo(File.join(root, 'empty-name-repo'), 'the empty-name commit')
   build_unidentified_repo(File.join(root, 'no-name-repo'), 'the absent-name commit', name: nil)
+  # A repository whose DIRECTORY name is not ASCII. Names come off the
+  # filesystem with the locale's encoding, and a mapping lookup compares
+  # strings — which is false across incompatible encodings even when the bytes
+  # are identical. A repository quietly losing its mapping is how it ends up
+  # published under its own directory name.
+  build_odd_name_repo(File.join(root, 'repo-întârziere'),
+                      'Accented Dir User', 'the accented-directory commit')
+  # And one that a non-ASCII exclude_repos entry has to hide. If the entry
+  # stops matching, this commit is published.
+  build_odd_name_repo(File.join(root, 'hidden-întârziere'),
+                      'Hidden Dir User', 'the hidden-directory commit')
+  # A broken repository whose path is not ASCII, so git's own error message —
+  # which git_capture retags and warns with — carries characters that used to
+  # be the problem.
+  build_broken_repo(File.join(root, 'broken-întârziere'))
   build_broken_repo(File.join(root, 'broken-repo'))
   build_unborn_repo(File.join(root, 'unborn-repo'))
 
@@ -353,6 +396,134 @@ Dir.mktmpdir do |root|
   _, bare_status = Open3.capture2e({ 'HOME' => fake_home },
                                    'ruby', SCRIPT, '--projects-root', root)
   failures << 'running with no config at all stopped working' unless bare_status.success?
+
+  # The report must survive an environment with no locale, which is the one
+  # cron provides.
+  #
+  # Ruby tags bytes from git with the locale's encoding. With no LANG that is
+  # US-ASCII, and the first accented character in a commit subject raises
+  # "invalid byte sequence in US-ASCII" — so a day with one Romanian or Italian
+  # commit killed the whole standup. It survived only because the wrapper script
+  # sources a shell profile that happens to set LANG, which is protection by
+  # accident: anything invoking standup.rb directly from cron crashed.
+  # unsetenv_others, because an Open3 env hash MERGES with the parent. An
+  # inherited LC_CTYPE — normal when working over ssh from a Mac — or a
+  # RUBYOPT=-E would keep a UTF-8 locale alive in the child, and this test would
+  # pass without the fix while looking like it had proved something.
+  # The parent environment minus the things this test is about. Passing only
+  # HOME and PATH also drops GEM_PATH, RUBYLIB and any version-manager shim, so
+  # a failure would say "no locale" while meaning "no gems".
+  bare_env = ENV.to_h.merge('HOME' => fake_home)
+  %w[LANG LC_ALL LC_CTYPE LC_MESSAGES LANGUAGE RUBYOPT].each { |k| bare_env.delete(k) }
+  no_locale, no_locale_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
+                                                '--projects-root', root, '--config', config,
+                                                unsetenv_others: true)
+  # If the suite itself runs under a C locale, capture2e tags this US-ASCII and
+  # the comparison below raises instead of failing.
+  no_locale = no_locale.dup.force_encoding(Encoding::UTF_8)
+
+  failures << 'the report crashed with no locale set' unless no_locale_status.success?
+  failures << 'a non-ASCII commit subject was lost with no locale set' unless
+    no_locale.include?('păsărele')
+  # A fragment that appears ONLY in llm-context.md. "întârziere" is also a
+  # fixture directory name in this same run, so asserting on it proved the
+  # directory was listed, not that the note was ever read.
+  failures << 'a non-ASCII llm-context entry was lost with no locale set' unless
+    no_locale.include?('più lungo')
+
+  # A valid config that is not ASCII: the third input path this change touches,
+  # and the one where a wrong answer is a repository published under a name
+  # nobody chose. Loaded in the same no-locale child.
+  accented_config = File.join(Dir.tmpdir, "standup-accented-#{Process.pid}.yml")
+  # binwrite: written through the suite's own default_external, a C-locale run
+  # would transcode these characters before the child ever saw them, and the
+  # test would assert something that was never in the file.
+  File.binwrite(accented_config,
+                "repo_name_mapping:\n  demo-repo: \"#întârziere\"\n" \
+                "  repo-întârziere: \"#accenteddir\"\n" \
+                "exclude_repos:\n  - hidden-întârziere\n")
+  accented, accented_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
+                                              '--projects-root', root,
+                                              '--config', accented_config,
+                                              unsetenv_others: true)
+  accented = accented.dup.force_encoding(Encoding::UTF_8)
+
+  failures << 'a config with non-ASCII names crashed with no locale set' unless
+    accented_status.success?
+  failures << 'a non-ASCII mapped name was not applied' unless
+    accented.include?('#întârziere')
+  failures << 'a repository with a non-ASCII directory name lost its mapping' unless
+    accented.include?('#accenteddir')
+  # The consequence that matters: an exclude_repos entry that stops matching
+  # publishes the repository it was written to hide.
+  failures << 'a non-ASCII exclude_repos entry stopped matching' if
+    accented.include?('the hidden-directory commit')
+  failures << 'exclude_repos wrongly reported a non-ASCII name as unknown' if
+    accented.include?('which is not a repository')
+
+  # Printing is the other half, and retagging the input does not cover it.
+  # Ruby writes a String's bytes to an IO that has no external encoding set,
+  # and $stdout has none, so a UTF-8 report reaches a US-ASCII terminal
+  # unchanged instead of raising on conversion. Two reviewers expected a crash
+  # here; it does not happen, on a pipe or on a redirected file.
+  #
+  # Pinned independently of the checks above: the child reports what it sees,
+  # so a future set_encoding at startup fails here rather than in production.
+  printing, = Open3.capture2e(bare_env, 'ruby', '-e',
+                              'print $stdout.external_encoding.inspect', unsetenv_others: true)
+  failures << "stdout gained an external encoding (#{printing}); UTF-8 output can now raise" unless
+    printing.strip == 'nil'
+
+  # The scrub path, checked directly. Getting genuinely invalid bytes into a
+  # commit message through git is not reliable — git normalises them on the way
+  # in — and a test that silently stops exercising what it names is worse than
+  # no test. standup.rb only runs its main block when invoked as a program, so
+  # requiring it here is safe.
+  require_relative 'standup'
+
+  bad = as_utf8("a subject with a bad byte: \xC3( here")
+  failures << 'an invalid byte was passed through instead of scrubbed' unless
+    bad.valid_encoding?
+  failures << 'scrubbing threw away the rest of the subject' unless
+    bad.include?('a subject with a bad byte') && bad.include?('here')
+
+  good = as_utf8('Somnoroase păsărele'.dup.force_encoding(Encoding::ASCII_8BIT))
+  failures << 'valid UTF-8 was altered on the way through' unless
+    good == 'Somnoroase păsărele'
+
+  # And end to end, through the call site: a bad byte in llm-context.md, which
+  # unlike a commit message is a plain file nothing normalises on the way in.
+  # The unit check above would not notice someone reverting that call to
+  # File.read.
+  # Its own repository, not demo-repo's file: overwriting that mid-suite made
+  # every earlier assertion depend on the order these blocks happen to run in.
+  bad_note = File.join(root, 'repo-întârziere', 'llm-context.md')
+  File.binwrite(bad_note, "#### #{YESTERDAY} - a note with a bad \xC3( byte\n")
+  noted, noted_status = Open3.capture2e(bare_env, 'ruby', SCRIPT,
+                                        '--projects-root', root, '--config', config,
+                                        unsetenv_others: true)
+  noted = noted.dup.force_encoding(Encoding::UTF_8)
+  failures << 'an invalid byte in llm-context.md killed the report' unless noted_status.success?
+  failures << 'the report emitted invalid bytes from llm-context.md' unless noted.valid_encoding?
+  # And the entry still has to be reported. Returning nothing for it, or
+  # truncating it at the bad byte, would have passed both checks above.
+  failures << 'the note with the bad byte was dropped instead of scrubbed' unless
+    noted.include?('a note with a bad') && noted.include?('byte')
+
+  # And the config, which must NOT be repaired: a scrubbed byte inside an
+  # exclude_repos entry changes the name, so the repository it was meant to
+  # hide is published as usual.
+  bad_config = File.join(Dir.tmpdir, "standup-bad-bytes-#{Process.pid}.yml")
+  File.binwrite(bad_config, "exclude_repos:\n  - demo\xC3(repo\n")
+  bad_out, bad_status = Open3.capture2e(bare_env, 'ruby', SCRIPT, '--projects-root', root,
+                                        '--config', bad_config, unsetenv_others: true)
+  failures << 'a config with invalid UTF-8 was silently repaired instead of refused' if
+    bad_status.success?
+  failures << 'the invalid-config error does not say which file' unless
+    bad_out.include?('standup-bad-bytes')
+
+
+  [accented_config, bad_config].each { |f| File.delete(f) if f && File.exist?(f) }
 
   if failures.empty?
     puts 'ok: the standup reports the day\'s commits, and only those'
