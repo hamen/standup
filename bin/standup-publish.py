@@ -206,6 +206,16 @@ def to_markdown_v2(text):
 TELEGRAM_LIMIT = 4096
 
 
+def tg_len(text):
+    """Length as Telegram counts it: UTF-16 code units, not code points.
+
+    The 📋 in the title is one Python character and two of these. Counting
+    Python characters gives a budget that is quietly too generous for exactly
+    the reports that carry emoji, which is all of them.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def fit_telegram(text, limit=TELEGRAM_LIMIT):
     """Trim the report to what Telegram will accept, on a boundary that reads.
 
@@ -217,22 +227,31 @@ def fit_telegram(text, limit=TELEGRAM_LIMIT):
     Whole project blocks go first, because half a project is worse than a named
     omission. If one block alone is too big, that block is cut by line.
     """
+    # Measured against the FINAL payload, to_markdown_v2 included. Measuring the
+    # escape alone was the same mistake this function exists to prevent, one
+    # layer up: to_markdown_v2 wraps the title and every project header in
+    # asterisks afterwards, so a report could pass this check and still be
+    # rejected — and the send would degrade to plain text, which is the failure
+    # the whole branch removes.
+    def payload(t):
+        return tg_len(to_markdown_v2(t))
+
     marker = "\n\n… trimmed to fit Telegram; the published version is complete."
-    if len(escape_mdv2(text)) <= limit:
+    if payload(text) <= limit:
         return text
 
-    room = limit - len(escape_mdv2(marker))
+    room = limit - payload(marker)
     blocks = re.split(r"\n\s*\n", text)
     kept = []
     for block in blocks:
         candidate = kept + [block]
-        if len(escape_mdv2("\n\n".join(candidate))) > room:
+        if payload("\n\n".join(candidate)) > room:
             break
         kept = candidate
 
     if not kept:  # even the first block does not fit; cut it by line
         lines = blocks[0].split("\n")
-        while lines and len(escape_mdv2("\n".join(lines))) > room:
+        while lines and payload("\n".join(lines)) > room:
             lines.pop()
         kept = ["\n".join(lines)]
 
@@ -484,6 +503,16 @@ def selftest():
     # output as already-escaped are mutually exclusive, and the loop above
     # requires the former.
 
+    # The CLI composes these three, and only the pieces were tested. A header
+    # arrives from the formatter as *#alpha*, and must survive stripping and
+    # come back bold — with its "#" escaped, which is what the earlier
+    # by-hand rendering got wrong.
+    cli = to_markdown_v2(fit_telegram(strip_telegram_markup(
+        "\U0001F4CB Daily Standup — 2026-09-09\n\n*#alpha*\n• one dart_defines here")))
+    assert "*\\#alpha*" in cli, cli
+    assert "dart\\_defines" in cli, cli
+    assert "**" not in cli, "the formatter's asterisks were not stripped first"
+
     # --- The length guard --------------------------------------------------
     small = "\U0001F4CB Daily Standup\n\n#alpha\n• one\n\n#beta\n• two"
     assert fit_telegram(small) == small, "a report that fits must not be touched"
@@ -493,15 +522,27 @@ def selftest():
         for i in range(30))
     trimmed = fit_telegram(big)
     rendered = to_markdown_v2(trimmed)
-    assert len(rendered) <= TELEGRAM_LIMIT, len(rendered)
+    assert tg_len(rendered) <= TELEGRAM_LIMIT, tg_len(rendered)
     assert "trimmed to fit Telegram" in trimmed, "a trim has to say so"
     assert not re.search(r"(?<!\\)\\$", rendered), "the render ends in a dangling escape"
     # Trimming drops whole projects, never half of one.
     assert trimmed.count("#p0") == 1 and "• a commit subject, number 19." in trimmed
 
+    # The case the busy-day report above cannot catch: escaped text just under
+    # the limit, which the emphasis added afterwards pushes over.
+    headers = "\n\n".join(f"#project{i}\n• a subject." for i in range(40))
+    filler = "\U0001F4CB Daily Standup\n\n" + headers
+    while tg_len(escape_mdv2(filler)) < TELEGRAM_LIMIT - 40:
+        filler += "\n• another subject line here."
+    assert tg_len(escape_mdv2(filler)) <= TELEGRAM_LIMIT, "the fixture must fit before emphasis"
+    assert tg_len(to_markdown_v2(filler)) > TELEGRAM_LIMIT, \
+        "the fixture must exceed the limit only after emphasis is added"
+    assert tg_len(to_markdown_v2(fit_telegram(filler))) <= TELEGRAM_LIMIT, \
+        "the guard measured the escape instead of the payload"
+
     # One block larger than the whole budget still has to come back inside it.
     single = "#solo\n" + "\n".join(f"• subject number {j}." for j in range(600))
-    assert len(to_markdown_v2(fit_telegram(single))) <= TELEGRAM_LIMIT
+    assert tg_len(to_markdown_v2(fit_telegram(single))) <= TELEGRAM_LIMIT
 
     print("selftest ok")
 
