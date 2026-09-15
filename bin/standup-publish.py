@@ -18,7 +18,6 @@ import random
 import re
 import shutil
 import subprocess
-import shutil
 import sys
 import tempfile
 import time
@@ -360,7 +359,12 @@ def _lead_files():
 
 @contextlib.contextmanager
 def _lead_lock():
-    """Serialise the read-modify-write. Yields even if the lock cannot be taken.
+    """Yields True when the lock is held, False when it could not be taken.
+
+    A caller that gets False must read nothing and write nothing. Carrying on
+    unlocked would let two processes overwrite each other's history, which is
+    the whole reason the lock is here — and losing a day of rotation is a much
+    smaller price than a corrupted one.
 
     The lock lives on a sidecar that is never replaced. Locking the JSON file
     itself would not work: the atomic write installs a new inode, so the next
@@ -372,10 +376,14 @@ def _lead_lock():
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = open(lock_path, "a+")
         fcntl.flock(handle, fcntl.LOCK_EX)
-    except Exception:  # noqa: BLE001 - a lock we cannot take must not stop a publish
+    except Exception as e:  # noqa: BLE001 - a lock we cannot take must not stop a publish
+        warn(f"lead rotation lock unavailable: {e}")
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.close()
         handle = None
     try:
-        yield
+        yield handle is not None
     finally:
         if handle is not None:
             with contextlib.suppress(Exception):
@@ -384,11 +392,25 @@ def _lead_lock():
                 handle.close()
 
 
+def _set_aside(path, keep=False):
+    """Preserve an unusable file, so an overwrite is recoverable and not silent.
+
+    Nanoseconds, not seconds: two renders in the same second would otherwise
+    collide, the rename would fail, and the next write would replace the only
+    copy of the broken file.
+    """
+    with contextlib.suppress(Exception):
+        target = path.with_suffix(f".json.bad-{time.time_ns()}")
+        shutil.copy2(path, target) if keep else path.rename(target)
+
+
 def _read_history():
-    """(decisions, last_led), always. A file we cannot use is moved aside.
+    """(decisions, last_led), always.
 
     Individual malformed entries are skipped rather than thrown away with the
-    rest: one stray value must not erase every project's turn.
+    rest: one stray value must not erase every project's turn. But anything
+    dropped means the next write loses it for good, so a copy is set aside
+    first — the same promise as a file that cannot be parsed at all.
     """
     path, _ = _lead_files()
     try:
@@ -398,8 +420,7 @@ def _read_history():
     except Exception:  # noqa: BLE001 - unreadable or not JSON
         raw = None
     if not isinstance(raw, dict):
-        with contextlib.suppress(Exception):
-            path.rename(path.with_suffix(f".json.bad-{int(time.time())}"))
+        _set_aside(path)
         return {}, {}
     decisions = {k: v for k, v in (raw.get("decisions") or {}).items()
                  if isinstance(k, str) and DATE_KEY.fullmatch(k) and isinstance(v, str)} \
@@ -407,6 +428,13 @@ def _read_history():
     last_led = {k: v for k, v in (raw.get("last_led") or {}).items()
                 if isinstance(k, str) and isinstance(v, str) and DATE_KEY.fullmatch(v)} \
         if isinstance(raw.get("last_led"), dict) else {}
+    kept = len(decisions) + len(last_led)
+    present = sum(len(raw[k]) for k in ("decisions", "last_led")
+                  if isinstance(raw.get(k), dict))
+    malformed_section = any(k in raw and not isinstance(raw[k], dict)
+                            for k in ("decisions", "last_led"))
+    if malformed_section or kept != present:
+        _set_aside(path, keep=True)
     return decisions, last_led
 
 
@@ -437,7 +465,9 @@ def choose_lead(tags, seed, date):
     The pin is validated against today's projects: a second daily-standup.sh run
     the same morning rewrites the pending file, possibly with a different set.
     """
-    with _lead_lock():
+    with _lead_lock() as locked:
+        if not locked:
+            return None
         decisions, last_led = _read_history()
         pinned = decisions.get(date)
         if pinned in tags:
@@ -456,6 +486,15 @@ def choose_lead(tags, seed, date):
         return lead
 
 
+def should_record_lead(x_before, state, lead):
+    """A turn is spent by a fresh X success on this press, and nothing else.
+
+    Not the "already posted, skipped" path, and not a wip.co-only press: only X
+    carries the link card that makes the lead slot worth having.
+    """
+    return bool(not x_before and state.get("posted_x") and lead.get("tag"))
+
+
 def record_lead(date, project):
     """Mark the turn as spent. Only after X actually accepted the post.
 
@@ -465,7 +504,9 @@ def record_lead(date, project):
     """
     if not (DATE_KEY.fullmatch(date or "") and project):
         return
-    with _lead_lock():
+    with _lead_lock() as locked:
+        if not locked:
+            return
         decisions, last_led = _read_history()
         # Never backwards: pending_states() can publish an older day after a
         # newer one, and an older date here would make that project look
@@ -509,19 +550,19 @@ def shuffle_projects(text, seed, lead_out=None):
     picked = [blocks[i] for i in slots]
 
     lead = None
-    if tags:
-        try:
-            lead = choose_lead(tags, seed, seed)
-        except Exception as e:  # noqa: BLE001 - fairness is never worth a lost day
-            warn(f"lead rotation unavailable, falling back to the shuffle: {e}")
-
     random.Random(seed).shuffle(picked)
-    if lead is not None and lead in tags:
-        head = picked.pop(next(i for i, b in enumerate(picked)
-                               if SLOT_HEADER.fullmatch(b.split("\n")[0].strip()).group(1) == lead))
-        picked.insert(0, head)
-        if lead_out is not None:
-            lead_out["tag"] = lead
+    try:
+        if tags:
+            lead = choose_lead(tags, seed, date=seed)
+        if lead is not None and lead in tags:
+            at = next(i for i, b in enumerate(picked)
+                      if (m := SLOT_HEADER.fullmatch(b.split("\n")[0].strip()))
+                      and m.group(1) == lead)
+            picked.insert(0, picked.pop(at))
+            if lead_out is not None:
+                lead_out["tag"] = lead
+    except Exception as e:  # noqa: BLE001 - fairness is never worth a lost day
+        warn(f"lead rotation unavailable, falling back to the shuffle: {e}")
 
     for i, block in zip(slots, picked):
         blocks[i] = block
@@ -879,14 +920,66 @@ def _selftest_body():
         seen.append(got["tag"])
     assert set(seen) == {"alpha", "beta", "gamma"}, seen
 
-    # A project that is not in today's standup is skipped, and is not marked led.
+    # A project that is not in today's standup is skipped, and is not marked led
+    # even once the day is actually recorded.
     _reset_rotation()
     two = "\U0001F4CB Daily Standup\n\n#alpha\n\u2022 one\n\n#beta\n\u2022 two"
     got = {}
     shuffle_projects(two, "2026-11-01", lead_out=got)
     assert got["tag"] in ("alpha", "beta"), got
+    record_lead("2026-11-01", got["tag"])
     _, last_led = _read_history()
     assert "gamma" not in last_led, last_led
+    assert last_led == {got["tag"]: "2026-11-01"}, last_led
+
+    # record_lead credits what it is handed, never what the file happens to say.
+    # The old shape of this test recorded the same project the pin already
+    # named, so a regression to reading decisions[D] would have passed.
+    _reset_rotation()
+    _write_history({"2026-11-09": "delta"}, {})
+    record_lead("2026-11-09", "alpha")
+    _, last_led = _read_history()
+    assert last_led == {"alpha": "2026-11-09"}, last_led
+
+    # The gate in main(): only a fresh X success on this press spends a turn.
+    assert should_record_lead(False, {"posted_x": True}, {"tag": "alpha"})
+    assert not should_record_lead(True, {"posted_x": True}, {"tag": "alpha"}), \
+        "an already-posted X must not spend the turn again"
+    assert not should_record_lead(False, {"posted_wip": True}, {"tag": "alpha"}), \
+        "a wip.co-only press must not spend a turn"
+    assert not should_record_lead(False, {"posted_x": True}, {}), \
+        "no lead captured means nothing to record"
+
+    # A malformed section keeps what is still good, and leaves a copy behind.
+    _reset_rotation()
+    lead_path, _ = _lead_files()
+    lead_path.write_text(json.dumps({"decisions": [], "last_led": {"alpha": "2026-01-01"}}))
+    decisions, last_led = _read_history()
+    assert decisions == {} and last_led == {"alpha": "2026-01-01"}, (decisions, last_led)
+    assert list(STATE_DIR.glob("lead-history.json.bad-*")), "a dropped section must be kept"
+
+    # So does a value that is not a date.
+    _reset_rotation()
+    lead_path.write_text(json.dumps({"decisions": {}, "last_led": {"alpha": "nope"}}))
+    decisions, last_led = _read_history()
+    assert last_led == {}, last_led
+    assert list(STATE_DIR.glob("lead-history.json.bad-*")), "a dropped value must be kept"
+
+    # A lock that cannot be taken must read nothing and write nothing. Carrying
+    # on unlocked is how two processes overwrite each other.
+    _reset_rotation()
+    real_flock = fcntl.flock
+    fcntl.flock = lambda *a, **k: (_ for _ in ()).throw(OSError("no lock for you"))
+    try:
+        assert choose_lead(["alpha", "beta"], "2026-11-11", date="2026-11-11") is None
+        record_lead("2026-11-11", "alpha")
+        assert not lead_path.exists(), "nothing may be written without the lock"
+        blind = {}
+        rendered = shuffle_projects(three, "2026-11-11", lead_out=blind)
+        assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
+        assert blind == {}, "no lead may be claimed without the lock"
+    finally:
+        fcntl.flock = real_flock
 
     # Never-led beats led-long-ago.
     _reset_rotation()
@@ -1062,7 +1155,7 @@ def main():
 
         # Only a fresh X success spends the turn — not the "already posted,
         # skipped" path, and not a wip.co-only press.
-        if not x_before and state.get("posted_x") and lead.get("tag"):
+        if should_record_lead(x_before, state, lead):
             record_lead(key, lead["tag"])
 
         log(f"[{key}] " + " | ".join(lines))
