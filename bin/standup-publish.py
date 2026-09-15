@@ -9,6 +9,7 @@ Nothing here publishes on its own. No button, no post.
 """
 
 import contextlib
+import datetime
 import fcntl
 import io
 import json
@@ -395,54 +396,68 @@ def _lead_lock():
                 handle.close()
 
 
-def _set_aside(path):
-    """Keep an unusable file, so starting a fresh history is recoverable.
+def _is_date(value):
+    """A real calendar date, not just the shape of one. 2026-99-99 is neither."""
+    if not (isinstance(value, str) and DATE_KEY.fullmatch(value)):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
-    Nanoseconds, not seconds: two renders in the same second would otherwise
-    collide, the rename would fail, and the next write would replace the only
-    copy of the broken file.
+
+def _set_aside(path):
+    """Keep an unusable file. True when it is safely out of the way.
+
+    False means the caller must not write a fresh history over it: that would
+    destroy the only copy of whatever went wrong, which is the opposite of the
+    point. Nanoseconds, not seconds, because two renders in the same second
+    would collide and the rename would fail.
     """
-    with contextlib.suppress(Exception):
+    try:
         path.rename(path.with_suffix(f".json.bad-{time.time_ns()}"))
+        return True
+    except Exception as e:  # noqa: BLE001
+        warn(f"could not set the unusable lead rotation file aside: {e}")
+        return False
 
 
 def _read_history():
-    """(decisions, last_led), always. Anything unusable starts an empty history.
+    """(decisions, last_led, writable).
 
-    Unusable means all of it: a decode error, a top level that is not a dict, a
-    section that is not a dict, or any value that is not a date. The file is
-    written by this code alone, so a shape it never writes means something else
-    got to it, and trusting the parts that still parse is a guess. The old file
-    is kept under .bad-<nanos> so the guess is not needed later either.
+    Anything unusable starts an empty history: a decode error, a top level that
+    is not a dict, a missing or non-dict section, or any value that is not a
+    real calendar date. The file is written by this code alone, so a shape it
+    never writes means something else got to it, and trusting the parts that
+    still parse is a guess.
+
+    `writable` is False when the old file could not be set aside. Writing then
+    would destroy the only copy of the evidence, so the caller does nothing at
+    all and the day falls back to the seeded shuffle.
     """
     path, _ = _lead_files()
     try:
         raw = json.loads(path.read_text())
     except FileNotFoundError:
-        return {}, {}
+        return {}, {}, True
     except Exception as e:  # noqa: BLE001 - unreadable, or not JSON
         warn(f"lead rotation file unusable ({e}); starting a new one")
-        _set_aside(path)
-        return {}, {}
+        return {}, {}, _set_aside(path)
 
     def usable(section, check):
         return isinstance(section, dict) and all(
             isinstance(k, str) and isinstance(v, str) and check(k, v)
             for k, v in section.items())
 
-    if not isinstance(raw, dict):
-        warn("lead rotation file is not an object; starting a new one")
-        _set_aside(path)
-        return {}, {}
-    decisions = raw.get("decisions", {})
-    last_led = raw.get("last_led", {})
-    if not (usable(decisions, lambda k, v: bool(DATE_KEY.fullmatch(k)))
-            and usable(last_led, lambda k, v: bool(DATE_KEY.fullmatch(v)))):
+    if not (isinstance(raw, dict)
+            and "decisions" in raw and "last_led" in raw
+            and usable(raw["decisions"], lambda k, v: _is_date(k))
+            and usable(raw["last_led"], lambda k, v: _is_date(v))):
         warn("lead rotation file has a shape it was never written with; "
              "starting a new one")
-        _set_aside(path)
-        return {}, {}
-    return dict(decisions), dict(last_led)
+        return {}, {}, _set_aside(path)
+    return dict(raw["decisions"]), dict(raw["last_led"]), True
 
 
 def _write_history(decisions, last_led):
@@ -474,10 +489,12 @@ def choose_lead(tags, seed, date):
     The pin is validated against today's projects: a second daily-standup.sh run
     the same morning rewrites the pending file, possibly with a different set.
     """
+    if not tags:
+        return None
     with _lead_lock() as locked:
         if not locked:
             return None
-        decisions, last_led = _read_history()
+        decisions, last_led, writable = _read_history()
         pinned = decisions.get(date)
         if pinned in tags:
             return pinned
@@ -490,8 +507,12 @@ def choose_lead(tags, seed, date):
         front = [t for t in ranked if (last_led.get(t) or "") == front_key]
         random.Random(seed).shuffle(front)
         lead = front[0]
-        decisions[date] = lead
-        _write_history(decisions, last_led)
+        # The pin is only written under a date this file can read back. A key
+        # that fails validation would make the whole file unusable on the next
+        # read, and take every project's turn with it.
+        if writable and _is_date(date):
+            decisions[date] = lead
+            _write_history(decisions, last_led)
         return lead
 
 
@@ -511,12 +532,14 @@ def record_lead(date, project):
     not consume a project's turn. A wip.co-only press records nothing: only X
     has the card that makes the lead slot worth anything.
     """
-    if not (DATE_KEY.fullmatch(date or "") and project):
+    if not (_is_date(date) and project):
         return
     with _lead_lock() as locked:
         if not locked:
             return
-        decisions, last_led = _read_history()
+        decisions, last_led, writable = _read_history()
+        if not writable:
+            return
         # Never backwards: pending_states() can publish an older day after a
         # newer one, and an older date here would make that project look
         # least-recently-led and lead again tomorrow.
@@ -895,7 +918,7 @@ def _selftest_body():
     _reset_rotation()
     out = {}
     first = shuffle_projects(three, "2026-09-20", lead_out=out)
-    decisions, last_led = _read_history()
+    decisions, last_led, _ = _read_history()
     assert decisions == {"2026-09-20": out["tag"]}, decisions
     assert last_led == {}, "a render must not spend a turn"
     assert lead_of(first) == out["tag"], (first, out)
@@ -908,8 +931,21 @@ def _selftest_body():
 
     # Only record_lead spends the turn, and only for the project handed to it.
     record_lead("2026-09-20", out["tag"])
-    _, last_led = _read_history()
+    _, last_led, _ = _read_history()
     assert last_led == {out["tag"]: "2026-09-20"}, last_led
+
+    # The pin wins even after last_led moves under it. This is the whole
+    # preview-equals-publish promise: the 07:30 render decides, and a press
+    # hours later — with other days recorded in between — must not re-decide.
+    _reset_rotation()
+    pinned = {}
+    shown = shuffle_projects(three, "2026-09-25", lead_out=pinned)
+    record_lead("2026-09-24", pinned["tag"])
+    record_lead("2026-09-23", "beta")
+    later = {}
+    assert shuffle_projects(three, "2026-09-25", lead_out=later) == shown, \
+        "a recorded turn must not move a day that was already pinned"
+    assert later["tag"] == pinned["tag"], (pinned, later)
 
     # Yesterday's leader does not lead today.
     second = {}
@@ -937,7 +973,7 @@ def _selftest_body():
     shuffle_projects(two, "2026-11-01", lead_out=got)
     assert got["tag"] in ("alpha", "beta"), got
     record_lead("2026-11-01", got["tag"])
-    _, last_led = _read_history()
+    _, last_led, _ = _read_history()
     assert "gamma" not in last_led, last_led
     assert last_led == {got["tag"]: "2026-11-01"}, last_led
 
@@ -947,7 +983,7 @@ def _selftest_body():
     _reset_rotation()
     _write_history({"2026-11-09": "delta"}, {})
     record_lead("2026-11-09", "alpha")
-    _, last_led = _read_history()
+    _, last_led, _ = _read_history()
     assert last_led == {"alpha": "2026-11-09"}, last_led
 
     # The gate in main(): only a fresh X success on this press spends a turn.
@@ -964,12 +1000,17 @@ def _selftest_body():
     for broken in ('{ not json',
                    json.dumps({"decisions": [], "last_led": {"alpha": "2026-01-01"}}),
                    json.dumps({"decisions": {}, "last_led": {"alpha": "nope"}}),
-                   json.dumps(["not", "a", "dict"])):
+                   json.dumps(["not", "a", "dict"]),
+                   json.dumps({"decisions": {}}),
+                   json.dumps({"last_led": {}}),
+                   json.dumps({"decisions": {"2026-99-99": "alpha"}, "last_led": {}}),
+                   json.dumps({"decisions": {}, "last_led": {"alpha": "2026-02-30"}})):
         _reset_rotation()
         lead_path, _ = _lead_files()
         lead_path.write_text(broken)
-        decisions, last_led = _read_history()
+        decisions, last_led, _ = _read_history()
         assert (decisions, last_led) == ({}, {}), (broken, decisions, last_led)
+        assert _is_date("2026-09-15") and not _is_date("2026-99-99"), "calendar, not shape"
         rendered = shuffle_projects(three, "2026-11-04")
         assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
         assert list(STATE_DIR.glob("lead-history.json.bad-*")), \
@@ -1003,7 +1044,7 @@ def _selftest_body():
     _reset_rotation()
     record_lead("2026-11-10", "alpha")
     record_lead("2026-11-05", "alpha")
-    _, last_led = _read_history()
+    _, last_led, _ = _read_history()
     assert last_led["alpha"] == "2026-11-10", last_led
 
     # A pin naming a project that is not here today is ignored, not obeyed.
@@ -1021,7 +1062,7 @@ def _selftest_body():
     caught = {}
     assert shuffle_projects(mention, "2026-11-05", lead_out=caught) == mention
     assert caught == {}, caught
-    decisions, _ = _read_history()
+    decisions, _, _ = _read_history()
     assert decisions == {}, f"a bullet must not be pinned as a project: {decisions}"
     assert lead_of("\u2022 #123 was the culprit\n\u2022 two") is None
 
@@ -1177,8 +1218,11 @@ def main():
             # the state write, the next destination — would skip the record,
             # and the next press sees posted_x and never posts X again. The
             # turn would be lost with nothing to show for it.
-            if should_record_lead(x_before, {"posted_x": ok}, lead):
-                record_lead(key, lead["tag"])
+            try:
+                if should_record_lead(x_before, {"posted_x": ok}, lead):
+                    record_lead(key, lead["tag"])
+            except Exception as e:  # noqa: BLE001 - the tweet is already live
+                warn(f"could not record the lead rotation: {e}")
             return ok, detail
 
         lines = publish_pending(
