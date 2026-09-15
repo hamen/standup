@@ -367,6 +367,62 @@ REPAIRED=$(printf '%s' "$ANALYSIS" | RAW_STANDUP="$RAW_STANDUP" \
 $RAW_STANDUP"
 }
 
+# Security lines never leave this machine, on any destination — not X, not
+# wip.co, not the Telegram message you approve. Placed AFTER every fallback
+# above resolves, because the two fallback branches replace ANALYSIS wholesale:
+# one with the Claude failure text, one with the raw report. The raw report is
+# the worse of the two to leak, since it carries the commit subjects
+# unsummarised, and a filter that sits inside the repair pipe never sees it.
+#
+# Fail closed. A filter that cannot run must stop the standup, not publish what
+# it failed to read. Every other fallback in this script degrades to sending
+# something; this one degrades to sending nothing, and that asymmetry is the
+# whole point of it.
+# set -e would abort here on exit 2 before the case ever ran, and an aborted
+# script sends nothing — the right outcome for the wrong reason, and silent.
+# Refusing to send is not enough on its own. A pending state for today may
+# already exist — from an earlier run, or from before this filter existed — and
+# its buttons carry the same date id, so a press on that older message would
+# still publish the text we are refusing to send now. Disarm it first.
+disarm_today() {
+  rm -f "${STANDUP_STATE_DIR:-$HOME/.local/state/standup}/pending-${TODAY}.json"
+}
+
+set +e
+STRIPPED=$(printf '%s' "$ANALYSIS" | python3 "$SCRIPT_DIR/standup-publish.py" --strip-private)
+STRIP_STATUS=$?
+set -e
+case $STRIP_STATUS in
+  0) ANALYSIS="$STRIPPED" ;;
+  2)
+    echo "[$TODAY] Every project was dropped by the private-line filter; nothing sent."
+    disarm_today
+    send_telegram "🔒 *Daily Standup — $TODAY*
+
+Niente da pubblicare: ogni riga era di sicurezza. Nessun report inviato."
+    exit 0
+    ;;
+  3)
+    # The filter ran and refused: the report has no project blocks at all. That
+    # is the formatter having failed upstream, and calling it a dead filter
+    # would send somebody to look in the wrong place.
+    echo "[$TODAY] The report has no project blocks; nothing sent."
+    disarm_today
+    send_telegram "⚠️ *Daily Standup — $TODAY*
+
+Il report non contiene nessun progetto: la formattazione è fallita a monte. Non ho inviato niente. Controlla il log."
+    exit 1
+    ;;
+  *)
+    echo "[$TODAY] The private-line filter itself failed; nothing sent."
+    disarm_today
+    send_telegram "⚠️ *Daily Standup — $TODAY*
+
+Il filtro delle righe di sicurezza non ha funzionato. Non ho inviato niente, per non pubblicare un report non filtrato. Controlla il log."
+    exit 1
+    ;;
+esac
+
 # ---- Send to Telegram, with the button that publishes it ----
 #
 # The button does not publish. It records that you pressed it; standup-publish.py

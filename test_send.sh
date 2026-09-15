@@ -217,20 +217,53 @@ echo "$out" | grep -q 'Test message sent' ||
 echo "$out" | grep -q 'Could not render MarkdownV2' ||
   failures+=("a broken renderer failed silently")
 
-# --- 4b. A broken renderer on the REPORT path, which is a different branch --
+cp "$TMP/stub/claude" "$TMP/claude.good"
+
+# --- 4b. A broken publisher on the REPORT path now stops the report ---------
+# This asserted the opposite until the private-line filter landed, and the
+# reversal is the point. Every other fallback in the sender degrades to sending
+# something; this one degrades to sending nothing. A publisher that cannot run
+# cannot strip the security lines either, and a report nobody filtered must not
+# reach X, wip.co, or the message you approve.
 cp "$WORK/bin/standup-publish.py" "$TMP/publisher.good2"
 printf 'not python\n' > "$WORK/bin/standup-publish.py"
-out=$(run "$TMP/broken-report.log")
+out=$(run "$TMP/broken-report.log") && \
+  failures+=("a broken publisher let the report path exit 0")
 cp "$TMP/publisher.good2" "$WORK/bin/standup-publish.py"
 first=$(call "$TMP/broken-report.log" 1)
-echo "$first" | grep -q 'parse_mode' &&
-  failures+=("the report path sent a doomed MarkdownV2 request with unescaped text")
-echo "$first" | grep -q 'dart_defines' ||
-  failures+=("a broken renderer stopped the report going out at all")
-echo "$first" | grep -q 'inline_keyboard' ||
-  failures+=("the unformatted report lost its publish buttons")
-echo "$out" | grep -q 'Sending the report unformatted' ||
-  failures+=("the report path did not say it was falling back")
+echo "$first" | grep -q 'dart_defines' &&
+  failures+=("an unfiltered report went out when the filter could not run")
+echo "$first" | grep -q 'inline_keyboard' &&
+  failures+=("a report nobody filtered was sent with publish buttons")
+echo "$out" | grep -q 'private-line filter itself failed' ||
+  failures+=("the report path did not say why it sent nothing")
+
+# There is deliberately no end-to-end case for exit 3 ("no project blocks").
+# The repair step runs first, and when the formatter returns prose the repair
+# fails and the raw report — which does carry headers — replaces it. So the
+# pipeline cannot reach that branch, and a test that pretended otherwise would
+# be asserting a fiction. The CLI path is covered in --selftest.
+
+# --- 4c. A report that is nothing but security lines ------------------------
+# Not a rest day, and not a title with a trailer and no content: both of those
+# would be a lie about what happened. Say so, send no report, arm no button.
+cp "$TMP/stub/claude" "$TMP/claude.good"
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '\xf0\x9f\x93\x8b *Daily Standup*\n\n*#alpha*\n\xe2\x80\xa2 Security: remove the demo account\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+out=$(run "$TMP/all-dropped.log") ||
+  failures+=("an all-security report should exit 0, not fail")
+cp "$TMP/claude.good" "$TMP/stub/claude"
+first=$(call "$TMP/all-dropped.log" 1)
+echo "$first" | grep -q 'inline_keyboard' &&
+  failures+=("an empty report was sent with publish buttons")
+echo "$first" | grep -q 'demo account' &&
+  failures+=("the security line reached Telegram")
+echo "$out" | grep -q 'dropped by the private-line filter' ||
+  failures+=("nothing said why the report was empty")
 
 # --- 5. Accepted by Telegram, but not the shape we expected ----------------
 # The report is already in the chat at this point. The script used to die here
@@ -384,7 +417,7 @@ echo "$out" | grep -q 'claude:.*/profile/wins/claude' &&
   failures+=("an empty CLAUDE_BIN on the cron line did not clear the profile export")
 
 if [ ${#failures[@]} -eq 0 ]; then
-  echo 'ok: the report reaches Telegram escaped, retries unescaped, and survives a broken renderer'
+  echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else
   printf 'FAIL: %s\n' "${failures[@]}" >&2
   exit 1
