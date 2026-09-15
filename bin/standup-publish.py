@@ -60,7 +60,10 @@ def warn(msg):
     anything printed there lands inside the tweet — and for_x would then return
     different bytes at publish time than the preview showed.
     """
-    print(msg, file=sys.stderr, flush=True)
+    # Suppressed: a closed or full stderr must not become an exception on the
+    # publish path, which is the one thing this whole change promised not to do.
+    with contextlib.suppress(Exception):
+        print(msg, file=sys.stderr, flush=True)
 
 
 def die(msg):
@@ -392,50 +395,54 @@ def _lead_lock():
                 handle.close()
 
 
-def _set_aside(path, keep=False):
-    """Preserve an unusable file, so an overwrite is recoverable and not silent.
+def _set_aside(path):
+    """Keep an unusable file, so starting a fresh history is recoverable.
 
     Nanoseconds, not seconds: two renders in the same second would otherwise
     collide, the rename would fail, and the next write would replace the only
     copy of the broken file.
     """
     with contextlib.suppress(Exception):
-        target = path.with_suffix(f".json.bad-{time.time_ns()}")
-        shutil.copy2(path, target) if keep else path.rename(target)
+        path.rename(path.with_suffix(f".json.bad-{time.time_ns()}"))
 
 
 def _read_history():
-    """(decisions, last_led), always.
+    """(decisions, last_led), always. Anything unusable starts an empty history.
 
-    Individual malformed entries are skipped rather than thrown away with the
-    rest: one stray value must not erase every project's turn. But anything
-    dropped means the next write loses it for good, so a copy is set aside
-    first — the same promise as a file that cannot be parsed at all.
+    Unusable means all of it: a decode error, a top level that is not a dict, a
+    section that is not a dict, or any value that is not a date. The file is
+    written by this code alone, so a shape it never writes means something else
+    got to it, and trusting the parts that still parse is a guess. The old file
+    is kept under .bad-<nanos> so the guess is not needed later either.
     """
     path, _ = _lead_files()
     try:
         raw = json.loads(path.read_text())
     except FileNotFoundError:
         return {}, {}
-    except Exception:  # noqa: BLE001 - unreadable or not JSON
-        raw = None
-    if not isinstance(raw, dict):
+    except Exception as e:  # noqa: BLE001 - unreadable, or not JSON
+        warn(f"lead rotation file unusable ({e}); starting a new one")
         _set_aside(path)
         return {}, {}
-    decisions = {k: v for k, v in (raw.get("decisions") or {}).items()
-                 if isinstance(k, str) and DATE_KEY.fullmatch(k) and isinstance(v, str)} \
-        if isinstance(raw.get("decisions"), dict) else {}
-    last_led = {k: v for k, v in (raw.get("last_led") or {}).items()
-                if isinstance(k, str) and isinstance(v, str) and DATE_KEY.fullmatch(v)} \
-        if isinstance(raw.get("last_led"), dict) else {}
-    kept = len(decisions) + len(last_led)
-    present = sum(len(raw[k]) for k in ("decisions", "last_led")
-                  if isinstance(raw.get(k), dict))
-    malformed_section = any(k in raw and not isinstance(raw[k], dict)
-                            for k in ("decisions", "last_led"))
-    if malformed_section or kept != present:
-        _set_aside(path, keep=True)
-    return decisions, last_led
+
+    def usable(section, check):
+        return isinstance(section, dict) and all(
+            isinstance(k, str) and isinstance(v, str) and check(k, v)
+            for k, v in section.items())
+
+    if not isinstance(raw, dict):
+        warn("lead rotation file is not an object; starting a new one")
+        _set_aside(path)
+        return {}, {}
+    decisions = raw.get("decisions", {})
+    last_led = raw.get("last_led", {})
+    if not (usable(decisions, lambda k, v: bool(DATE_KEY.fullmatch(k)))
+            and usable(last_led, lambda k, v: bool(DATE_KEY.fullmatch(v)))):
+        warn("lead rotation file has a shape it was never written with; "
+             "starting a new one")
+        _set_aside(path)
+        return {}, {}
+    return dict(decisions), dict(last_led)
 
 
 def _write_history(decisions, last_led):
@@ -449,6 +456,8 @@ def _write_history(decisions, last_led):
         os.replace(tmp, path)
     except Exception as e:  # noqa: BLE001
         warn(f"could not write the lead rotation file: {e}")
+        with contextlib.suppress(Exception):
+            path.with_suffix(".json.tmp").unlink(missing_ok=True)
 
 
 def choose_lead(tags, seed, date):
@@ -950,20 +959,21 @@ def _selftest_body():
     assert not should_record_lead(False, {"posted_x": True}, {}), \
         "no lead captured means nothing to record"
 
-    # A malformed section keeps what is still good, and leaves a copy behind.
-    _reset_rotation()
-    lead_path, _ = _lead_files()
-    lead_path.write_text(json.dumps({"decisions": [], "last_led": {"alpha": "2026-01-01"}}))
-    decisions, last_led = _read_history()
-    assert decisions == {} and last_led == {"alpha": "2026-01-01"}, (decisions, last_led)
-    assert list(STATE_DIR.glob("lead-history.json.bad-*")), "a dropped section must be kept"
-
-    # So does a value that is not a date.
-    _reset_rotation()
-    lead_path.write_text(json.dumps({"decisions": {}, "last_led": {"alpha": "nope"}}))
-    decisions, last_led = _read_history()
-    assert last_led == {}, last_led
-    assert list(STATE_DIR.glob("lead-history.json.bad-*")), "a dropped value must be kept"
+    # Every unusable shape is unusable whole: a fresh history, the old file
+    # kept, and a render that still returns every block.
+    for broken in ('{ not json',
+                   json.dumps({"decisions": [], "last_led": {"alpha": "2026-01-01"}}),
+                   json.dumps({"decisions": {}, "last_led": {"alpha": "nope"}}),
+                   json.dumps(["not", "a", "dict"])):
+        _reset_rotation()
+        lead_path, _ = _lead_files()
+        lead_path.write_text(broken)
+        decisions, last_led = _read_history()
+        assert (decisions, last_led) == ({}, {}), (broken, decisions, last_led)
+        rendered = shuffle_projects(three, "2026-11-04")
+        assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
+        assert list(STATE_DIR.glob("lead-history.json.bad-*")), \
+            f"the unusable file must be kept: {broken}"
 
     # A lock that cannot be taken must read nothing and write nothing. Carrying
     # on unlocked is how two processes overwrite each other.
@@ -1003,16 +1013,29 @@ def _selftest_body():
     shuffle_projects(three, "2026-11-03", lead_out=got)
     assert got["tag"] in ("alpha", "beta", "gamma"), got
 
-    # An unusable file is moved aside, and the render still returns every block.
+    # A first line that merely mentions a hashtag is not a project header — and
+    # this has to go through shuffle_projects, not just lead_of. A regression to
+    # collecting slots with HASHTAG.search would sail past a lead_of-only check.
     _reset_rotation()
-    lead_path, _ = _lead_files()
-    lead_path.write_text("{ not json")
-    rendered = shuffle_projects(three, "2026-11-04")
-    assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
-    assert list(STATE_DIR.glob("lead-history.json.bad-*")), "the bad file must be kept"
-
-    # A first line that merely mentions a hashtag is not a project header.
+    mention = "\U0001F4CB Daily Standup\n\n\u2022 #123 was the culprit\n\u2022 two"
+    caught = {}
+    assert shuffle_projects(mention, "2026-11-05", lead_out=caught) == mention
+    assert caught == {}, caught
+    decisions, _ = _read_history()
+    assert decisions == {}, f"a bullet must not be pinned as a project: {decisions}"
     assert lead_of("\u2022 #123 was the culprit\n\u2022 two") is None
+
+    # The live first line is Telegram-bold, which is what SLOT_HEADER is for.
+    _reset_rotation()
+    bold = ("\U0001F4CB *Daily Standup*\n\n*#alpha*\n\u2022 one\n\n"
+            "*#beta*\n\u2022 two\n\n2 projects")
+    got = {}
+    rendered = shuffle_projects(bold, "2026-11-12", lead_out=got)
+    assert got.get("tag") in ("alpha", "beta"), got
+    assert rendered.startswith("\U0001F4CB *Daily Standup*"), rendered
+    assert rendered.endswith("2 projects"), rendered
+    assert rendered.split("\n\n")[1] == f"*#{got['tag']}*\n\u2022 " + \
+        ("one" if got["tag"] == "alpha" else "two"), rendered
 
     # Shapes that must not explode.
     _reset_rotation()
@@ -1146,17 +1169,24 @@ def main():
         # with a project name and a URL by then.
         lead = {}
         x_before = bool(state.get("posted_x"))
+
+        def post_x():
+            ok, detail = post_to_x(text, key, lead_out=lead)
+            # Recorded here rather than after the loop. publish_pending saves
+            # posted_x the moment X succeeds, so anything that raises later —
+            # the state write, the next destination — would skip the record,
+            # and the next press sees posted_x and never posts X again. The
+            # turn would be lost with nothing to show for it.
+            if should_record_lead(x_before, {"posted_x": ok}, lead):
+                record_lead(key, lead["tag"])
+            return ok, detail
+
         lines = publish_pending(
             state, target,
-            (("X", "x", "posted_x", lambda: post_to_x(text, key, lead_out=lead)),
+            (("X", "x", "posted_x", post_x),
              ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))),
             lambda s: path.write_text(json.dumps(s, ensure_ascii=False, indent=2)),
         )
-
-        # Only a fresh X success spends the turn — not the "already posted,
-        # skipped" path, and not a wip.co-only press.
-        if should_record_lead(x_before, state, lead):
-            record_lead(key, lead["tag"])
 
         log(f"[{key}] " + " | ".join(lines))
 
