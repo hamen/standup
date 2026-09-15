@@ -557,16 +557,18 @@ def record_lead(date, project):
 TRAILER_LINE = re.compile(r"(?i)\s*\d+\s+projects?\b.*")
 PRIVATE_LINE = [re.compile(p) for p in (
     r"(?i)CVE-\d{4}-\d{4,}",
-    # \w* on the stems, because "\bvulnerabilit\b" can never match
-    # "vulnerability" — a word character follows the stem. The first version of
-    # this list was written that way and caught none of the lines it was for.
-    r"(?i)\b(vulnerabilit|advisor|exploit)\w*",
-    # The bold form too: Telegram headers already use it, and a label written
-    # "*Security:*" would otherwise slip past.
-    r"(?i)^\s*[\u2022*-]\s*\*?security\b",
-    # Plural only, not \w*: "secret\w*" would drop a bullet about a secretary.
-    r"(?i)\b(passwords?|secrets?|credentials?"
-    r"|api[ _-]?keys?|signing[ _-]?keys?|private[ _-]?keys?)\b",
+    # \w* on the stems: "\bvulnerabilit\b" can never match "vulnerability",
+    # because a word character follows the stem. The first version of this list
+    # was written that way and caught none of the lines it was written for.
+    r"(?i)\b(vulnerabilit|vuln|advisor|exploit|breach|leak)\w*",
+    r"(?i)\b(zero[ -]?day|rce|injection|xss|csrf|sqli)\b",
+    # No bullet required, and any amount of Telegram bold around the label.
+    r"(?i)^\s*[\u2022*-]*\s*\**\s*security\b",
+    # Plural only, never \w*: "secret\w*" would drop a bullet about a secretary.
+    r"(?i)\b(passwords?|secrets?|credentials?)\b",
+    # A key or a token is only interesting when something qualifies it.
+    r"(?i)\b(api|signing|private|public|ssh|gpg|jwt|auth|access|refresh|session)"
+    r"[ _-]?(keys?|tokens?)\b",
 )]
 
 
@@ -610,15 +612,17 @@ def strip_private(text):
         if not _is_header(raw[last].strip()) and TRAILER_LINE.fullmatch(raw[last]):
             frame.add(last)
 
+    # Split keeping the separators, so every line's absolute index falls out of
+    # the arithmetic. Re-finding each line by value was fragile: two identical
+    # bullets in one report would resync onto the wrong one.
     numbered, index = [], 0
-    for block in re.split(r"\n\s*\n", text):
-        rows = []
-        for line in block.split("\n"):
-            while index < len(raw) and raw[index] != line:
-                index += 1
-            rows.append((index, line))
-            index += 1
+    for position, part in enumerate(re.split(r"(\n\s*\n)", text)):
+        if position % 2:
+            index += part.count("\n")
+            continue
+        rows = [(index + offset, line) for offset, line in enumerate(part.split("\n"))]
         numbered.append(rows)
+        index += len(rows) - 1
 
     FRAME, HEADED, LOOSE = "frame", "headed", "loose"
     groups = []
@@ -1319,6 +1323,30 @@ def _selftest_body():
     assert child.stdout == "", f"stdout must stay clean: {child.stdout!r}"
     assert "dropped" in child.stderr, child.stderr
 
+    # A report with no project at all exits 1, not 2. Checked through the CLI,
+    # because swapping the two guards would still pass a function-level test.
+    child = subprocess.run(
+        [sys.executable, __file__, "--strip-private"],
+        input="just some prose\n\nand more", capture_output=True, text=True, timeout=60)
+    assert child.returncode == 3, child.returncode
+    assert child.stdout == "", f"stdout must stay clean: {child.stdout!r}"
+
+    # And the ordinary path really does put the report on stdout.
+    child = subprocess.run(
+        [sys.executable, __file__, "--strip-private"],
+        input="\U0001F4CB T\n\n#alpha\n\u2022 Security: gone\n\u2022 Tests: ok\n\n1 projects",
+        capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0, child.stderr[:200]
+    assert "Tests: ok" in child.stdout and "Security: gone" not in child.stdout, child.stdout
+
+    # The vocabulary the first list missed.
+    for gone in ("\u2022 patch the vuln in upload", "\u2022 fix the SQL injection",
+                 "\u2022 rotate the JWT token", "\u2022 a zero-day in the parser",
+                 "\u2022 Security: no bullet marker needed",
+                 "\u2022 **Security:** double bold"):
+        body = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
+        assert gone not in stripped(body), gone
+
     print("selftest ok")
 
 
@@ -1361,8 +1389,10 @@ def main():
         if not before:
             # No project headers at all. That is a formatter failure, not a
             # quiet security day, and reporting it as one would hide it.
+            # 3, not 1: a crashed interpreter also exits 1, and the two must
+            # not collapse into one message again.
             warn("the report has no project blocks; refusing to publish it")
-            sys.exit(1)
+            sys.exit(3)
         if not after:
             warn("every project was dropped by the private-line filter")
             sys.exit(2)

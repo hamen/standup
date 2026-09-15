@@ -217,6 +217,8 @@ echo "$out" | grep -q 'Test message sent' ||
 echo "$out" | grep -q 'Could not render MarkdownV2' ||
   failures+=("a broken renderer failed silently")
 
+cp "$TMP/stub/claude" "$TMP/claude.good"
+
 # --- 4b. A broken publisher on the REPORT path now stops the report ---------
 # This asserted the opposite until the private-line filter landed, and the
 # reversal is the point. Every other fallback in the sender degrades to sending
@@ -233,8 +235,14 @@ echo "$first" | grep -q 'dart_defines' &&
   failures+=("an unfiltered report went out when the filter could not run")
 echo "$first" | grep -q 'inline_keyboard' &&
   failures+=("a report nobody filtered was sent with publish buttons")
-echo "$out" | grep -q 'private-line filter failed' ||
+echo "$out" | grep -q 'private-line filter itself failed' ||
   failures+=("the report path did not say why it sent nothing")
+
+# There is deliberately no end-to-end case for exit 3 ("no project blocks").
+# The repair step runs first, and when the formatter returns prose the repair
+# fails and the raw report — which does carry headers — replaces it. So the
+# pipeline cannot reach that branch, and a test that pretended otherwise would
+# be asserting a fiction. The CLI path is covered in --selftest.
 
 # --- 4c. A report that is nothing but security lines ------------------------
 # Not a rest day, and not a title with a trailer and no content: both of those

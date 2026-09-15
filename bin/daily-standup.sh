@@ -393,8 +393,18 @@ case $STRIP_STATUS in
 Niente da pubblicare: ogni riga era di sicurezza. Nessun report inviato."
     exit 0
     ;;
+  3)
+    # The filter ran and refused: the report has no project blocks at all. That
+    # is the formatter having failed upstream, and calling it a dead filter
+    # would send somebody to look in the wrong place.
+    echo "[$TODAY] The report has no project blocks; nothing sent."
+    send_telegram "⚠️ *Daily Standup — $TODAY*
+
+Il report non contiene nessun progetto: la formattazione è fallita a monte. Non ho inviato niente. Controlla il log."
+    exit 1
+    ;;
   *)
-    echo "[$TODAY] The private-line filter failed; nothing sent."
+    echo "[$TODAY] The private-line filter itself failed; nothing sent."
     send_telegram "⚠️ *Daily Standup — $TODAY*
 
 Il filtro delle righe di sicurezza non ha funzionato. Non ho inviato niente, per non pubblicare un report non filtrato. Controlla il log."
