@@ -549,6 +549,80 @@ def record_lead(date, project):
         _write_history(decisions, last_led)
 
 
+# Lines that must not leave this machine, on any destination. Every stem ends
+# in \w* on purpose: "\bvulnerabilit\b" can never match "vulnerability", because
+# a word character follows the stem. The first draft of this list was written
+# that way and caught none of the four lines it was written for.
+PRIVATE_LINE = [re.compile(p) for p in (
+    r"(?i)CVE-\d{4}-\d{4,}",
+    r"(?i)\b(vulnerabilit|advisor|exploit)\w*",
+    r"(?i)^\s*[\u2022*-]\s*security\b",
+    r"(?i)\b(password|secret|credential|api[ _-]?key|signing key|private key)\w*",
+)]
+# The two lines that frame a report and are never anybody's commit.
+TITLE_LINE = re.compile(r"\s*\U0001F4CB.*")
+TRAILER_LINE = re.compile(r"(?i)\s*\d+\s+projects?\b.*")
+
+
+def _is_header(line):
+    return bool(SLOT_HEADER.fullmatch(line.strip()))
+
+
+def _is_frame(line):
+    """The title and the closing count: never dropped, never a project."""
+    return bool(TITLE_LINE.fullmatch(line) or TRAILER_LINE.fullmatch(line))
+
+
+def strip_private(text):
+    """Remove security lines, and any project they leave with nothing to say.
+
+    Applied per line. A pattern can match anywhere, so headers and the two frame
+    lines — the title and the closing count — are exempt: dropping a header
+    would orphan its bullets into the project above it.
+
+    Blocks are grouped under their header rather than judged one at a time,
+    because standup.rb writes the project name, a blank line, and then the
+    bullets. In a blank-line split the header is therefore its own block with no
+    body in it, and a per-block rule would leave a bare project name behind
+    whenever a project's only bullet was dropped.
+
+    Returns (text, kept_projects).
+    """
+    FRAME, HEADED, LOOSE = "frame", "headed", "loose"
+    groups = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [l for l in block.split("\n")]
+        if lines and _is_header(lines[0].strip()):
+            groups.append({"kind": HEADED, "lines": lines})
+        elif all(_is_frame(l) or not l.strip() for l in lines):
+            groups.append({"kind": FRAME, "lines": lines})
+        elif groups and groups[-1]["kind"] == HEADED:
+            groups[-1]["lines"].append("")
+            groups[-1]["lines"].extend(lines)
+        else:
+            groups.append({"kind": LOOSE, "lines": lines})
+
+    out, kept = [], 0
+    for group in groups:
+        if group["kind"] == FRAME:
+            out.append("\n".join(group["lines"]))
+            continue
+        lines, body = [], 0
+        for line in group["lines"]:
+            if _is_header(line.strip()) or _is_frame(line):
+                lines.append(line)
+                continue
+            if line.strip() and any(r.search(line) for r in PRIVATE_LINE):
+                continue
+            lines.append(line)
+            body += bool(line.strip())
+        if not body:
+            continue
+        kept += group["kind"] == HEADED
+        out.append("\n".join(lines).strip("\n"))
+    return "\n\n".join(b for b in out if b.strip()), kept
+
+
 def shuffle_projects(text, seed, lead_out=None):
     """Reorder the project blocks, the same way all day, differently each day.
 
@@ -1122,6 +1196,56 @@ def _selftest_body():
             shutil.rmtree(box, ignore_errors=True)
     assert picks[0] and picks[0] == picks[1], f"the tie-break follows the hash seed: {picks}"
 
+    # ---- private lines ----------------------------------------------------
+    # Invented lines, never the real report: this repository is public, the two
+    # lines that prompted this were never published, and a fixture would be the
+    # first public copy of them.
+    def stripped(t):
+        return strip_private(t)[0]
+
+    for gone in ("\u2022 bump rubyzip for CVE-2026-11111",
+                 "\u2022 also cve-2026-11111 lowercase",
+                 "\u2022 Security: remove the demo account",
+                 "\u2022 Fixed a security vulnerability",
+                 "\u2022 Published an advisory for it",
+                 "\u2022 rotate the signing keys",
+                 "\u2022 removed hardcoded passwords",
+                 "\u2022 stop logging the api key"):
+        body = f"\U0001F4CB Daily Standup\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
+        assert gone not in stripped(body), gone
+        assert "\u2022 Tests: ok" in stripped(body), gone
+
+    # Anchored and word-bounded, not a substring hunt.
+    for kept in ("\u2022 Made the upload more secure",
+                 "\u2022 securely stores nothing",
+                 "\u2022 Auth: split the exercise lookup"):
+        body = f"\U0001F4CB Daily Standup\n\n#alpha\n{kept}\n\n1 projects"
+        assert kept in stripped(body), kept
+
+    # A block that loses its last body line loses its header too.
+    two = ("\U0001F4CB Daily Standup\n\n*#alpha*\n\u2022 Security: drop it\n\n"
+           "*#beta*\n\u2022 Tests: keep it\n\n2 projects")
+    out, kept = strip_private(two)
+    assert "alpha" not in out and "*#beta*" in out, out
+    assert kept == 1, kept
+    assert out.startswith("\U0001F4CB Daily Standup"), out
+    assert out.endswith("2 projects"), "the trailer is never dropped"
+
+    # standup.rb writes the name, a blank line, then the bullets — so the header
+    # is its own block. A per-block rule would leave the name behind alone.
+    raw = "#alpha\n\n\u2022 bump rubyzip for CVE-2026-11111\n\n#beta\n\n\u2022 Tests: ok"
+    out, kept = strip_private(raw)
+    assert "#alpha" not in out, f"orphaned header: {out!r}"
+    assert "#beta" in out and kept == 1, (out, kept)
+
+    # A header or a frame line is never dropped by a line match.
+    framed = "\U0001F4CB Daily Standup \u2014 security review\n\n#alpha\n\u2022 Tests: ok\n\n1 projects"
+    assert "security review" in stripped(framed), stripped(framed)
+
+    # Everything dropped: no projects left, which the shell turns into "send nothing".
+    _, kept = strip_private("\U0001F4CB Daily Standup\n\n#alpha\n\u2022 Security: all of it\n\n1 projects")
+    assert kept == 0, kept
+
     print("selftest ok")
 
 
@@ -1156,6 +1280,17 @@ def main():
     # Reads the formatted report on stdin and the raw one from RAW_STANDUP, so
     # neither has to survive argv quoting. Exits 1 when a project went missing,
     # which is daily-standup.sh's signal to publish the raw report instead.
+    # Reads the report on stdin. 0 = filtered report on stdout, 2 = nothing of
+    # it survived, anything else = it failed. daily-standup.sh must treat every
+    # non-zero as "send nothing": a privacy filter that fails open is not one.
+    if "--strip-private" in sys.argv:
+        stripped, kept = strip_private(sys.stdin.read())
+        if not kept:
+            warn("every project was dropped by the private-line filter")
+            sys.exit(2)
+        sys.stdout.write(stripped)
+        return
+
     if "--repair-headers" in sys.argv:
         repaired, missing = repair_headers(os.environ.get("RAW_STANDUP", ""),
                                            sys.stdin.read())
