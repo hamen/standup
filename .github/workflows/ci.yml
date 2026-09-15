@@ -22,7 +22,8 @@ jobs:
         run: ruby test_standup.rb
 
       # No dependency step: standup-publish.py imports the standard library
-      # only — json, os, pathlib, random, re, shutil, subprocess, sys, urllib.
+      # only — contextlib, fcntl, io, json, os, pathlib, random, re, shutil,
+      # subprocess, sys, tempfile, time, urllib.
       - name: The publisher's own checks
         run: python3 bin/standup-publish.py --selftest
 

@@ -8,6 +8,10 @@ Telegram whether the button was pressed, and publishes if it was.
 Nothing here publishes on its own. No button, no post.
 """
 
+import contextlib
+import datetime
+import fcntl
+import io
 import json
 import os
 import pathlib
@@ -16,6 +20,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -46,6 +52,19 @@ BIRD = (
 
 def log(msg):
     print(msg, flush=True)
+
+
+def warn(msg):
+    """Diagnostics that must never reach stdout.
+
+    daily-standup.sh captures --preview's stdout as the text it posts to X, so
+    anything printed there lands inside the tweet — and for_x would then return
+    different bytes at publish time than the preview showed.
+    """
+    # Suppressed: a closed or full stderr must not become an exception on the
+    # publish path, which is the one thing this whole change promised not to do.
+    with contextlib.suppress(Exception):
+        print(msg, file=sys.stderr, flush=True)
 
 
 def die(msg):
@@ -329,7 +348,208 @@ def repair_headers(raw, formatted):
     return repaired, [t for t in tags if f"#{t}" not in repaired]
 
 
-def shuffle_projects(text, seed):
+# A project block's first line IS the hashtag, optionally in Telegram bold.
+# Deliberately not "a line that contains one": a bullet opening
+# "\u2022 #123 was the culprit" would otherwise become a project and write "123"
+# into the rotation history.
+SLOT_HEADER = re.compile(r"\*?#([a-z0-9]+)\*?")
+DATE_KEY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _lead_files():
+    """Resolved at call time, never at import: selftest rebinds STATE_DIR."""
+    return STATE_DIR / "lead-history.json", STATE_DIR / "lead-history.lock"
+
+
+@contextlib.contextmanager
+def _lead_lock():
+    """Yields True when the lock is held, False when it could not be taken.
+
+    A caller that gets False must read nothing and write nothing. Carrying on
+    unlocked would let two processes overwrite each other's history, which is
+    the whole reason the lock is here — and losing a day of rotation is a much
+    smaller price than a corrupted one.
+
+    The lock lives on a sidecar that is never replaced. Locking the JSON file
+    itself would not work: the atomic write installs a new inode, so the next
+    process would lock a different file and the two updates would race.
+    """
+    _, lock_path = _lead_files()
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+")
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except Exception as e:  # noqa: BLE001 - a lock we cannot take must not stop a publish
+        warn(f"lead rotation lock unavailable: {e}")
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.close()
+        handle = None
+    try:
+        yield handle is not None
+    finally:
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                handle.close()
+
+
+def _is_date(value):
+    """A real calendar date, not just the shape of one. 2026-99-99 is neither."""
+    if not (isinstance(value, str) and DATE_KEY.fullmatch(value)):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _set_aside(path):
+    """Keep an unusable file. True when it is safely out of the way.
+
+    False means the caller must not write a fresh history over it: that would
+    destroy the only copy of whatever went wrong, which is the opposite of the
+    point. Nanoseconds, not seconds, because two renders in the same second
+    would collide and the rename would fail.
+    """
+    try:
+        path.rename(path.with_suffix(f".json.bad-{time.time_ns()}"))
+        return True
+    except Exception as e:  # noqa: BLE001
+        warn(f"could not set the unusable lead rotation file aside: {e}")
+        return False
+
+
+def _read_history():
+    """(decisions, last_led, writable).
+
+    Anything unusable starts an empty history: a decode error, a top level that
+    is not a dict, a missing or non-dict section, or any value that is not a
+    real calendar date. The file is written by this code alone, so a shape it
+    never writes means something else got to it, and trusting the parts that
+    still parse is a guess.
+
+    `writable` is False when the old file could not be set aside. Writing then
+    would destroy the only copy of the evidence, so the caller does nothing at
+    all and the day falls back to the seeded shuffle.
+    """
+    path, _ = _lead_files()
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}, {}, True
+    except Exception as e:  # noqa: BLE001 - unreadable, or not JSON
+        warn(f"lead rotation file unusable ({e}); starting a new one")
+        return {}, {}, _set_aside(path)
+
+    def usable(section, check):
+        return isinstance(section, dict) and all(
+            isinstance(k, str) and isinstance(v, str) and check(k, v)
+            for k, v in section.items())
+
+    if not (isinstance(raw, dict)
+            and "decisions" in raw and "last_led" in raw
+            and usable(raw["decisions"], lambda k, v: _is_date(k))
+            and usable(raw["last_led"], lambda k, v: _is_date(v))):
+        warn("lead rotation file has a shape it was never written with; "
+             "starting a new one")
+        return {}, {}, _set_aside(path)
+    return dict(raw["decisions"]), dict(raw["last_led"]), True
+
+
+def _write_history(decisions, last_led):
+    """Best effort. A rotation file we cannot write is not worth a lost publish."""
+    path, _ = _lead_files()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"decisions": decisions, "last_led": last_led},
+                                  ensure_ascii=False, indent=2))
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001
+        warn(f"could not write the lead rotation file: {e}")
+        with contextlib.suppress(Exception):
+            path.with_suffix(".json.tmp").unlink(missing_ok=True)
+
+
+def choose_lead(tags, seed, date):
+    """Which project leads today: the one that has gone longest without leading.
+
+    The lead slot is the promotion — X builds the link card from the first URL
+    in the post — so drawing it at random every day was never fair. An
+    independent draw clusters, and it did: one project led three mornings
+    running while three others had never led at all.
+
+    Pinned per date, because --preview renders this text at 07:30 and the
+    publish re-renders it when the button is finally pressed, hours later. A
+    preview that does not match what goes out is not an approval of anything.
+    The pin is validated against today's projects: a second daily-standup.sh run
+    the same morning rewrites the pending file, possibly with a different set.
+    """
+    if not tags:
+        return None
+    with _lead_lock() as locked:
+        if not locked:
+            return None
+        decisions, last_led, writable = _read_history()
+        pinned = decisions.get(date)
+        if pinned in tags:
+            return pinned
+        # Never-led sorts first; the hashtag breaks the sort stably. Only the
+        # group tied at the front is shuffled, and only with the date seed:
+        # hash() and set order follow PYTHONHASHSEED, and preview and publish
+        # are two processes.
+        ranked = sorted(tags, key=lambda t: (last_led.get(t) or "", t))
+        front_key = last_led.get(ranked[0]) or ""
+        front = [t for t in ranked if (last_led.get(t) or "") == front_key]
+        random.Random(seed).shuffle(front)
+        lead = front[0]
+        # The pin is only written under a date this file can read back. A key
+        # that fails validation would make the whole file unusable on the next
+        # read, and take every project's turn with it.
+        if writable and _is_date(date):
+            decisions[date] = lead
+            _write_history(decisions, last_led)
+        return lead
+
+
+def should_record_lead(x_before, state, lead):
+    """A turn is spent by a fresh X success on this press, and nothing else.
+
+    Not the "already posted, skipped" path, and not a wip.co-only press: only X
+    carries the link card that makes the lead slot worth having.
+    """
+    return bool(not x_before and state.get("posted_x") and lead.get("tag"))
+
+
+def record_lead(date, project):
+    """Mark the turn as spent. Only after X actually accepted the post.
+
+    A standup that is previewed and never approved, or whose publish fails, must
+    not consume a project's turn. A wip.co-only press records nothing: only X
+    has the card that makes the lead slot worth anything.
+    """
+    if not (_is_date(date) and project):
+        return
+    with _lead_lock() as locked:
+        if not locked:
+            return
+        decisions, last_led, writable = _read_history()
+        if not writable:
+            return
+        # Never backwards: pending_states() can publish an older day after a
+        # newer one, and an older date here would make that project look
+        # least-recently-led and lead again tomorrow.
+        if (last_led.get(project) or "") >= date:
+            return
+        last_led[project] = date
+        _write_history(decisions, last_led)
+
+
+def shuffle_projects(text, seed, lead_out=None):
     """Reorder the project blocks, the same way all day, differently each day.
 
     X builds the link card from the first URL in the tweet. The standup lists
@@ -341,17 +561,47 @@ def shuffle_projects(text, seed):
     not an approval of anything.
 
     Blocks with no hashtag — the title, the closing count — keep their place.
+
+    `lead_out`, when given, receives the chosen hashtag under "tag". The caller
+    needs it to record the turn afterwards, and it cannot be read back out of
+    the finished text: for_x has replaced every hashtag with a name and a URL by
+    then, so the key would never match.
+
+    Nothing here may raise. This runs inside post_to_x, which catches nothing,
+    and the update offset is already advanced by the time it does — so an
+    exception would lose the press and the day. Any failure falls back to the
+    plain seeded shuffle.
     """
     blocks = re.split(r"\n\s*\n", text)
-    slots = [i for i, b in enumerate(blocks) if HASHTAG.search(b.split("\n")[0])]
+    slots, tags = [], []
+    for i, b in enumerate(blocks):
+        m = SLOT_HEADER.fullmatch(b.split("\n")[0].strip())
+        if m:
+            slots.append(i)
+            tags.append(m.group(1))
     picked = [blocks[i] for i in slots]
+
+    lead = None
     random.Random(seed).shuffle(picked)
+    try:
+        if tags:
+            lead = choose_lead(tags, seed, date=seed)
+        if lead is not None and lead in tags:
+            at = next(i for i, b in enumerate(picked)
+                      if (m := SLOT_HEADER.fullmatch(b.split("\n")[0].strip()))
+                      and m.group(1) == lead)
+            picked.insert(0, picked.pop(at))
+            if lead_out is not None:
+                lead_out["tag"] = lead
+    except Exception as e:  # noqa: BLE001 - fairness is never worth a lost day
+        warn(f"lead rotation unavailable, falling back to the shuffle: {e}")
+
     for i, block in zip(slots, picked):
         blocks[i] = block
     return "\n\n".join(blocks)
 
 
-def for_x(text, seed):
+def for_x(text, seed, lead_out=None):
     """Rewrite the hashtags as project names and links, for X.
 
     A hashtag is the attach mechanism on wip.co and nothing but text on X, where
@@ -365,7 +615,7 @@ def for_x(text, seed):
     If wip.co cannot be reached, the hashtags stay. A post that reads a little
     worse beats no post at all.
     """
-    text = shuffle_projects(text, seed)
+    text = shuffle_projects(text, seed, lead_out=lead_out)
     try:
         projects = wip_projects()
     except Exception as e:  # noqa: BLE001 - never let this block a publish
@@ -382,8 +632,8 @@ def for_x(text, seed):
     return HASHTAG.sub(swap, text)
 
 
-def post_to_x(text, seed):
-    text = for_x(text, seed)
+def post_to_x(text, seed, lead_out=None):
+    text = for_x(text, seed, lead_out=lead_out)
     result = subprocess.run([BIRD, "tweet", text], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout).strip()[:300]
@@ -444,7 +694,34 @@ def pending_states():
     return out
 
 
+def _reset_rotation():
+    """Every case starts from an empty history, or it passes for the wrong reason."""
+    path, lock = _lead_files()
+    path.unlink(missing_ok=True)
+    lock.unlink(missing_ok=True)
+    for bad in STATE_DIR.glob("lead-history.json.bad-*"):
+        bad.unlink()
+
+
 def selftest():
+    """Isolated, always.
+
+    STATE_DIR is bound at import, so setting STANDUP_STATE_DIR in here would do
+    nothing. The 28-day loop below runs real dates, and without this rebind a
+    test run writes fake projects into the live rotation file.
+    """
+    global STATE_DIR
+    real, tmp = STATE_DIR, tempfile.mkdtemp(prefix="standup-selftest-")
+    STATE_DIR = pathlib.Path(tmp)
+    try:
+        _selftest_body()
+    finally:
+        STATE_DIR = real
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selftest_body():
+    global STATE_DIR
     text = ("\U0001F4CB Daily Standup \u2014 2026-09-06\n\n"
             "#alpha\n\u2022 one\n\n#beta\n\u2022 two\n\n#gamma\n\u2022 three\n\n"
             "3 projects, 9 commits shipped")
@@ -626,6 +903,225 @@ def selftest():
     assert tg_len(fitted) <= TELEGRAM_LIMIT, tg_len(fitted)
     assert "a very long subject" in fitted, "the only line was dropped instead of cut"
 
+    # ---- lead rotation ----------------------------------------------------
+    three = ("\U0001F4CB Daily Standup\n\n#alpha\n\u2022 one\n\n"
+             "#beta\n\u2022 two\n\n#gamma\n\u2022 three\n\n3 projects")
+
+    def lead_of(rendered):
+        for block in re.split(r"\n\s*\n", rendered):
+            m = SLOT_HEADER.fullmatch(block.split("\n")[0].strip())
+            if m:
+                return m.group(1)
+        return None
+
+    # A render pins the day and leaves last_led alone: previewing is not publishing.
+    _reset_rotation()
+    out = {}
+    first = shuffle_projects(three, "2026-09-20", lead_out=out)
+    decisions, last_led, _ = _read_history()
+    assert decisions == {"2026-09-20": out["tag"]}, decisions
+    assert last_led == {}, "a render must not spend a turn"
+    assert lead_of(first) == out["tag"], (first, out)
+
+    # The same day renders the same order and rewrites nothing.
+    lead_path, _ = _lead_files()
+    before = lead_path.read_bytes()
+    assert shuffle_projects(three, "2026-09-20") == first, "one day, one order"
+    assert lead_path.read_bytes() == before, "a repeat render must not rewrite the file"
+
+    # Only record_lead spends the turn, and only for the project handed to it.
+    record_lead("2026-09-20", out["tag"])
+    _, last_led, _ = _read_history()
+    assert last_led == {out["tag"]: "2026-09-20"}, last_led
+
+    # The pin wins even after last_led moves under it. This is the whole
+    # preview-equals-publish promise: the 07:30 render decides, and a press
+    # hours later — with other days recorded in between — must not re-decide.
+    _reset_rotation()
+    pinned = {}
+    shown = shuffle_projects(three, "2026-09-25", lead_out=pinned)
+    record_lead("2026-09-24", pinned["tag"])
+    record_lead("2026-09-23", "beta")
+    later = {}
+    assert shuffle_projects(three, "2026-09-25", lead_out=later) == shown, \
+        "a recorded turn must not move a day that was already pinned"
+    assert later["tag"] == pinned["tag"], (pinned, later)
+
+    # Yesterday's leader does not lead today.
+    second = {}
+    shuffle_projects(three, "2026-09-21", lead_out=second)
+    assert second["tag"] != out["tag"], (out, second)
+
+    # Over many days everyone leads, and nobody leads twice running.
+    _reset_rotation()
+    seen, previous = [], None
+    for d in range(1, 16):
+        day = f"2026-10-{d:02d}"
+        got = {}
+        shuffle_projects(three, day, lead_out=got)
+        record_lead(day, got["tag"])
+        assert got["tag"] != previous, f"{day} repeated {previous}"
+        previous = got["tag"]
+        seen.append(got["tag"])
+    assert set(seen) == {"alpha", "beta", "gamma"}, seen
+
+    # A project that is not in today's standup is skipped, and is not marked led
+    # even once the day is actually recorded.
+    _reset_rotation()
+    two = "\U0001F4CB Daily Standup\n\n#alpha\n\u2022 one\n\n#beta\n\u2022 two"
+    got = {}
+    shuffle_projects(two, "2026-11-01", lead_out=got)
+    assert got["tag"] in ("alpha", "beta"), got
+    record_lead("2026-11-01", got["tag"])
+    _, last_led, _ = _read_history()
+    assert "gamma" not in last_led, last_led
+    assert last_led == {got["tag"]: "2026-11-01"}, last_led
+
+    # record_lead credits what it is handed, never what the file happens to say.
+    # The old shape of this test recorded the same project the pin already
+    # named, so a regression to reading decisions[D] would have passed.
+    _reset_rotation()
+    _write_history({"2026-11-09": "delta"}, {})
+    record_lead("2026-11-09", "alpha")
+    _, last_led, _ = _read_history()
+    assert last_led == {"alpha": "2026-11-09"}, last_led
+
+    # The gate in main(): only a fresh X success on this press spends a turn.
+    assert should_record_lead(False, {"posted_x": True}, {"tag": "alpha"})
+    assert not should_record_lead(True, {"posted_x": True}, {"tag": "alpha"}), \
+        "an already-posted X must not spend the turn again"
+    assert not should_record_lead(False, {"posted_wip": True}, {"tag": "alpha"}), \
+        "a wip.co-only press must not spend a turn"
+    assert not should_record_lead(False, {"posted_x": True}, {}), \
+        "no lead captured means nothing to record"
+
+    # Every unusable shape is unusable whole: a fresh history, the old file
+    # kept, and a render that still returns every block.
+    for broken in ('{ not json',
+                   json.dumps({"decisions": [], "last_led": {"alpha": "2026-01-01"}}),
+                   json.dumps({"decisions": {}, "last_led": {"alpha": "nope"}}),
+                   json.dumps(["not", "a", "dict"]),
+                   json.dumps({"decisions": {}}),
+                   json.dumps({"last_led": {}}),
+                   json.dumps({"decisions": {"2026-99-99": "alpha"}, "last_led": {}}),
+                   json.dumps({"decisions": {}, "last_led": {"alpha": "2026-02-30"}})):
+        _reset_rotation()
+        lead_path, _ = _lead_files()
+        lead_path.write_text(broken)
+        decisions, last_led, _ = _read_history()
+        assert (decisions, last_led) == ({}, {}), (broken, decisions, last_led)
+        assert _is_date("2026-09-15") and not _is_date("2026-99-99"), "calendar, not shape"
+        rendered = shuffle_projects(three, "2026-11-04")
+        assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
+        assert list(STATE_DIR.glob("lead-history.json.bad-*")), \
+            f"the unusable file must be kept: {broken}"
+
+    # A lock that cannot be taken must read nothing and write nothing. Carrying
+    # on unlocked is how two processes overwrite each other.
+    _reset_rotation()
+    real_flock = fcntl.flock
+    fcntl.flock = lambda *a, **k: (_ for _ in ()).throw(OSError("no lock for you"))
+    try:
+        assert choose_lead(["alpha", "beta"], "2026-11-11", date="2026-11-11") is None
+        record_lead("2026-11-11", "alpha")
+        assert not lead_path.exists(), "nothing may be written without the lock"
+        blind = {}
+        rendered = shuffle_projects(three, "2026-11-11", lead_out=blind)
+        assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
+        assert blind == {}, "no lead may be claimed without the lock"
+    finally:
+        fcntl.flock = real_flock
+
+    # Never-led beats led-long-ago.
+    _reset_rotation()
+    _write_history({}, {"alpha": "2020-01-01", "beta": "2020-01-02"})
+    got = {}
+    shuffle_projects(three, "2026-11-02", lead_out=got)
+    assert got["tag"] == "gamma", got
+
+    # last_led never moves backwards: pending_states() can publish an older day
+    # after a newer one, and the older date would hand that project the lead again.
+    _reset_rotation()
+    record_lead("2026-11-10", "alpha")
+    record_lead("2026-11-05", "alpha")
+    _, last_led, _ = _read_history()
+    assert last_led["alpha"] == "2026-11-10", last_led
+
+    # A pin naming a project that is not here today is ignored, not obeyed.
+    _reset_rotation()
+    _write_history({"2026-11-03": "delta"}, {})
+    got = {}
+    shuffle_projects(three, "2026-11-03", lead_out=got)
+    assert got["tag"] in ("alpha", "beta", "gamma"), got
+
+    # A first line that merely mentions a hashtag is not a project header — and
+    # this has to go through shuffle_projects, not just lead_of. A regression to
+    # collecting slots with HASHTAG.search would sail past a lead_of-only check.
+    _reset_rotation()
+    mention = "\U0001F4CB Daily Standup\n\n\u2022 #123 was the culprit\n\u2022 two"
+    caught = {}
+    assert shuffle_projects(mention, "2026-11-05", lead_out=caught) == mention
+    assert caught == {}, caught
+    decisions, _, _ = _read_history()
+    assert decisions == {}, f"a bullet must not be pinned as a project: {decisions}"
+    assert lead_of("\u2022 #123 was the culprit\n\u2022 two") is None
+
+    # The live first line is Telegram-bold, which is what SLOT_HEADER is for.
+    _reset_rotation()
+    bold = ("\U0001F4CB *Daily Standup*\n\n*#alpha*\n\u2022 one\n\n"
+            "*#beta*\n\u2022 two\n\n2 projects")
+    got = {}
+    rendered = shuffle_projects(bold, "2026-11-12", lead_out=got)
+    assert got.get("tag") in ("alpha", "beta"), got
+    assert rendered.startswith("\U0001F4CB *Daily Standup*"), rendered
+    assert rendered.endswith("2 projects"), rendered
+    assert rendered.split("\n\n")[1] == f"*#{got['tag']}*\n\u2022 " + \
+        ("one" if got["tag"] == "alpha" else "two"), rendered
+
+    # Shapes that must not explode.
+    _reset_rotation()
+    assert shuffle_projects("#solo\n\u2022 one", "2026-11-06").startswith("#solo")
+    assert shuffle_projects("no projects here", "2026-11-07") == "no projects here"
+
+    # A state directory it cannot write still renders, raises nothing, and says
+    # nothing on stdout — stdout is the tweet.
+    _reset_rotation()
+    blocked = STATE_DIR / "afile"
+    blocked.write_text("not a directory")
+    saved_dir = STATE_DIR
+    STATE_DIR = blocked / "nested"
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rendered = shuffle_projects(three, "2026-11-08")
+        assert sorted(HASHTAG.findall(rendered)) == ["alpha", "beta", "gamma"], rendered
+        assert buf.getvalue() == "", f"nothing may reach stdout: {buf.getvalue()!r}"
+    finally:
+        STATE_DIR = saved_dir
+
+    # Two processes, two hash seeds, one lead. The tie-break must not follow
+    # PYTHONHASHSEED: --preview and the publish are different interpreters, and
+    # on a day when every project ties they must still agree. Each child gets its
+    # own empty history, or the pin would decide it for them.
+    driver = ("import importlib.util,sys;"
+              "spec=importlib.util.spec_from_file_location('sp',sys.argv[1]);"
+              "m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);"
+              "out={};m.shuffle_projects(sys.argv[2],'2026-12-01',lead_out=out);"
+              "print(out.get('tag',''))")
+    picks = []
+    for hash_seed in ("0", "12345"):
+        box = tempfile.mkdtemp(prefix="standup-tie-")
+        try:
+            child = subprocess.run(
+                [sys.executable, "-c", driver, __file__, three],
+                capture_output=True, text=True, timeout=60,
+                env=dict(os.environ, PYTHONHASHSEED=hash_seed, STANDUP_STATE_DIR=box))
+            assert child.returncode == 0, child.stderr[:300]
+            picks.append(child.stdout.strip())
+        finally:
+            shutil.rmtree(box, ignore_errors=True)
+    assert picks[0] and picks[0] == picks[1], f"the tie-break follows the hash seed: {picks}"
+
     print("selftest ok")
 
 
@@ -709,9 +1205,29 @@ def main():
         # Each destination is remembered on its own, the moment it succeeds, so
         # a half-done day — X posted, wip.co refused — is retryable without
         # tweeting it twice.
+        # The hashtag that led, caught on the way past. It cannot be read back
+        # out of the finished text: for_x has already replaced every hashtag
+        # with a project name and a URL by then.
+        lead = {}
+        x_before = bool(state.get("posted_x"))
+
+        def post_x():
+            ok, detail = post_to_x(text, key, lead_out=lead)
+            # Recorded here rather than after the loop. publish_pending saves
+            # posted_x the moment X succeeds, so anything that raises later —
+            # the state write, the next destination — would skip the record,
+            # and the next press sees posted_x and never posts X again. The
+            # turn would be lost with nothing to show for it.
+            try:
+                if should_record_lead(x_before, {"posted_x": ok}, lead):
+                    record_lead(key, lead["tag"])
+            except Exception as e:  # noqa: BLE001 - the tweet is already live
+                warn(f"could not record the lead rotation: {e}")
+            return ok, detail
+
         lines = publish_pending(
             state, target,
-            (("X", "x", "posted_x", lambda: post_to_x(text, key)),
+            (("X", "x", "posted_x", post_x),
              ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))),
             lambda s: path.write_text(json.dumps(s, ensure_ascii=False, indent=2)),
         )
