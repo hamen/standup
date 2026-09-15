@@ -560,8 +560,13 @@ PRIVATE_LINE = [re.compile(p) for p in (
     # \w* on the stems: "\bvulnerabilit\b" can never match "vulnerability",
     # because a word character follows the stem. The first version of this list
     # was written that way and caught none of the lines it was written for.
-    r"(?i)\b(vulnerabilit|vuln|advisor|exploit|breach|leak)\w*",
-    r"(?i)\b(zero[ -]?day|rce|injection|xss|csrf|sqli)\b",
+    r"(?i)\b(vulnerabilit|vuln|advisor|exploit|breach)\w*",
+    r"(?i)\b(zero[ -]?day|rce|xss|csrf|sqli)\b",
+    # Qualified only. Bare "injection" is dependency injection and bare "leak"
+    # is a memory leak — both ordinary commits, and dropping a project's only
+    # bullet would turn an ordinary day into a silent one.
+    r"(?i)\b(sql|command|code|template|prompt)[ -]?injection\b",
+    r"(?i)\b(data|token|key|secret|credential|password)[ -]?leaks?\b",
     # No bullet required, and any amount of Telegram bold around the label.
     r"(?i)^\s*[\u2022*-]*\s*\**\s*security\b",
     # Plural only, never \w*: "secret\w*" would drop a bullet about a secretary.
@@ -572,8 +577,15 @@ PRIVATE_LINE = [re.compile(p) for p in (
 )]
 
 
+# Deliberately wider than SLOT_HEADER, which the rotation uses. The rotation
+# must not hand the lead to a project the URL swap cannot resolve; the filter
+# has the opposite duty — miss a header here and a valid report is refused as
+# having no projects at all. repo_name_mapping allows uppercase, "_" and "-".
+FILTER_HEADER = re.compile(r"\*?#([A-Za-z0-9][A-Za-z0-9_-]*)\*?")
+
+
 def _is_header(line):
-    return bool(SLOT_HEADER.fullmatch(line.strip()))
+    return bool(FILTER_HEADER.fullmatch(line.strip()))
 
 
 def strip_private(text):
@@ -1299,6 +1311,23 @@ def _selftest_body():
     assert "drop it" not in stripped(
         "\U0001F4CB T\n\n#alpha\n\u2022 *Security:* drop it\n\u2022 Tests: ok\n\n1 projects")
     assert "secretary" in stripped("\U0001F4CB T\n\n#alpha\n\u2022 ask the secretary\n\n1 projects")
+
+    # Every header shape repo_name_mapping allows must be recognised, or a valid
+    # report is refused as having no projects at all.
+    for shape in ("#alpha", "#My-App", "#my_app", "*#Alpha*", "#3thingsaday"):
+        one = f"\U0001F4CB T\n\n{shape}\n\u2022 Tests: ok\n\n1 projects"
+        assert strip_private(one)[1:] == (1, 1), (shape, strip_private(one)[1:])
+
+    # Qualified only: an unqualified injection or leak is an ordinary commit,
+    # and dropping a project's only bullet would fake a quiet day.
+    for kept in ("\u2022 Fixed a memory leak", "\u2022 Refactor dependency injection",
+                 "\u2022 vulgar language filter"):
+        one = f"\U0001F4CB T\n\n#alpha\n{kept}\n\n1 projects"
+        assert kept in stripped(one), kept
+    for gone in ("\u2022 Fix the SQL injection", "\u2022 a credential leak in logs",
+                 "\u2022 patch the vuln in upload", "\u2022 a zero-day in the parser"):
+        one = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
+        assert gone not in stripped(one), gone
 
     # A header carrying a matching word is exempt, or its bullets would orphan.
     hdr = "\U0001F4CB T\n\n#security\n\u2022 Tests: ok\n\n1 projects"
