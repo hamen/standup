@@ -52,6 +52,12 @@ BUFFER_LINKEDIN_CHANNEL=<the channel id from: buffer channels list --organizatio
 fails hours after you press it is worse than a button that was never offered. `daily-standup.sh --check`
 tells you which state you are in.
 
+**Check where `buffer` actually lands.** `npm install -g` puts it in npm's global prefix, which is
+not always on cron's PATH — and is not necessarily the same place your other global CLIs live. Run
+`daily-standup.sh --check`: if it reports the binary as MISSING, put `BUFFER_BIN=/full/path/to/buffer`
+on the cron line, the same way `BIRD_BIN` is already there. The publisher falls back to
+`~/.npm-global/bin/buffer`, which is a guess and only right for one kind of npm setup.
+
 With it configured the morning message carries a LinkedIn button and a `Tutti` button; without it,
 the keyboard is unchanged. The post goes out with `--mode shareNow`, so it publishes immediately
 rather than joining a Buffer queue — the press is the approval, and a post appearing at some later

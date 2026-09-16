@@ -48,7 +48,15 @@ BIRD = (
     or shutil.which("bird")
     or str(pathlib.Path.home() / ".npm-global/bin/bird")
 )
-BUFFER = os.environ.get("BUFFER_BIN") or shutil.which("buffer") or "buffer"
+# The npm-global fallback matters for the same reason it does for bird: this
+# runs under cron, whose PATH is short, and the README says npm install -g.
+# Without it every LinkedIn press would fail with FileNotFoundError — reported
+# rather than fatal, but never able to succeed.
+BUFFER = (
+    os.environ.get("BUFFER_BIN")
+    or shutil.which("buffer")
+    or str(pathlib.Path.home() / ".npm-global/bin/buffer")
+)
 BUFFER_ENV = CONFIG_DIR / "buffer.env"
 
 
@@ -874,6 +882,20 @@ def post_to_wip(text):
 
 
 LEGACY_BOTH = ("x", "wip")
+# Which flag records each destination. A state written before LinkedIn existed
+# has no "armed" list, and must not wait for a post its keyboard never offered.
+DESTINATION_FLAG = {"x": "posted_x", "wip": "posted_wip", "linkedin": "posted_linkedin"}
+
+
+def day_complete(state):
+    """Every destination armed THAT MORNING has been resolved.
+
+    Judged against the armed list rather than the config that exists now: a day
+    whose keyboard never offered LinkedIn must not wait for a LinkedIn post, and
+    one whose LinkedIn was later unconfigured must not wait for ever either.
+    """
+    armed = state.get("armed") or list(LEGACY_BOTH)
+    return all(state.get(DESTINATION_FLAG[a]) for a in armed if a in DESTINATION_FLAG)
 
 
 def publish_pending(state, target, posters, save):
@@ -904,12 +926,12 @@ def publish_pending(state, target, posters, save):
             continue
         try:
             ok, detail = fn()
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as e:
             # Ambiguous: the post may well have gone out. It is recorded as
             # failed and is therefore retryable, so the reply has to say so
             # rather than leave a second public post to chance.
-            ok, detail = False, ("timed out after 120s — it MAY have been "
-                                 "published; check before pressing again")
+            ok, detail = False, (f"timed out after {e.timeout:g}s — it MAY have "
+                                 "been published; check before pressing again")
         # SystemExit too, and not by accident: wip_key() calls die() on a
         # missing token, die() raises SystemExit, and SystemExit is not an
         # Exception. Catching Exception alone would have left that one escaping
@@ -1093,15 +1115,47 @@ def _selftest_body():
     # the others and omit it in silence, while the pending file waited for a
     # post nobody was going to attempt.
     st = {"id": "g", "armed": ["x", "wip", "linkedin"]}
+    def disarmed():
+        st["posted_linkedin"] = "skipped"
+        return True, "skipped — not configured any more"
     gone = publish_pending(
         st, "all",
         (("X", "x", "posted_x", lambda: (True, "ok")),
          ("wip.co", "wip", "posted_wip", lambda: (True, "ok")),
-         ("LinkedIn", "linkedin", "posted_linkedin",
-          lambda: (False, "not configured any more"))),
+         ("LinkedIn", "linkedin", "posted_linkedin", disarmed)),
         lambda s: None)
-    assert len(gone) == 3 and st["posted_linkedin"] is False, (gone, st)
+    assert len(gone) == 3, gone
     assert any("not configured any more" in l for l in gone), gone
+    assert day_complete(st), f"a disarmed destination must not stall the day: {st}"
+
+    # The argv the CLI actually receives: a list, never a shell string, with
+    # shareNow and the report as one argument however many spaces it has.
+    box = pathlib.Path(tempfile.mkdtemp(prefix="standup-buffer-bin-"))
+    try:
+        stub = box / "buffer"
+        stub.write_text("#!/usr/bin/env python3\n"
+                        "import json,sys,os\n"
+                        "print(json.dumps({'argv': sys.argv[1:],\n"
+                        "                  'key': os.environ.get('BUFFER_API_KEY')}))\n")
+        stub.chmod(0o755)
+        real_buffer = globals()["BUFFER"]
+        globals()["BUFFER"] = str(stub)
+        try:
+            ok, detail = post_to_linkedin(
+                "a report\nwith two lines",
+                {"BUFFER_API_KEY": "k", "BUFFER_LINKEDIN_CHANNEL": "chan"})
+        finally:
+            globals()["BUFFER"] = real_buffer
+        assert ok, detail
+        seen = json.loads(detail)
+        assert seen["key"] == "k", "the key reaches the child through its environment"
+        argv = seen["argv"]
+        assert argv[:3] == ["posts", "create", "--channel-id"], argv
+        assert "chan" in argv and "--mode" in argv, argv
+        assert argv[argv.index("--mode") + 1] == "shareNow", argv
+        assert "a report\nwith two lines" in argv, "the report is one argument"
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
 
     # die() raises SystemExit, which is not an Exception. wip_key() calls it.
     def exits():
@@ -1114,18 +1168,18 @@ def _selftest_body():
 
     # Completion is judged against what was armed that morning, never against
     # the config that exists when the button is finally pressed.
-    done = {"x": "posted_x", "wip": "posted_wip", "linkedin": "posted_linkedin"}
-    def complete(state):
-        armed = state.get("armed") or ["x", "wip"]
-        return all(state.get(done[a]) for a in armed if a in done)
-    assert complete({"armed": ["x", "wip"], "posted_x": True, "posted_wip": True})
-    assert not complete({"armed": ["x", "wip", "linkedin"],
-                         "posted_x": True, "posted_wip": True})
-    assert complete({"armed": ["x", "wip", "linkedin"], "posted_x": True,
-                     "posted_wip": True, "posted_linkedin": True})
+    assert day_complete({"armed": ["x", "wip"], "posted_x": True, "posted_wip": True})
+    assert not day_complete({"armed": ["x", "wip", "linkedin"],
+                             "posted_x": True, "posted_wip": True})
+    assert day_complete({"armed": ["x", "wip", "linkedin"], "posted_x": True,
+                         "posted_wip": True, "posted_linkedin": True})
     # A state written before LinkedIn existed has no armed list and must not
     # wait for a post its keyboard never offered.
-    assert complete({"posted_x": True, "posted_wip": True})
+    assert day_complete({"posted_x": True, "posted_wip": True})
+    # And a destination that was armed and then unconfigured is resolved, not
+    # pending: "skipped" is truthy, so the file can finally be deleted.
+    assert day_complete({"armed": ["x", "wip", "linkedin"], "posted_x": True,
+                         "posted_wip": True, "posted_linkedin": "skipped"})
 
     # --- The 2026-09-09 underscore, both halves of it ---------------------
     subject = "• Build config: dart_defines from production.env"
@@ -1824,8 +1878,14 @@ def main():
             if linkedin:
                 poster = lambda: post_to_linkedin(render_public(), linkedin)
             else:
-                poster = lambda: (False, f"not configured any more: {BUFFER_ENV} "
-                                         "no longer has both keys")
+                # "skipped" rather than False: truthy, so the day can complete.
+                # A destination that no longer exists is resolved, not pending —
+                # otherwise the file is re-read on every tick for ever and the
+                # button stays dead on the message.
+                def poster():
+                    state["posted_linkedin"] = "skipped"
+                    return True, (f"skipped — {BUFFER_ENV} no longer has both keys, "
+                                  "so this destination is not configured any more")
             posters.append(("LinkedIn", "linkedin", "posted_linkedin", poster))
 
         lines = publish_pending(
@@ -1847,9 +1907,7 @@ def main():
         # from the config that exists now would never complete a day whose
         # message predates LinkedIn, and pending_states() would re-read that
         # file on every tick for ever.
-        armed = state.get("armed") or ["x", "wip"]
-        done = {"x": "posted_x", "wip": "posted_wip", "linkedin": "posted_linkedin"}
-        if all(state.get(done[a]) for a in armed if a in done):
+        if day_complete(state):
             path.unlink(missing_ok=True)
 
         telegram(token, "sendMessage", chat_id=state["chat_id"],
