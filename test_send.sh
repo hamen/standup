@@ -244,6 +244,41 @@ echo "$out" | grep -q 'private-line filter itself failed' ||
 # pipeline cannot reach that branch, and a test that pretended otherwise would
 # be asserting a fiction. The CLI path is covered in --selftest.
 
+# --- 4b-iii. LinkedIn arms the keyboard, and only when fully configured -----
+# fakehome is the config dir under env -i, so buffer.env lands there.
+BUF="$TMP/fakehome/.config/standup/buffer.env"
+mkdir -p "$(dirname "$BUF")"
+
+out=$(run "$TMP/no-buffer.log")
+kb=$(call "$TMP/no-buffer.log" 1 | grep -o 'inline_keyboard.*')
+echo "$kb" | grep -q ':both' ||
+  failures+=("without buffer.env the keyboard lost its Entrambi button")
+echo "$kb" | grep -q 'LinkedIn' &&
+  failures+=("LinkedIn was offered with no buffer.env at all")
+
+# Half-configured must not arm: a button that fails hours later is worse than
+# one that was never offered.
+printf 'BUFFER_API_KEY=k\n' > "$BUF"
+out=$(run "$TMP/half-buffer.log")
+call "$TMP/half-buffer.log" 1 | grep -q 'LinkedIn' &&
+  failures+=("a buffer.env missing the channel id still armed LinkedIn")
+
+printf 'BUFFER_API_KEY=k\nBUFFER_LINKEDIN_CHANNEL=c\n' > "$BUF"
+out=$(run "$TMP/full-buffer.log")
+kb=$(call "$TMP/full-buffer.log" 1 | grep -o 'inline_keyboard.*')
+echo "$kb" | grep -q 'LinkedIn' ||
+  failures+=("a complete buffer.env did not arm the LinkedIn button")
+echo "$kb" | grep -q ':all' ||
+  failures+=("the armed keyboard has no Tutti button")
+echo "$kb" | grep -q ':both' &&
+  failures+=("Entrambi is still offered alongside Tutti")
+state=$(cat "$TMP/fakehome/.local/state/standup/pending-"*.json 2>/dev/null)
+echo "$state" | grep -q '"linkedin"' ||
+  failures+=("the pending state did not record linkedin as armed")
+echo "$state" | grep -q '"posted_linkedin": false' ||
+  failures+=("the pending state has no posted_linkedin flag")
+rm -f "$BUF" "$TMP/fakehome/.local/state/standup/pending-"*.json
+
 # --- 4c. A report that is nothing but security lines ------------------------
 # Not a rest day, and not a title with a trailer and no content: both of those
 # would be a lie about what happened. Say so, send no report, arm no button.
