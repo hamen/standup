@@ -36,6 +36,25 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 # the widened PATH would report a binary that the poller cannot see.
 CRON_PATH="$PATH"
 
+# LinkedIn is armed only when buffer.env carries BOTH keys with a real value.
+# A half-configured destination is worse than an absent one: it offers a button
+# that fails hours later. One function, because the keyboard and --check have to
+# agree with each other and with the publisher — and the publisher strips quotes
+# before deciding, so BUFFER_API_KEY="" is empty there and must be empty here.
+linkedin_armed() {
+  local env_file="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env" key value
+  [ -f "$env_file" ] || return 1
+  for key in BUFFER_API_KEY BUFFER_LINKEDIN_CHANNEL; do
+    value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" \
+            "$env_file" | head -1)
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [ -n "$value" ] || return 1
+  done
+  return 0
+}
+
 # ---- Source shell profile (cron runs with minimal env) ----
 #
 # The profile is sourced for PATH, which cron does not give us. It is also a
@@ -55,7 +74,7 @@ CRON_PATH="$PATH"
 # The credentials are in the list because a profile exporting either of them
 # silently changes WHERE the standup is posted, which is the worst version of
 # this failure and the least visible.
-_OVERRIDES=(CLAUDE_BIN BIRD_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
+_OVERRIDES=(CLAUDE_BIN BIRD_BIN BUFFER_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
             STANDUP_STATE_DIR TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
 for _v in "${_OVERRIDES[@]}"; do
   # ${!_v+set}, not -n: a caller that writes VAR= on the cron line means "empty",
@@ -132,6 +151,14 @@ if [ "${1:-}" = "--check" ]; then
   bird_at="${BIRD_BIN:-$(PATH="$CRON_PATH" command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
   echo "claude:        $claude_at $([ -x "$claude_at" ] || echo '(MISSING — set CLAUDE_BIN)')"
   echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
+  if linkedin_armed; then
+    # The same fallback the publisher uses, or --check calls a binary missing
+    # that the publisher would have found.
+    buffer_at="${BUFFER_BIN:-$(PATH="$CRON_PATH" command -v buffer 2>/dev/null || echo "$HOME/.npm-global/bin/buffer")}"
+    echo "LinkedIn:      armed $([ -x "$buffer_at" ] || echo "(but $buffer_at is MISSING — set BUFFER_BIN)")"
+  else
+    echo "LinkedIn:      not armed (${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env needs BUFFER_API_KEY and BUFFER_LINKEDIN_CHANNEL)"
+  fi
   echo "publisher:     $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
   echo "state dir:     ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
   exit 0
@@ -441,7 +468,26 @@ PENDING_ID="$TODAY"
 # One button per destination, so a day already published to one place can still
 # be sent to the other. Each destination is recorded on its own, so pressing the
 # same button twice is a no-op rather than a duplicate.
-KEYBOARD="{\"inline_keyboard\":[[{\"text\":\"🐦 X\",\"callback_data\":\"publish:${PENDING_ID}:x\"},{\"text\":\"📋 wip.co\",\"callback_data\":\"publish:${PENDING_ID}:wip\"}],[{\"text\":\"🚀 Entrambi\",\"callback_data\":\"publish:${PENDING_ID}:both\"}]]}"
+# LinkedIn is armed only when buffer.env carries BOTH keys. A file with one of
+# them is a half-configured destination, which is worse than an absent one: it
+# offers a button that fails hours later. The publisher applies the same rule,
+# so the keyboard and the publish path cannot disagree.
+ARMED='["x","wip"]'
+LINKEDIN_ARMED=0
+if linkedin_armed; then
+  LINKEDIN_ARMED=1
+  ARMED='["x","wip","linkedin"]'
+fi
+
+# "Tutti" carries `all` and replaces "Entrambi" on new keyboards. `both` is not
+# offered any more but is still honoured on receipt, so a press on a message
+# sent before LinkedIn existed still does what its label promised.
+ROW1="[{\"text\":\"🐦 X\",\"callback_data\":\"publish:${PENDING_ID}:x\"},{\"text\":\"📋 wip.co\",\"callback_data\":\"publish:${PENDING_ID}:wip\"}]"
+if [ "$LINKEDIN_ARMED" = 1 ]; then
+  KEYBOARD="{\"inline_keyboard\":[${ROW1},[{\"text\":\"💼 LinkedIn\",\"callback_data\":\"publish:${PENDING_ID}:linkedin\"}],[{\"text\":\"🚀 Tutti\",\"callback_data\":\"publish:${PENDING_ID}:all\"}]]}"
+else
+  KEYBOARD="{\"inline_keyboard\":[${ROW1},[{\"text\":\"🚀 Entrambi\",\"callback_data\":\"publish:${PENDING_ID}:both\"}]]}"
+fi
 
 # The state file keeps ANALYSIS unescaped — that text is what X and wip.co
 # receive when the button is pressed, and backslashes are not prose. Only what
@@ -484,7 +530,7 @@ if echo "$RESP" | grep -q '"ok":true'; then
   # state file is a dead button, and a state file without the id it belongs to
   # cannot be replied to. Text through the environment, not argv, because it is
   # long and multi-line and that is where quoting breaks.
-  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" "${PY_UTF8[@]}" python3 - \
+  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" ARMED="$ARMED" "${PY_UTF8[@]}" python3 - \
       "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" <<'PYEOF'
 import json, os, sys
 
@@ -502,7 +548,14 @@ state = {"id": pending_id,
          "message_id": int(result["message_id"]),
          "chat_id": int(result["chat"]["id"]),
          "text": os.environ["ANALYSIS"],
+         # What was armed THIS morning. Completion is judged against this list,
+         # not against whatever config exists when the button is finally
+         # pressed — a day whose keyboard never offered LinkedIn must not wait
+         # for a LinkedIn post that can never happen.
+         "armed": json.loads(os.environ["ARMED"]),
          "posted_x": False, "posted_wip": False}
+if "linkedin" in state["armed"]:
+    state["posted_linkedin"] = False
 
 tmp = path + ".partial"
 try:

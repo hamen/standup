@@ -32,6 +32,43 @@ $ standup
 
 No dependencies, no daemon, no account. Ruby and `git`.
 
+## Optional: publish to LinkedIn
+
+The companion can post to LinkedIn through the [Buffer CLI](https://developers.buffer.com/guides/cli.html),
+alongside X and wip.co. It is off unless you configure it.
+
+```bash
+npm install -g @bufferapp/cli
+```
+
+Then put both values in `~/.config/standup/buffer.env`, mode `600`:
+
+```
+BUFFER_API_KEY=<from https://publish.buffer.com/settings/api>
+BUFFER_LINKEDIN_CHANNEL=<the channel id from: buffer channels list --organization-id <org>>
+```
+
+**Both keys are required.** A file with only one does not arm the destination, because a button that
+fails hours after you press it is worse than a button that was never offered. `daily-standup.sh --check`
+tells you which state you are in.
+
+**Check where `buffer` actually lands.** `npm install -g` puts it in npm's global prefix, which is
+not always on cron's PATH — and is not necessarily the same place your other global CLIs live. Run
+`daily-standup.sh --check`: if it reports the binary as MISSING, put `BUFFER_BIN=/full/path/to/buffer`
+on the cron line, the same way `BIRD_BIN` is already there. The publisher falls back to
+`~/.npm-global/bin/buffer`, which is a guess and only right for one kind of npm setup.
+
+With it configured the morning message carries a LinkedIn button and a `Tutti` button; without it,
+the keyboard is unchanged. The post goes out with `--mode shareNow`, so it publishes immediately
+rather than joining a Buffer queue — the press is the approval, and a post appearing at some later
+slot is not what the button promised.
+
+LinkedIn receives the same text as X: project names and website links rather than hashtags, which
+are wip.co's attach mechanism and read as noise anywhere else.
+
+Note that a Buffer API key reaches **every organisation and channel on your account** — Buffer has no
+per-organisation scoping — so treat it like the other credentials here.
+
 ## Why it is not `git log`
 
 Because `git log` reads the branch your checkout happens to be sitting on, and

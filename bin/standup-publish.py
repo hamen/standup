@@ -48,6 +48,16 @@ BIRD = (
     or shutil.which("bird")
     or str(pathlib.Path.home() / ".npm-global/bin/bird")
 )
+# The npm-global fallback matters for the same reason it does for bird: this
+# runs under cron, whose PATH is short, and the README says npm install -g.
+# Without it every LinkedIn press would fail with FileNotFoundError — reported
+# rather than fatal, but never able to succeed.
+BUFFER = (
+    os.environ.get("BUFFER_BIN")
+    or shutil.which("buffer")
+    or str(pathlib.Path.home() / ".npm-global/bin/buffer")
+)
+BUFFER_ENV = CONFIG_DIR / "buffer.env"
 
 
 def log(msg):
@@ -82,6 +92,36 @@ def read_env(paths, key):
             if line.startswith(f"{key}=") or line.startswith(f"export {key}="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     die(f"{key} not found in any of {', '.join(str(p) for p in paths)}")
+
+
+def optional_env(path, *keys):
+    """Every key, or None. Never fatal, unlike read_env.
+
+    read_env calls die() on a missing key, so reusing it for optional config
+    would exit on every cron tick of a machine that has no buffer.env.
+    """
+    if not path.exists():
+        return None
+    found = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, sep, value = line.partition("=")
+        if sep and key.strip() in keys:
+            found[key.strip()] = value.strip().strip('"').strip("'")
+    if any(not found.get(k) for k in keys):
+        return None
+    return found
+
+
+def linkedin_config():
+    """The Buffer key and channel, or None when LinkedIn is not armed.
+
+    Both are required. A file with one of them is a half-configured destination,
+    which is worse than an absent one because it only fails at publish time.
+    """
+    return optional_env(BUFFER_ENV, "BUFFER_API_KEY", "BUFFER_LINKEDIN_CHANNEL")
 
 
 def wip_key():
@@ -798,10 +838,31 @@ def for_x(text, seed, lead_out=None):
     return HASHTAG.sub(swap, text)
 
 
-def post_to_x(text, seed, lead_out=None):
-    text = for_x(text, seed, lead_out=lead_out)
+def post_to_x(text):
+    """`text` is already rendered for a public timeline — see render_public."""
     result = subprocess.run([BIRD, "tweet", text], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
+        return False, (result.stderr or result.stdout).strip()[:300]
+    return True, (result.stdout or "").strip()[:300]
+
+
+def post_to_linkedin(text, config):
+    """Through the Buffer CLI, the same shape X already has with bird.
+
+    shareNow rather than the queue: the press is the approval, and a post that
+    appears at some later slot is not what the button promised. The key reaches
+    the child through the environment; a file it never reads would not.
+    """
+    result = subprocess.run(
+        [BUFFER, "posts", "create",
+         "--channel-id", config["BUFFER_LINKEDIN_CHANNEL"],
+         "--text", text,
+         "--mode", "shareNow",
+         "--scheduling-type", "automatic"],
+        capture_output=True, text=True, timeout=120,
+        env=dict(os.environ, BUFFER_API_KEY=config["BUFFER_API_KEY"]))
+    if result.returncode != 0:
+        # The CLI answers in JSON, and what Buffer refused is the useful part.
         return False, (result.stderr or result.stdout).strip()[:300]
     return True, (result.stdout or "").strip()[:300]
 
@@ -820,6 +881,30 @@ def post_to_wip(text):
         return False, str(e)[:300]
 
 
+LEGACY_BOTH = ("x", "wip")
+# Which flag records each destination. A state written before LinkedIn existed
+# has no "armed" list, and must not wait for a post its keyboard never offered.
+DESTINATION_FLAG = {"x": "posted_x", "wip": "posted_wip", "linkedin": "posted_linkedin"}
+
+
+def day_complete(state):
+    """Every destination armed THAT MORNING has been resolved.
+
+    Resolved means posted, or waived. Judged against the armed list rather than
+    the config that exists now: a day whose keyboard never offered LinkedIn must
+    not wait for a LinkedIn post, and one whose LinkedIn was unconfigured before
+    the button was pressed must not wait for ever either.
+
+    A waiver is deliberately not a success. Recording one as posted would show a
+    green tick for a post that never happened, and would let a retry be skipped
+    as "already posted" if the configuration came back.
+    """
+    armed = state.get("armed") or list(LEGACY_BOTH)
+    waived = state.get("waived") or []
+    return all(state.get(DESTINATION_FLAG[a]) or a in waived
+               for a in armed if a in DESTINATION_FLAG)
+
+
 def publish_pending(state, target, posters, save):
     """Post to each requested destination, writing down each success at once.
 
@@ -836,12 +921,33 @@ def publish_pending(state, target, posters, save):
     """
     lines = []
     for name, code, already, fn in posters:
-        if target not in (code, "both"):
+        # `all` is every armed destination. `both` is the two that existed
+        # before LinkedIn and means exactly those, so a press on a message sent
+        # back then still does what its label promised — and does not silently
+        # acquire a third destination the person never saw.
+        if not (target == code or target == "all"
+                or (target == "both" and code in LEGACY_BOTH)):
             continue
         if state.get(already):
             lines.append(f"✅ {name} — already posted, skipped")
             continue
-        ok, detail = fn()
+        try:
+            ok, detail = fn()
+        except subprocess.TimeoutExpired as e:
+            # Ambiguous: the post may well have gone out. It is recorded as
+            # failed and is therefore retryable, so the reply has to say so
+            # rather than leave a second public post to chance.
+            ok, detail = False, (f"timed out after {e.timeout:g}s — it MAY have "
+                                 "been published; check before pressing again")
+        # SystemExit too, and not by accident: wip_key() calls die() on a
+        # missing token, die() raises SystemExit, and SystemExit is not an
+        # Exception. Catching Exception alone would have left that one escaping
+        # exactly the way this guard exists to stop.
+        except (Exception, SystemExit) as e:  # noqa: BLE001 - see below
+            # bird runs with timeout=120 and nothing caught it, and the
+            # getUpdates offset was advanced before this loop began. A raise
+            # here used to lose the press and the whole day.
+            ok, detail = False, f"{type(e).__name__}: {e}"[:300]
         state[already] = ok
         save(state)
         lines.append(f"{'✅' if ok else '❌'} {name} — {detail or 'posted'}")
@@ -925,21 +1031,36 @@ def _selftest_body():
     st = {"id": "d"}
     def explode():
         raise RuntimeError("wip.co is down")
-    # The exception is allowed to escape — the process dying is not the problem.
-    # The problem would be it dying with the X success only in memory.
-    try:
-        publish_pending(
-            st, "both",
-            (("X", "x", "posted_x", lambda: (True, "https://x.com/i/1")),
-             ("wip.co", "wip", "posted_wip", explode)),
-            lambda s: saved.append(dict(s)),
-        )
-        raise AssertionError("the failing destination should have raised")
-    except RuntimeError:
-        pass
+    # The exception used to be allowed to escape, on the reasoning that the
+    # process dying was not the problem. It was: the getUpdates offset is
+    # advanced before this loop runs, so a raise here consumed the press and
+    # lost the whole day — and bird runs with timeout=120 and nothing caught it.
+    # A poster that raises is a failed destination now, and the ones after it
+    # still run.
+    lines = publish_pending(
+        st, "both",
+        (("X", "x", "posted_x", lambda: (True, "https://x.com/i/1")),
+         ("wip.co", "wip", "posted_wip", explode)),
+        lambda s: saved.append(dict(s)),
+    )
+    assert st["posted_wip"] is False, st
+    assert any("wip.co is down" in l for l in lines), lines
+    assert any("RuntimeError" in l for l in lines), lines
+
+    # A timeout is the ambiguous one: the post may well have gone out, and it is
+    # recorded as failed and therefore retryable, so the reply has to say so.
+    def stall():
+        raise subprocess.TimeoutExpired(cmd="bird", timeout=120)
+    timed = publish_pending(
+        {"id": "t"}, "x", (("X", "x", "posted_x", stall),), lambda s: None)
+    assert any("MAY have been" in l for l in timed), timed
     assert saved and saved[0].get("posted_x") is True, \
         "the X success was not written down before wip.co was attempted"
-    assert st["posted_x"] is True and "posted_wip" not in st, st
+    # posted_wip is False rather than absent now: a poster that raises is a
+    # failed destination, which is recorded, reported and retryable. It used to
+    # be absent because the raise happened before the write — and took the
+    # press with it.
+    assert st["posted_x"] is True and st["posted_wip"] is False, st
 
     # And the ordinary path still records both, and skips what is already done.
     saved.clear()
@@ -962,6 +1083,105 @@ def _selftest_body():
                      ("wip.co", "wip", "posted_wip", lambda: (True, "ok"))),
                     lambda s: None)
     assert "posted_x" not in st, st
+
+    # --- LinkedIn ---------------------------------------------------------
+    # Armed only when both keys are there. A half-configured destination is
+    # worse than an absent one: it offers a button that fails hours later.
+    box = pathlib.Path(tempfile.mkdtemp(prefix="standup-buffer-"))
+    try:
+        assert optional_env(box / "nothing.env", "A") is None
+        half = box / "half.env"
+        half.write_text("BUFFER_API_KEY=k\n")
+        assert optional_env(half, "BUFFER_API_KEY", "BUFFER_LINKEDIN_CHANNEL") is None
+        blank = box / "blank.env"
+        blank.write_text("BUFFER_API_KEY=k\nBUFFER_LINKEDIN_CHANNEL=\n")
+        assert optional_env(blank, "BUFFER_API_KEY", "BUFFER_LINKEDIN_CHANNEL") is None
+        full = box / "full.env"
+        full.write_text('export BUFFER_API_KEY="k"\nBUFFER_LINKEDIN_CHANNEL=c\n')
+        assert optional_env(full, "BUFFER_API_KEY", "BUFFER_LINKEDIN_CHANNEL") == \
+            {"BUFFER_API_KEY": "k", "BUFFER_LINKEDIN_CHANNEL": "c"}
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+
+    # `all` reaches every destination; `both` reaches the two that existed
+    # before LinkedIn, so a press on an older message still does what its label
+    # promised; a target nobody serves produces no lines, and main() turns that
+    # into a reply rather than an empty sendMessage.
+    def served(target, names):
+        st = {"id": "s"}
+        posters = tuple((n, c, f"posted_{c}", (lambda ok=n: (True, "ok")))
+                        for n, c in names)
+        return publish_pending(st, target, posters, lambda s: None)
+    three = (("X", "x"), ("wip.co", "wip"), ("LinkedIn", "linkedin"))
+    assert len(served("all", three)) == 3
+    assert [l.split(" — ")[0] for l in served("both", three)] == ["✅ X", "✅ wip.co"]
+    assert served("linkedin", (("X", "x"), ("wip.co", "wip"))) == []
+
+    # A destination armed that morning but no longer configured is still in the
+    # poster list, as one that fails and says why. Left out, `all` would post to
+    # the others and omit it in silence, while the pending file waited for a
+    # post nobody was going to attempt.
+    # A waiver is not a success: no flag is set, so no green tick and no
+    # "already posted, skipped" if the configuration comes back.
+    st = {"id": "g", "armed": ["x", "wip", "linkedin"],
+          "posted_x": True, "posted_wip": True}
+    assert not day_complete(st), "an armed destination cannot just be ignored"
+    st["waived"] = ["linkedin"]
+    assert day_complete(st), f"a waived destination must not stall the day: {st}"
+    assert "posted_linkedin" not in st, "a waiver must not look like a post"
+
+    # The argv the CLI actually receives: a list, never a shell string, with
+    # shareNow and the report as one argument however many spaces it has.
+    box = pathlib.Path(tempfile.mkdtemp(prefix="standup-buffer-bin-"))
+    try:
+        stub = box / "buffer"
+        stub.write_text("#!/usr/bin/env python3\n"
+                        "import json,sys,os\n"
+                        "print(json.dumps({'argv': sys.argv[1:],\n"
+                        "                  'key': os.environ.get('BUFFER_API_KEY')}))\n")
+        stub.chmod(0o755)
+        real_buffer = globals()["BUFFER"]
+        globals()["BUFFER"] = str(stub)
+        try:
+            ok, detail = post_to_linkedin(
+                "a report\nwith two lines",
+                {"BUFFER_API_KEY": "k", "BUFFER_LINKEDIN_CHANNEL": "chan"})
+        finally:
+            globals()["BUFFER"] = real_buffer
+        assert ok, detail
+        seen = json.loads(detail)
+        assert seen["key"] == "k", "the key reaches the child through its environment"
+        argv = seen["argv"]
+        assert argv[:3] == ["posts", "create", "--channel-id"], argv
+        assert "chan" in argv and "--mode" in argv, argv
+        assert argv[argv.index("--mode") + 1] == "shareNow", argv
+        assert "a report\nwith two lines" in argv, "the report is one argument"
+    finally:
+        shutil.rmtree(box, ignore_errors=True)
+
+    # die() raises SystemExit, which is not an Exception. wip_key() calls it.
+    def exits():
+        die("no wip.co token")
+    st = {"id": "e"}
+    out = publish_pending(st, "wip", (("wip.co", "wip", "posted_wip", exits),),
+                          lambda s: None)
+    assert st["posted_wip"] is False, st
+    assert any("SystemExit" in l for l in out), out
+
+    # Completion is judged against what was armed that morning, never against
+    # the config that exists when the button is finally pressed.
+    assert day_complete({"armed": ["x", "wip"], "posted_x": True, "posted_wip": True})
+    assert not day_complete({"armed": ["x", "wip", "linkedin"],
+                             "posted_x": True, "posted_wip": True})
+    assert day_complete({"armed": ["x", "wip", "linkedin"], "posted_x": True,
+                         "posted_wip": True, "posted_linkedin": True})
+    # A state written before LinkedIn existed has no armed list and must not
+    # wait for a post its keyboard never offered.
+    assert day_complete({"posted_x": True, "posted_wip": True})
+    # And a destination that was armed and then unconfigured is resolved, not
+    # pending: "skipped" is truthy, so the file can finally be deleted.
+    assert day_complete({"armed": ["x", "wip", "linkedin"], "posted_x": True,
+                         "posted_wip": True, "posted_linkedin": "skipped"})
 
     # --- The 2026-09-09 underscore, both halves of it ---------------------
     subject = "• Build config: dart_defines from production.env"
@@ -1622,9 +1842,21 @@ def main():
         # with a project name and a URL by then.
         lead = {}
         x_before = bool(state.get("posted_x"))
+        linkedin = linkedin_config()
+
+        # Rendered on first use, not up front: for_x fetches the wip.co project
+        # list and takes the rotation lock, and a wip.co-only press should do
+        # neither. Cached, so X and LinkedIn cannot receive different bytes if
+        # that fetch fails on a second call.
+        public = {}
+
+        def render_public():
+            if "text" not in public:
+                public["text"] = for_x(text, key, lead_out=lead)
+            return public["text"]
 
         def post_x():
-            ok, detail = post_to_x(text, key, lead_out=lead)
+            ok, detail = post_to_x(render_public())
             # Recorded here rather than after the loop. publish_pending saves
             # posted_x the moment X succeeds, so anything that raises later —
             # the state write, the next destination — would skip the record,
@@ -1637,18 +1869,56 @@ def main():
                 warn(f"could not record the lead rotation: {e}")
             return ok, detail
 
+        posters = [("X", "x", "posted_x", post_x),
+                   ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))]
+        # Armed that morning, not configured right now. If buffer.env went away
+        # in between, LinkedIn still belongs in this list — as a destination
+        # that fails and says why. Leaving it out instead made `all` post to X
+        # and wip.co and omit LinkedIn in silence, while the pending file waited
+        # for a post nobody was going to attempt.
+        # Armed that morning, never "configured right now": a press on a state
+        # whose keyboard never offered LinkedIn must be refused, not quietly
+        # served, for the same reason `both` does not reach a third destination.
+        armed_today = state.get("armed") or list(LEGACY_BOTH)
+        if "linkedin" in armed_today and linkedin:
+            posters.append(("LinkedIn", "linkedin", "posted_linkedin",
+                            lambda: post_to_linkedin(render_public(), linkedin)))
+
         lines = publish_pending(
-            state, target,
-            (("X", "x", "posted_x", post_x),
-             ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))),
+            state, target, tuple(posters),
             lambda s: path.write_text(json.dumps(s, ensure_ascii=False, indent=2)),
         )
 
+        # Armed this morning, unconfigured by the time the button was pressed.
+        # Waived rather than posted: no green tick for a post that never
+        # happened, and no "already posted, skipped" if the file comes back.
+        # Waiving rather than leaving it pending, because a destination that no
+        # longer exists cannot be waited for — the file would be re-read on
+        # every tick for ever and the button would stay dead on the message.
+        if "linkedin" in armed_today and not linkedin and \
+                (target in ("linkedin", "all")):
+            waived = state.setdefault("waived", [])
+            if "linkedin" not in waived:
+                waived.append("linkedin")
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+            lines.append(f"⚠️ LinkedIn — skipped: {BUFFER_ENV} no longer carries both "
+                         "keys, so it was not attempted")
+
+        # An empty result means the target matched nothing we can post to — a
+        # linkedin press with no buffer.env, or a target from a newer sender.
+        # sendMessage refuses empty text with a 400, and telegram() dies on it,
+        # after the offset was already advanced. Another lost press.
+        if not lines:
+            lines = [f"❌ nothing to publish for target {target!r}: "
+                     "that destination is not configured on this machine"]
+
         log(f"[{key}] " + " | ".join(lines))
 
-        # Only once nothing is left to retry. Everything below here can fail
-        # without costing anything, because the file already says what happened.
-        if state.get("posted_x") and state.get("posted_wip"):
+        # Complete when everything ARMED THAT MORNING has posted. Deciding it
+        # from the config that exists now would never complete a day whose
+        # message predates LinkedIn, and pending_states() would re-read that
+        # file on every tick for ever.
+        if day_complete(state):
             path.unlink(missing_ok=True)
 
         telegram(token, "sendMessage", chat_id=state["chat_id"],
