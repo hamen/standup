@@ -612,10 +612,19 @@ def strip_private(text):
     counting as body: a trailer glued to the last project must not keep that
     project alive once its bullets are gone.
 
-    The frame is identified BY POSITION, first and last non-empty line, not by
-    shape. Matching the trailer's shape anywhere made any body line that began
-    "3 projects ..." exempt from all four patterns, which is a hole rather than
-    an exemption.
+    The frame is the title and the closing count, and it takes BOTH position and
+    shape to be one. The title is the first non-empty line unless a header
+    starts the report. The trailer is the last non-empty line AND has to look
+    like the formatter's count.
+
+    Both halves are load-bearing, and each was wrong on its own once. Shape
+    alone made any body line beginning "3 projects ..." exempt from every
+    pattern — a hole, not an exemption. Position alone made the last bullet of a
+    count-less report into a trailer, which cost that project its header.
+
+    The distinction matters more since a frame line stopped counting as body: a
+    bullet wrongly classed as frame would earn its project no body at all, and
+    the project would be dropped as empty.
 
     Blocks are grouped under their header rather than judged one at a time,
     because standup.rb writes the project name, a blank line, and then the
@@ -1409,6 +1418,16 @@ def _selftest_body():
     assert (before, after) == (1, 0), (out, before, after)
     assert "#alpha" not in out, out
     assert "2 projects" in out, f"a frame line is not collateral: {out!r}"
+
+    # A report with no count line at all: the last bullet is the last non-empty
+    # line, and must NOT be taken for a trailer. It would earn its project no
+    # body and the project would be dropped as empty. Both report shapes.
+    for countless in ("\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok",
+                      "#alpha\n\n\u2022 Tests: ok",
+                      "#alpha\n\n\u2022 only one"):
+        out, before, after = strip_private(countless)
+        assert (before, after) == (1, 1), (countless, before, after)
+        assert "#alpha" in out and out.strip().endswith(countless.strip().split("\n")[-1]), out
 
     # A glued trailer that matches nothing stays, and so does its project.
     alive = "\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n2 projects"
