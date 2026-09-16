@@ -672,24 +672,34 @@ def strip_private(text):
         if group["kind"] == FRAME:
             # Filtered too. The exemption used to live here as well as in the
             # loop below, and changing only one left a glued trailer going out.
+            # Headers are still exempt on this path as well as the other: a
+            # title-less report whose first line is a header lands here.
             kept_lines = [line for _, line in group["rows"]
-                          if not (line.strip() and any(r.search(line) for r in PRIVATE_LINE))]
+                          if _is_header(line.strip())
+                          or not (line.strip() and any(r.search(line) for r in PRIVATE_LINE))]
             if any(line.strip() for line in kept_lines):
                 out.append("\n".join(kept_lines))
             continue
-        lines, body = [], 0
+        kept_rows, body = [], 0
         for i, line in group["rows"]:
             if _is_header(line.strip()):
-                lines.append(line)
+                kept_rows.append((i, line))
                 continue
             if line.strip() and any(r.search(line) for r in PRIVATE_LINE):
                 continue
-            lines.append(line)
+            kept_rows.append((i, line))
             # A frame line that survives is still not body. Counting a glued
             # trailer as body would leave a project header with nothing under
             # it but the count.
             body += bool(line.strip()) and i not in frame
+        lines = [line for _, line in kept_rows]
         if not body:
+            # The project is gone, but a frame line glued to it is not
+            # collateral: it is dropped only when it matches a pattern itself,
+            # and it already survived that test above.
+            survivors = [line for i, line in kept_rows if i in frame and line.strip()]
+            if survivors:
+                out.append("\n".join(survivors))
             continue
         after += group["kind"] == HEADED
         out.append("\n".join(lines).strip("\n"))
@@ -1384,12 +1394,49 @@ def _selftest_body():
     assert "\u2022 Tests: ok" in stripped(sep), stripped(sep)
     glued = "\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n3 projects \u2014 security hardening"
     assert "security hardening" not in stripped(glued), stripped(glued)
+    assert "\u2022 Tests: ok" in stripped(glued), "an empty result would pass the line above"
+
+    # A title-less report — its title was dropped — still trims for Telegram.
+    titleless = strip_private(
+        "\U0001F4CB Daily Standup \u2014 security review\n\n#alpha\n\u2022 Tests: ok")[0]
+    assert titleless.startswith("#alpha"), titleless
+    assert fit_telegram(titleless) == titleless, "a short title-less report must not be trimmed"
 
     # A kept trailer glued to a project must not keep that project alive once
-    # its own bullets are gone.
+    # its own bullets are gone — and must not be dragged down with it either.
     dead = "\U0001F4CB T\n\n#alpha\n\u2022 Fixed rubyzip CVE\n2 projects"
     out, before, after = strip_private(dead)
     assert (before, after) == (1, 0), (out, before, after)
+    assert "#alpha" not in out, out
+    assert "2 projects" in out, f"a frame line is not collateral: {out!r}"
+
+    # A glued trailer that matches nothing stays, and so does its project.
+    alive = "\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n2 projects"
+    out, before, after = strip_private(alive)
+    assert (before, after) == (1, 1), (out, before, after)
+    assert "#alpha" in out and "\u2022 Tests: ok" in out and out.endswith("2 projects"), out
+
+    # The 2026-09-16 shape end to end: three projects that did nothing but
+    # security work vanish, the others are untouched, and the count line goes
+    # because it describes the work that was removed. Survivors named, not
+    # counted — the count line was already unreliable before any of this.
+    incident = (
+        "\U0001F4CB *Daily Standup*\n\n"
+        "*#keeper*\n- Overhauled account handling and analytics\n\n"
+        "*#wallpapers*\n- Hardened CI gem check gate, fixed rubyzip CVE\n"
+        "- Hardened CI gate with Ruby requirement\n\n"
+        "*#second*\n- Analytics fixes for transition tracking\n\n"
+        "*#mygoo*\n- Fixed rubyzip CVE\n\n"
+        "*#phototoss*\n- Upgraded Rails with CVE fixes\n\n"
+        "5 projects \u2014 security hardening, CI improvements")
+    out, before, after = strip_private(incident)
+    assert (before, after) == (5, 2), (before, after)
+    for survivor in ("*#keeper*", "- Overhauled account handling and analytics",
+                     "*#second*", "- Analytics fixes for transition tracking"):
+        assert survivor in out, (survivor, out)
+    for gone in ("*#wallpapers*", "*#mygoo*", "*#phototoss*", "CVE", "Hardened",
+                 "security hardening"):
+        assert gone not in out, (gone, out)
 
     # A header carrying a matching word is exempt, or its bullets would orphan.
     hdr = "\U0001F4CB T\n\n#security\n\u2022 Tests: ok\n\n1 projects"
