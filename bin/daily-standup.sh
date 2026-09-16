@@ -152,7 +152,9 @@ if [ "${1:-}" = "--check" ]; then
   echo "claude:        $claude_at $([ -x "$claude_at" ] || echo '(MISSING — set CLAUDE_BIN)')"
   echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
   if linkedin_armed; then
-    buffer_at="${BUFFER_BIN:-$(PATH="$CRON_PATH" command -v buffer 2>/dev/null || echo buffer)}"
+    # The same fallback the publisher uses, or --check calls a binary missing
+    # that the publisher would have found.
+    buffer_at="${BUFFER_BIN:-$(PATH="$CRON_PATH" command -v buffer 2>/dev/null || echo "$HOME/.npm-global/bin/buffer")}"
     echo "LinkedIn:      armed $([ -x "$buffer_at" ] || echo "(but $buffer_at is MISSING — set BUFFER_BIN)")"
   else
     echo "LinkedIn:      not armed (${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env needs BUFFER_API_KEY and BUFFER_LINKEDIN_CHANNEL)"
