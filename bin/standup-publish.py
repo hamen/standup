@@ -910,7 +910,11 @@ def publish_pending(state, target, posters, save):
             # rather than leave a second public post to chance.
             ok, detail = False, ("timed out after 120s — it MAY have been "
                                  "published; check before pressing again")
-        except Exception as e:  # noqa: BLE001 - see below
+        # SystemExit too, and not by accident: wip_key() calls die() on a
+        # missing token, die() raises SystemExit, and SystemExit is not an
+        # Exception. Catching Exception alone would have left that one escaping
+        # exactly the way this guard exists to stop.
+        except (Exception, SystemExit) as e:  # noqa: BLE001 - see below
             # bird runs with timeout=120 and nothing caught it, and the
             # getUpdates offset was advanced before this loop began. A raise
             # here used to lose the press and the whole day.
@@ -1083,6 +1087,30 @@ def _selftest_body():
     assert len(served("all", three)) == 3
     assert [l.split(" — ")[0] for l in served("both", three)] == ["✅ X", "✅ wip.co"]
     assert served("linkedin", (("X", "x"), ("wip.co", "wip"))) == []
+
+    # A destination armed that morning but no longer configured is still in the
+    # poster list, as one that fails and says why. Left out, `all` would post to
+    # the others and omit it in silence, while the pending file waited for a
+    # post nobody was going to attempt.
+    st = {"id": "g", "armed": ["x", "wip", "linkedin"]}
+    gone = publish_pending(
+        st, "all",
+        (("X", "x", "posted_x", lambda: (True, "ok")),
+         ("wip.co", "wip", "posted_wip", lambda: (True, "ok")),
+         ("LinkedIn", "linkedin", "posted_linkedin",
+          lambda: (False, "not configured any more"))),
+        lambda s: None)
+    assert len(gone) == 3 and st["posted_linkedin"] is False, (gone, st)
+    assert any("not configured any more" in l for l in gone), gone
+
+    # die() raises SystemExit, which is not an Exception. wip_key() calls it.
+    def exits():
+        die("no wip.co token")
+    st = {"id": "e"}
+    out = publish_pending(st, "wip", (("wip.co", "wip", "posted_wip", exits),),
+                          lambda s: None)
+    assert st["posted_wip"] is False, st
+    assert any("SystemExit" in l for l in out), out
 
     # Completion is judged against what was armed that morning, never against
     # the config that exists when the button is finally pressed.
@@ -1787,9 +1815,18 @@ def main():
 
         posters = [("X", "x", "posted_x", post_x),
                    ("wip.co", "wip", "posted_wip", lambda: post_to_wip(text))]
-        if linkedin:
-            posters.append(("LinkedIn", "linkedin", "posted_linkedin",
-                            lambda: post_to_linkedin(render_public(), linkedin)))
+        # Armed that morning, not configured right now. If buffer.env went away
+        # in between, LinkedIn still belongs in this list — as a destination
+        # that fails and says why. Leaving it out instead made `all` post to X
+        # and wip.co and omit LinkedIn in silence, while the pending file waited
+        # for a post nobody was going to attempt.
+        if "linkedin" in (state.get("armed") or []) or linkedin:
+            if linkedin:
+                poster = lambda: post_to_linkedin(render_public(), linkedin)
+            else:
+                poster = lambda: (False, f"not configured any more: {BUFFER_ENV} "
+                                         "no longer has both keys")
+            posters.append(("LinkedIn", "linkedin", "posted_linkedin", poster))
 
         lines = publish_pending(
             state, target, tuple(posters),

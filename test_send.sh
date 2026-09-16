@@ -263,6 +263,13 @@ out=$(run "$TMP/half-buffer.log")
 call "$TMP/half-buffer.log" 1 | grep -q 'LinkedIn' &&
   failures+=("a buffer.env missing the channel id still armed LinkedIn")
 
+# An empty value in quotes is empty once the quotes come off, which is what the
+# publisher does. The keyboard must not claim otherwise.
+printf 'BUFFER_API_KEY="k"\nBUFFER_LINKEDIN_CHANNEL=""\n' > "$BUF"
+out=$(run "$TMP/quoted-empty.log")
+call "$TMP/quoted-empty.log" 1 | grep -q 'LinkedIn' &&
+  failures+=("an empty quoted value armed LinkedIn; the publisher would disagree")
+
 printf 'BUFFER_API_KEY=k\nBUFFER_LINKEDIN_CHANNEL=c\n' > "$BUF"
 out=$(run "$TMP/full-buffer.log")
 kb=$(call "$TMP/full-buffer.log" 1 | grep -o 'inline_keyboard.*')

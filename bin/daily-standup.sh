@@ -132,14 +132,11 @@ if [ "${1:-}" = "--check" ]; then
   bird_at="${BIRD_BIN:-$(PATH="$CRON_PATH" command -v bird 2>/dev/null || echo "$HOME/.npm-global/bin/bird")}"
   echo "claude:        $claude_at $([ -x "$claude_at" ] || echo '(MISSING — set CLAUDE_BIN)')"
   echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
-  buffer_env="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env"
-  if [ -f "$buffer_env" ] \
-    && grep -qE '^[[:space:]]*(export[[:space:]]+)?BUFFER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' "$buffer_env" \
-    && grep -qE '^[[:space:]]*(export[[:space:]]+)?BUFFER_LINKEDIN_CHANNEL[[:space:]]*=[[:space:]]*[^[:space:]]' "$buffer_env"; then
+  if linkedin_armed; then
     buffer_at="${BUFFER_BIN:-$(PATH="$CRON_PATH" command -v buffer 2>/dev/null || echo buffer)}"
     echo "LinkedIn:      armed $([ -x "$buffer_at" ] || echo "(but $buffer_at is MISSING — set BUFFER_BIN)")"
   else
-    echo "LinkedIn:      not armed ($buffer_env needs BUFFER_API_KEY and BUFFER_LINKEDIN_CHANNEL)"
+    echo "LinkedIn:      not armed (${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env needs BUFFER_API_KEY and BUFFER_LINKEDIN_CHANNEL)"
   fi
   echo "publisher:     $SCRIPT_DIR/standup-publish.py $([ -f "$SCRIPT_DIR/standup-publish.py" ] || echo '(MISSING)')"
   echo "state dir:     ${STANDUP_STATE_DIR:-$HOME/.local/state/standup}"
@@ -222,6 +219,25 @@ telegram_plain() {
   else
     printf '%s' "$1"
   fi
+}
+
+# LinkedIn is armed only when buffer.env carries BOTH keys with a real value.
+# A half-configured destination is worse than an absent one: it offers a button
+# that fails hours later. One function, because the keyboard and --check have to
+# agree with each other and with the publisher — and the publisher strips quotes
+# before deciding, so BUFFER_API_KEY="" is empty there and must be empty here.
+linkedin_armed() {
+  local env_file="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env" key value
+  [ -f "$env_file" ] || return 1
+  for key in BUFFER_API_KEY BUFFER_LINKEDIN_CHANNEL; do
+    value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" \
+            "$env_file" | head -1)
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [ -n "$value" ] || return 1
+  done
+  return 0
 }
 
 send_telegram() {
@@ -455,11 +471,8 @@ PENDING_ID="$TODAY"
 # offers a button that fails hours later. The publisher applies the same rule,
 # so the keyboard and the publish path cannot disagree.
 ARMED='["x","wip"]'
-BUFFER_ENV="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env"
 LINKEDIN_ARMED=0
-if [ -f "$BUFFER_ENV" ] \
-  && grep -qE '^[[:space:]]*(export[[:space:]]+)?BUFFER_API_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' "$BUFFER_ENV" \
-  && grep -qE '^[[:space:]]*(export[[:space:]]+)?BUFFER_LINKEDIN_CHANNEL[[:space:]]*=[[:space:]]*[^[:space:]]' "$BUFFER_ENV"; then
+if linkedin_armed; then
   LINKEDIN_ARMED=1
   ARMED='["x","wip","linkedin"]'
 fi
