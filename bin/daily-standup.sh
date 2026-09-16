@@ -36,6 +36,25 @@ REPO_DIR="$(dirname "$SCRIPT_DIR")"
 # the widened PATH would report a binary that the poller cannot see.
 CRON_PATH="$PATH"
 
+# LinkedIn is armed only when buffer.env carries BOTH keys with a real value.
+# A half-configured destination is worse than an absent one: it offers a button
+# that fails hours later. One function, because the keyboard and --check have to
+# agree with each other and with the publisher — and the publisher strips quotes
+# before deciding, so BUFFER_API_KEY="" is empty there and must be empty here.
+linkedin_armed() {
+  local env_file="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env" key value
+  [ -f "$env_file" ] || return 1
+  for key in BUFFER_API_KEY BUFFER_LINKEDIN_CHANNEL; do
+    value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" \
+            "$env_file" | head -1)
+    value="${value%"${value##*[![:space:]]}"}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    [ -n "$value" ] || return 1
+  done
+  return 0
+}
+
 # ---- Source shell profile (cron runs with minimal env) ----
 #
 # The profile is sourced for PATH, which cron does not give us. It is also a
@@ -219,25 +238,6 @@ telegram_plain() {
   else
     printf '%s' "$1"
   fi
-}
-
-# LinkedIn is armed only when buffer.env carries BOTH keys with a real value.
-# A half-configured destination is worse than an absent one: it offers a button
-# that fails hours later. One function, because the keyboard and --check have to
-# agree with each other and with the publisher — and the publisher strips quotes
-# before deciding, so BUFFER_API_KEY="" is empty there and must be empty here.
-linkedin_armed() {
-  local env_file="${STANDUP_CONFIG_DIR:-$HOME/.config/standup}/buffer.env" key value
-  [ -f "$env_file" ] || return 1
-  for key in BUFFER_API_KEY BUFFER_LINKEDIN_CHANNEL; do
-    value=$(sed -nE "s/^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=[[:space:]]*//p" \
-            "$env_file" | head -1)
-    value="${value%"${value##*[![:space:]]}"}"
-    value="${value%\"}"; value="${value#\"}"
-    value="${value%\'}"; value="${value#\'}"
-    [ -n "$value" ] || return 1
-  done
-  return 0
 }
 
 send_telegram() {

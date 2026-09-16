@@ -890,12 +890,19 @@ DESTINATION_FLAG = {"x": "posted_x", "wip": "posted_wip", "linkedin": "posted_li
 def day_complete(state):
     """Every destination armed THAT MORNING has been resolved.
 
-    Judged against the armed list rather than the config that exists now: a day
-    whose keyboard never offered LinkedIn must not wait for a LinkedIn post, and
-    one whose LinkedIn was later unconfigured must not wait for ever either.
+    Resolved means posted, or waived. Judged against the armed list rather than
+    the config that exists now: a day whose keyboard never offered LinkedIn must
+    not wait for a LinkedIn post, and one whose LinkedIn was unconfigured before
+    the button was pressed must not wait for ever either.
+
+    A waiver is deliberately not a success. Recording one as posted would show a
+    green tick for a post that never happened, and would let a retry be skipped
+    as "already posted" if the configuration came back.
     """
     armed = state.get("armed") or list(LEGACY_BOTH)
-    return all(state.get(DESTINATION_FLAG[a]) for a in armed if a in DESTINATION_FLAG)
+    waived = state.get("waived") or []
+    return all(state.get(DESTINATION_FLAG[a]) or a in waived
+               for a in armed if a in DESTINATION_FLAG)
 
 
 def publish_pending(state, target, posters, save):
@@ -1114,19 +1121,14 @@ def _selftest_body():
     # poster list, as one that fails and says why. Left out, `all` would post to
     # the others and omit it in silence, while the pending file waited for a
     # post nobody was going to attempt.
-    st = {"id": "g", "armed": ["x", "wip", "linkedin"]}
-    def disarmed():
-        st["posted_linkedin"] = "skipped"
-        return True, "skipped — not configured any more"
-    gone = publish_pending(
-        st, "all",
-        (("X", "x", "posted_x", lambda: (True, "ok")),
-         ("wip.co", "wip", "posted_wip", lambda: (True, "ok")),
-         ("LinkedIn", "linkedin", "posted_linkedin", disarmed)),
-        lambda s: None)
-    assert len(gone) == 3, gone
-    assert any("not configured any more" in l for l in gone), gone
-    assert day_complete(st), f"a disarmed destination must not stall the day: {st}"
+    # A waiver is not a success: no flag is set, so no green tick and no
+    # "already posted, skipped" if the configuration comes back.
+    st = {"id": "g", "armed": ["x", "wip", "linkedin"],
+          "posted_x": True, "posted_wip": True}
+    assert not day_complete(st), "an armed destination cannot just be ignored"
+    st["waived"] = ["linkedin"]
+    assert day_complete(st), f"a waived destination must not stall the day: {st}"
+    assert "posted_linkedin" not in st, "a waiver must not look like a post"
 
     # The argv the CLI actually receives: a list, never a shell string, with
     # shareNow and the report as one argument however many spaces it has.
@@ -1874,24 +1876,33 @@ def main():
         # that fails and says why. Leaving it out instead made `all` post to X
         # and wip.co and omit LinkedIn in silence, while the pending file waited
         # for a post nobody was going to attempt.
-        if "linkedin" in (state.get("armed") or []) or linkedin:
-            if linkedin:
-                poster = lambda: post_to_linkedin(render_public(), linkedin)
-            else:
-                # "skipped" rather than False: truthy, so the day can complete.
-                # A destination that no longer exists is resolved, not pending —
-                # otherwise the file is re-read on every tick for ever and the
-                # button stays dead on the message.
-                def poster():
-                    state["posted_linkedin"] = "skipped"
-                    return True, (f"skipped — {BUFFER_ENV} no longer has both keys, "
-                                  "so this destination is not configured any more")
-            posters.append(("LinkedIn", "linkedin", "posted_linkedin", poster))
+        # Armed that morning, never "configured right now": a press on a state
+        # whose keyboard never offered LinkedIn must be refused, not quietly
+        # served, for the same reason `both` does not reach a third destination.
+        armed_today = state.get("armed") or list(LEGACY_BOTH)
+        if "linkedin" in armed_today and linkedin:
+            posters.append(("LinkedIn", "linkedin", "posted_linkedin",
+                            lambda: post_to_linkedin(render_public(), linkedin)))
 
         lines = publish_pending(
             state, target, tuple(posters),
             lambda s: path.write_text(json.dumps(s, ensure_ascii=False, indent=2)),
         )
+
+        # Armed this morning, unconfigured by the time the button was pressed.
+        # Waived rather than posted: no green tick for a post that never
+        # happened, and no "already posted, skipped" if the file comes back.
+        # Waiving rather than leaving it pending, because a destination that no
+        # longer exists cannot be waited for — the file would be re-read on
+        # every tick for ever and the button would stay dead on the message.
+        if "linkedin" in armed_today and not linkedin and \
+                (target in ("linkedin", "all")):
+            waived = state.setdefault("waived", [])
+            if "linkedin" not in waived:
+                waived.append("linkedin")
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+            lines.append(f"⚠️ LinkedIn — skipped: {BUFFER_ENV} no longer carries both "
+                         "keys, so it was not attempted")
 
         # An empty result means the target matched nothing we can post to — a
         # linkedin press with no buffer.env, or a target from a newer sender.

@@ -286,6 +286,22 @@ echo "$state" | grep -q '"posted_linkedin": false' ||
   failures+=("the pending state has no posted_linkedin flag")
 rm -f "$BUF" "$TMP/fakehome/.local/state/standup/pending-"*.json
 
+# --- 4b-iv. --check answers the question the README sends people to it for --
+# The function it calls used to be defined below the --check block, which exits
+# first, so bash never reached the definition and --check always said "not
+# armed" — on every machine, armed or not. test_send.sh passed throughout,
+# because the send path runs after the definition.
+printf 'BUFFER_API_KEY=k\nBUFFER_LINKEDIN_CHANNEL=c\n' > "$BUF"
+out=$(run "$TMP/check-armed.log" --check)
+echo "$out" | grep -q 'command not found' &&
+  failures+=("--check called a function that was not defined yet")
+echo "$out" | grep -qE 'LinkedIn: +armed' ||
+  failures+=("--check did not report LinkedIn as armed with a complete buffer.env")
+rm -f "$BUF"
+out=$(run "$TMP/check-bare.log" --check)
+echo "$out" | grep -qE 'LinkedIn: +not armed' ||
+  failures+=("--check did not report LinkedIn as unarmed without buffer.env")
+
 # --- 4c. A report that is nothing but security lines ------------------------
 # Not a rest day, and not a title with a trailer and no content: both of those
 # would be a lie about what happened. Say so, send no report, arm no button.
