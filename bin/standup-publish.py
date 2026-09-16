@@ -1410,6 +1410,18 @@ def _selftest_body():
         "\U0001F4CB Daily Standup \u2014 security review\n\n#alpha\n\u2022 Tests: ok")[0]
     assert titleless.startswith("#alpha"), titleless
     assert fit_telegram(titleless) == titleless, "a short title-less report must not be trimmed"
+    assert to_markdown_v2(titleless), "a title-less report still composes"
+
+    # And one that does not fit. The by-line path used to assume a report always
+    # had a title, so "nothing kept yet" meant "still on the first block". A
+    # dropped title breaks that, and the first block is now a project header.
+    fat = ("\U0001F4CB Daily Standup \u2014 security review\n\n#alpha\n"
+           + "\n".join(f"\u2022 a commit subject, number {n}." for n in range(400)))
+    trimmed = fit_telegram(strip_private(fat)[0])
+    assert tg_len(trimmed) <= TELEGRAM_LIMIT, tg_len(trimmed)
+    assert trimmed.startswith("#alpha"), trimmed[:60]
+    assert "security review" not in trimmed, "the title was dropped before trimming"
+    assert "\u2022 a commit subject, number 0." in trimmed, "it must keep what it can"
 
     # A kept trailer glued to a project must not keep that project alive once
     # its own bullets are gone — and must not be dragged down with it either.
