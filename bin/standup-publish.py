@@ -918,8 +918,8 @@ def shuffle_projects(text, seed, lead_out=None):
 
     Nothing here may raise. This runs inside post_to_x, which catches nothing,
     and the update offset is already advanced by the time it does — so an
-    exception would lose the press and the day. Any failure falls back to the
-    plain seeded shuffle.
+    exception would lose the press and the day. Any failure keeps the original
+    text, in its original order.
     """
     try:
         head, body, tail = split_share_frame(text)

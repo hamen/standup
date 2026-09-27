@@ -538,8 +538,10 @@ echo "$first" | grep -q 'Daily Standup' &&
 echo "$first" | grep -q 'text=\*\\#alpha\*' ||
   failures+=("share_header #alpha did not replace the LLM title: $first")
 
-# 12c. Formatter started with *#alpha* (project) — still prepend config header.
-# Raw must match so repair keeps the formatted body.
+# 12c. Formatter started with a project line — still prepend config header.
+# The header differs from the project, or a match on the project alone would
+# pass with no header at all.
+printf 'projects_root: %s\nshare_header: "#gamma"\n' "$TMP/projects" > "$WORK/standup.yml"
 cat > "$TMP/stub/ruby" <<SH
 #!/usr/bin/env bash
 case " \$* " in
@@ -555,9 +557,61 @@ SH
 chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
 out=$(run "$TMP/share-hash-project.log")
 first=$(call "$TMP/share-hash-project.log" 1)
-# First text= line must start with the config header.
-echo "$first" | grep -q 'text=\*\\#alpha\*' ||
-  failures+=("share_header #alpha missing when body already started with *#alpha*: $first")
+echo "$first" | grep -q 'text=\*\\#gamma\*' ||
+  failures+=("share_header #gamma missing when body already started with *#alpha*: $first")
+echo "$first" | grep -qx '\*\\#alpha\*' ||
+  failures+=("project #alpha lost under share_header #gamma: $first")
+
+# 12d. A failed --drop-title keeps the filtered report instead of sending
+# only the header under live buttons.
+REAL_PYTHON="$(command -v python3)"
+cat > "$TMP/stub/python3" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" --drop-title "*) exit 1 ;;
+esac
+exec "$REAL_PYTHON" "\$@"
+SH
+chmod +x "$TMP/stub/python3"
+out=$(run "$TMP/drop-fail.log")
+rm -f "$TMP/stub/python3"
+first=$(call "$TMP/drop-fail.log" 1)
+echo "$first" | grep -qx '\*\\#alpha\*' ||
+  failures+=("a failed --drop-title emptied the report: $first")
+echo "$first" | grep -q '• one' ||
+  failures+=("a failed --drop-title lost the bullet: $first")
+echo "$out" | grep -q -- '--drop-title failed' ||
+  failures+=("a failed --drop-title was not logged: $out")
+
+# 12e. No share_header: the default title, with {date} filled in, leads.
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+today_esc=$(date '+%Y-%m-%d' | sed 's/-/\\-/g')
+out=$(run "$TMP/share-default.log")
+call "$TMP/share-default.log" 1 | grep -qxF "text=*📋 Daily Standup — ${today_esc}*" ||
+  failures+=("default share_header did not lead Telegram: $(call "$TMP/share-default.log" 1)")
+
+# 12f. An empty share_header means the default, not a blank title.
+printf 'projects_root: %s\nshare_header: ""\n' "$TMP/projects" > "$WORK/standup.yml"
+out=$(run "$TMP/share-empty.log")
+call "$TMP/share-empty.log" 1 | grep -qxF "text=*📋 Daily Standup — ${today_esc}*" ||
+  failures+=("empty share_header did not fall back to the default: $(call "$TMP/share-empty.log" 1)")
+
+# 12g. share_footer closes the Telegram text and the text X and wip.co get.
+printf 'projects_root: %s\nshare_footer: "#buildinpublic"\n' "$TMP/projects" > "$WORK/standup.yml"
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+out=$(run "$TMP/share-footer.log")
+tg_text=$(call "$TMP/share-footer.log" 1 | awk '/^text=/{on=1} /^--data-urlencode$/{if(on) exit} on')
+# A lone hashtag line is rendered bold like a project header; position is what counts.
+printf '%s\n' "$tg_text" | tail -n 1 | grep -qxE '\*?\\#buildinpublic\*?' ||
+  failures+=("share_footer is not the last Telegram line: $tg_text")
+[ -z "$(printf '%s\n' "$tg_text" | tail -n 2 | head -n 1)" ] ||
+  failures+=("share_footer is not preceded by a blank line: $tg_text")
+python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+text = json.load(open(sys.argv[1], encoding="utf-8"))["text"]
+assert text.endswith("\n\n#buildinpublic"), repr(text[-60:])
+PYEOF
+  failures+=("the pending state text does not end with share_footer")
 
 # Restore default yml and ruby stub for clarity.
 printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"

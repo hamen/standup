@@ -334,7 +334,8 @@ path, date = ARGV[0], ARGV[1]
 raw = File.read(path)
 cfg = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
 cfg = {} unless cfg.is_a?(Hash)
-header = (cfg["share_header"] || "📋 Daily Standup — {date}").to_s
+header = cfg["share_header"].to_s.strip
+header = "📋 Daily Standup — {date}" if header.empty?
 footer = (cfg["share_footer"] || "").to_s.strip
 header = header.gsub("{date}", date)
 puts "SHARE_HEADER=#{Shellwords.escape(header)}"
@@ -471,7 +472,13 @@ esac
 # (if the first line is not a project hashtag), then prepend SHARE_HEADER.
 # Same placement as the footer — after strip-private, so a share_header that is
 # itself a lone #hashtag is never mistaken for an empty project and dropped.
-ANALYSIS=$(printf '%s' "$ANALYSIS" | python3 "$SCRIPT_DIR/standup-publish.py" --drop-title) || ANALYSIS=""
+# A failure here keeps the already-filtered text: two titles beat a message
+# holding only the header under live publish buttons.
+if DROPPED=$(printf '%s' "$ANALYSIS" | python3 "$SCRIPT_DIR/standup-publish.py" --drop-title); then
+  ANALYSIS="$DROPPED"
+else
+  echo "  --drop-title failed; keeping the report as it is"
+fi
 ANALYSIS="${SHARE_HEADER}
 
 ${ANALYSIS}"

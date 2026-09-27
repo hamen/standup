@@ -193,9 +193,11 @@ repository name is a small thing to leak and an awkward one to take back.
 ### Framing the shared post
 
 `share_header` and `share_footer` frame the message on every destination. On X,
-only project hashtags in the *body* are rewritten as `Name — website`; the
-title and the footer stay as written, so social hashtags belong in
-`share_footer` rather than among the project lines.
+only project header lines are rewritten as `Name — website`; hashtags inside
+bullets, the title and the footer stay as written, so social hashtags belong in
+`share_footer` rather than among the project lines. A footer hashtag also goes
+to wip.co, where it attaches the todo to a project with that hashtag if you
+have one.
 
 ### The publisher in `bin/`
 
