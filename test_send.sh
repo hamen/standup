@@ -107,6 +107,7 @@ run() { # run <log> <args...>
       ${FORMATTER_BIN+FORMATTER_BIN=$FORMATTER_BIN} \
       ${FORMATTER_MODEL+FORMATTER_MODEL=$FORMATTER_MODEL} \
       ${AGENT_LOG+AGENT_LOG=$AGENT_LOG} \
+      ${CLAUDE_CALLED+CLAUDE_CALLED=$CLAUDE_CALLED} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -728,7 +729,8 @@ printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
 cat > "$TMP/stub/claude" <<'SH'
 #!/usr/bin/env bash
 cat > /dev/null
-printf 'partial-should-not-publish\n'
+# Shaped so --repair-headers accepts it: only the exit-code check can stop it.
+printf '*#alpha*\n• partial-should-not-publish\n'
 exit 1
 SH
 chmod +x "$TMP/stub/claude"
@@ -736,7 +738,8 @@ rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
 out=$(run "$TMP/fmt-rc.log")
 echo "$out" | grep -q 'formatter exited 1' ||
   failures+=("non-zero formatter exit was not logged: $out")
-call "$TMP/fmt-rc.log" 1 | grep -q 'partial-should-not-publish' &&
+# MarkdownV2 escapes the dashes, so match the escaped form Telegram receives.
+call "$TMP/fmt-rc.log" 1 | grep -q 'partial\\-should\\-not\\-publish' &&
   failures+=("partial formatter stdout reached Telegram despite non-zero exit")
 call "$TMP/fmt-rc.log" 1 | grep -q 'dart_defines\|dart\\_defines' ||
   failures+=("raw fallback missing after formatter non-zero exit")
@@ -745,11 +748,16 @@ call "$TMP/fmt-rc.log" 1 | grep -q 'dart_defines\|dart\\_defines' ||
 cat > "$TMP/stub/claude" <<'SH'
 #!/usr/bin/env bash
 cat > /dev/null
+[ -n "${CLAUDE_CALLED:-}" ] && touch "$CLAUDE_CALLED"
 printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
 SH
 chmod +x "$TMP/stub/claude"
 : > "$TMP/agent.args"
-out=$(STANDUP_FORMATTER=foo AGENT_LOG="$TMP/agent.args" run "$TMP/unknown-fmt.log")
+rm -f "$TMP/claude.called"
+out=$(STANDUP_FORMATTER=foo AGENT_LOG="$TMP/agent.args" CLAUDE_CALLED="$TMP/claude.called" \
+      run "$TMP/unknown-fmt.log")
+[ -f "$TMP/claude.called" ] ||
+  failures+=("unknown formatter did not actually run claude")
 echo "$out" | grep -q "unknown formatter 'foo'; using claude" ||
   failures+=("unknown formatter did not warn and fall back to claude: $out")
 [ ! -s "$TMP/agent.args" ] ||

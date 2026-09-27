@@ -216,6 +216,7 @@ run_formatter() {
       # --trust in an empty temp dir: under cron, agent refuses without workspace
       # trust. Do not pass --trust on $HOME or the repo (too broad). --yolo /
       # --force would also clear the prompt but are far more permissive.
+      # agent reads the prompt only from argv (no stdin), so it shows in `ps`.
       local trust_dir
       trust_dir=$(mktemp -d 2>/dev/null) || trust_dir=""
       if [ -z "$trust_dir" ]; then
