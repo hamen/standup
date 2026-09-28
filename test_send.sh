@@ -820,6 +820,53 @@ echo "$out" | grep -q "using config:.*standup.yml" ||
 call "$TMP/empty-env.log" 1 | grep -q 'REPOCFG' ||
   failures+=("empty STANDUP_CONFIG= + repo-only did not use repo header")
 
+# --- 16. Plain-text repo_name_mapping titles ------------------------------
+# A mapping value like "My Food Mate - example.com" has no "#". The formatter
+# writes no title, so that plain name opens the report: it must be kept as a
+# project, not dropped as a title nor refused as "no project blocks".
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf 'My Food Mate - example.com\n• one\n\n#beta\n• two\n'
+SH
+
+# 16a. Report opens on the plain title.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*My Food Mate - example.com*\n• one\n\n*#beta*\n• two\n\n2 projects\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+set +e
+out=$(run "$TMP/plain-first.log")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || failures+=("plain mapping title as first project exited $rc: $out")
+first=$(call "$TMP/plain-first.log" 1)
+echo "$first" | grep -q 'Daily Standup' ||
+  failures+=("default share_header missing above a plain first project: $first")
+echo "$first" | grep -q 'My Food Mate' ||
+  failures+=("plain first project was dropped as a title: $first")
+echo "$first" | grep -q '\\#beta' ||
+  failures+=("#beta lost next to a plain mapping title: $first")
+
+# 16b. An invented title above the plain title goes; the project stays.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf 'Invented Title\n\n*My Food Mate - example.com*\n• one\n\n*#beta*\n• two\n\n2 projects\n'
+SH
+chmod +x "$TMP/stub/claude"
+out=$(run "$TMP/plain-invented.log")
+first=$(call "$TMP/plain-invented.log" 1)
+echo "$first" | grep -q 'Invented Title' &&
+  failures+=("invented title survived above a plain mapping title: $first")
+echo "$first" | grep -q 'My Food Mate' ||
+  failures+=("plain project lost with an invented title above it: $first")
+
 printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
 
 if [ ${#failures[@]} -eq 0 ]; then

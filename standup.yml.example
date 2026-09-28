@@ -1,12 +1,13 @@
 projects_root: ~/code
 
-# Optional: map repo directory names to display names (often hashtags)
-# Useful if you use project hashtags on communities like wip.co
-# Example: local repo "daily-journal" maps to "#dailyjournal" (same as your wip.co project name)
+# Optional: map repo directory names to display names.
+# A single wip.co hashtag (#myfoodmate) enables attach on wip and Name — URL on X.
+# A plain title is published as-is (no attach, no URL swap).
 repo_name_mapping:
   habit-tracker: "#habittracker"
   ebook-finder: "#ebookfinder"
   daily-journal: "#dailyjournal"
+  myfoodmate: "My Food Mate - myfoodmate.net"
 
 # Optional: repositories to keep out of the report.
 # Every repository under projects_root is reported unless it is named here, so

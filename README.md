@@ -166,10 +166,16 @@ exclude_repos:
 Renames a repository in the output. That is *all* it does — it never decides
 which repositories are scanned.
 
-For the Telegram → X / wip.co pipeline, each published value must be a single
-wip.co project hashtag on its own (e.g. `#myfoodmate`). A display title such as
-`My Food Mate - myfoodmate.net` is fine for local reading, but the publisher
-will refuse the report: it only recognises `#hashtag` project headers.
+Each value may be either:
+
+- a single wip.co project hashtag (e.g. `#myfoodmate`) — used as the project
+  header in the report; wip.co can attach a todo by that tag, and on X the
+  header may become `Name — website` when the site is known; or
+- a plain display title (e.g. `My Food Mate - myfoodmate.net`) — published
+  as-is on Telegram, X, and wip.co, with no automatic attach and no URL swap.
+
+Use a `#hashtag` when you want wip attach / X link cards; use plain text when
+you only want a readable project name.
 
 ### `exclude_repos`
 

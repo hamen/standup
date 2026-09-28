@@ -597,24 +597,34 @@ No commits $DATE_LABEL. Rest day? 🏖️"
   exit 0
 fi
 
+# repo_name_mapping may name a project in plain text ("My Food Mate - site"),
+# and the formatter is told not to write a title, so a plain name can be the
+# first line — exactly where a title would sit. The publisher tells them apart
+# by these: every line standup.rb printed directly above a "• " bullet.
+# RAW_STANDUP holds stderr too, so a warning line is never followed by one.
+STANDUP_PROJECT_TITLES=$(printf '%s\n' "$RAW_STANDUP" | awk '
+  /^• / { if (prev != "" && prev !~ /^• /) print prev }
+  { prev = $0 }' | sort -u)
+export STANDUP_PROJECT_TITLES
+
 # ---- Format with the configured LLM CLI ----
 echo "  Formatting with $STANDUP_FORMATTER ($FORMATTER_BIN)..."
 PROMPT="You are formatting a daily developer standup for Telegram.
 
 Date: $TODAY (this is $DATE_LABEL's activity)
 
-Here is the raw standup output (each section is a project hashtag, bullets are commits):
+Here is the raw standup output (each section starts with a project name — a hashtag or a plain title — and bullets are commits):
 
 $RAW_STANDUP
 
 Format this as a concise, scannable Telegram message:
-- Do not write a title line. Start directly with the first project hashtag.
-- Group by project hashtag (bold the hashtag)
+- Do not write a title line. Start directly with the first project name.
+- Group by project, keeping each project name exactly as written in the raw output, alone on its line (bold it)
 - Summarize related commits into one bullet where possible (don't repeat noise like 'chore: bump version')
 - Use plain language, not commit-speak
 - Add a brief one-line summary at the end with total project count
 - Keep it short — this is a standup, not a changelog
-- Bold ONLY the project hashtag on its own line, with single asterisks (*#project*), never double. Use no other markup anywhere — no italics, no inline bold, no code spans. Every other character is escaped before sending, so a stray marker is published literally to X and wip.co rather than rendered.
+- Bold ONLY the project name on its own line, with single asterisks (*#project* or *Project Name*), never double. Use no other markup anywhere — no italics, no inline bold, no code spans. Every other character is escaped before sending, so a stray marker is published literally to X and wip.co rather than rendered.
 - Output ONLY the formatted message, nothing else"
 
 ANALYSIS=$(run_formatter "$PROMPT") || ANALYSIS=""
@@ -695,7 +705,7 @@ Il filtro delle righe di sicurezza non ha funzionato. Non ho inviato niente, per
 esac
 
 # Configured title is the only source: drop whatever title the formatter wrote
-# (if the first line is not a project hashtag), then prepend SHARE_HEADER.
+# (if the first line is not a project header), then prepend SHARE_HEADER.
 # Same placement as the footer — after strip-private, so a share_header that is
 # itself a lone #hashtag is never mistaken for an empty project and dropped.
 # A failure here keeps the already-filtered text: two titles beat a message
