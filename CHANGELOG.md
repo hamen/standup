@@ -14,6 +14,18 @@ All notable changes to this project are recorded here. The format follows
   preferring home. An empty `STANDUP_CONFIG=` is treated like unset. Successful
   runs still log `using config: …`.
 
+### Added
+
+- **`repo_name_mapping` values may be plain titles.** A value such as
+  `"My Food Mate - myfoodmate.net"` is now a project header, not only a
+  `#hashtag`. `daily-standup.sh` exports the headers `standup.rb` printed as
+  `STANDUP_PROJECT_TITLES`, so a plain title opening a title-less report is
+  kept as a project instead of being dropped as a title or refused with "no
+  project blocks". Prose the formatter writes in place of a report is still
+  refused. Plain titles are published as written: no wip.co attach and no
+  `Name — URL` swap on X. A missing wip.co token no longer turns the X preview
+  into an `ERROR:` line.
+
 ### Fixed
 
 - **The standup could be sent and then leave a button that did nothing.** The

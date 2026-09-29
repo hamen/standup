@@ -126,7 +126,10 @@ def linkedin_config():
 
 def wip_key():
     if not WIP_TOKEN_FILE.exists():
-        die(f"{WIP_TOKEN_FILE} is missing")
+        # FileNotFoundError, not die(): for_x / --preview must keep the report
+        # text on stdout. die() prints ERROR there and exits with SystemExit,
+        # which used to become the Telegram "Su X esce così" reply.
+        raise FileNotFoundError(f"{WIP_TOKEN_FILE} is missing")
     raw = WIP_TOKEN_FILE.read_text().strip()
     # The file has been seen holding WIP_TOKEN=<key> rather than the bare key,
     # which the API rejects exactly like a made-up one. Accept both shapes.
@@ -195,6 +198,58 @@ RAW_HEADER = re.compile(r"#([A-Za-z0-9][A-Za-z0-9_-]*)")
 # eaten the "#". Anything with a space in it is a title or a trailer, not a header.
 FMT_HEADER = re.compile(r"\*?#?([A-Za-z0-9][A-Za-z0-9_-]*)\*?")
 
+# The formatter's closing count, which is never anybody's commit.
+TRAILER_LINE = re.compile(r"(?i)\s*\d+\s+projects?\b.*")
+
+# Deliberately wider than SLOT_HEADER (defined later), which the rotation uses.
+# Miss a header here and strip_private / MarkdownV2 refuse or mis-render a
+# valid report. repo_name_mapping allows #hashtags and plain display titles.
+FILTER_HEADER = re.compile(r"\*?#([A-Za-z0-9][A-Za-z0-9_-]*)\*?")
+
+
+def _known_titles():
+    """Plain project headers standup.rb printed, from STANDUP_PROJECT_TITLES.
+
+    daily-standup.sh exports one per line. Read on every call rather than at
+    import, so --selftest can set it per case.
+    """
+    raw = os.environ.get("STANDUP_PROJECT_TITLES", "")
+    return {t.strip().strip("*").strip() for t in raw.split("\n") if t.strip()}
+
+
+def _is_header(line, *, first_content=False, loose=False):
+    """True when `line` opens a project block.
+
+    A lone #hashtag (optionally Telegram-bold with * or **) is always a header
+    — including when it is the first line of a title-less report. So is a line
+    naming one of the known plain titles (STANDUP_PROJECT_TITLES): the
+    formatter is told not to write a title, so a plain mapping title often
+    opens the report.
+
+    No other plain line is a header, unless `loose` and the list is unset: a
+    later process re-rendering an approved report only has its shape, and
+    there any plain line but the first (the title) is a header. Bullets and the
+    "N projects" trailer never are. The filters stay strict, or prose the
+    formatter wrote instead of a report would pass as a project.
+    """
+    s = line.strip()
+    # Formatter may wrap headers in * or **; strip edge stars for the # check.
+    core = s.strip("*").strip()
+    if FILTER_HEADER.fullmatch(s) or RAW_HEADER.fullmatch(core):
+        return True
+    known = _known_titles()
+    if known or not loose:
+        return bool(core) and core in known
+    if first_content:
+        return False
+    if not core or RAW_HEADER.fullmatch(core):
+        return False
+    if TRAILER_LINE.fullmatch(core) or TRAILER_LINE.fullmatch(s):
+        return False
+    if core.startswith("\u2022") or core.startswith("- "):
+        return False
+    return True
+
 
 # Every character MarkdownV2 gives a meaning to. All of them are escaped,
 # without asking whether this one looks like markup: guessing is what legacy
@@ -219,8 +274,9 @@ def to_markdown_v2(text):
     had in fact worked.
 
     So: escape everything as MarkdownV2, then add the two emphases that are ours
-    to add — the title, and each project header. A commit subject can then hold
-    any character it likes, because none of them are markup any more.
+    to add — the title, and each project header (#hashtag or plain mapping
+    title). A commit subject can then hold any character it likes, because none
+    of them are markup any more.
 
     The input must be unescaped text. This is not idempotent and cannot be: a
     report legitimately containing a backslash has to have it escaped, so
@@ -231,12 +287,13 @@ def to_markdown_v2(text):
     seen_content = False
     for line in text.split("\n"):
         stripped = line.strip()
-        # Title: first non-empty line unless a project starts the report.
-        # share_header need not begin with 📋.
-        is_title = bool(stripped) and not seen_content and not RAW_HEADER.fullmatch(stripped)
+        first = bool(stripped) and not seen_content
         if stripped:
             seen_content = True
-        header = RAW_HEADER.fullmatch(stripped) or is_title
+        # Title: first non-empty line that is not a #hashtag project header.
+        is_title = first and not _is_header(stripped, first_content=True)
+        is_project = bool(stripped) and _is_header(stripped, first_content=first, loose=True)
+        header = is_title or is_project
         out.append(f"*{escape_mdv2(stripped)}*" if header and stripped else escape_mdv2(line))
     return "\n".join(out)
 
@@ -346,24 +403,18 @@ def strip_telegram_markup(text):
     seen_content = False
     for line in text.splitlines():
         bare = line.strip()
-        # Asterisks are removed only where they can only be markup: the title,
-        # and a project header, both of which are re-emphasised downstream
-        # anyway. Everywhere else an asterisk is a character somebody committed
-        # — "*.rb", "2 * 3" — and deleting it is the same data loss as the
-        # underscore this function exists to stop deleting.
-        # Tested with the asterisks removed, so **#alpha** is recognised as the
-        # header it is. FMT_HEADER allows one asterisk a side, and a formatter
-        # that reaches for ** despite the prompt used to have its stars deleted
-        # by the old blanket replace; matching on the bare token restores that
-        # without deleting asterisks anywhere else.
-        #
-        # The title is the first non-empty line unless a project starts the
-        # report — share_header need not begin with 📋.
-        is_title = bool(bare) and not seen_content and not FMT_HEADER.fullmatch(
-            bare.replace("*", ""))
+        first = bool(bare) and not seen_content
         if bare:
             seen_content = True
-        if is_title or bare.startswith("📋") or FMT_HEADER.fullmatch(bare.replace("*", "")):
+        # Asterisks are removed only where they can only be markup: the title,
+        # and a project header (#hashtag or plain mapping title), both of which
+        # are re-emphasised downstream anyway. Everywhere else an asterisk is a
+        # character somebody committed — "*.rb", "2 * 3" — and deleting it is
+        # the same data loss as the underscore this function exists to stop
+        # deleting.
+        is_title = first and not _is_header(bare, first_content=True)
+        is_project = bool(bare) and _is_header(bare, first_content=first, loose=True)
+        if is_title or bare.startswith("📋") or is_project:
             line = line.replace("*", "")
         out.append(line)
     return "\n".join(out).strip()
@@ -610,8 +661,6 @@ def record_lead(date, project):
 # in \w* on purpose: "\bvulnerabilit\b" can never match "vulnerability", because
 # a word character follows the stem. The first draft of this list was written
 # that way and caught none of the four lines it was written for.
-# The formatter's closing count, which is never anybody's commit.
-TRAILER_LINE = re.compile(r"(?i)\s*\d+\s+projects?\b.*")
 PRIVATE_LINE = [re.compile(p) for p in (
     # The word, not the identifier, and the plural: "fixed rubyzip CVE" and
     # "3 CVEs fixed" are the disclosure — naming the library and the fact of it.
@@ -642,24 +691,13 @@ PRIVATE_LINE = [re.compile(p) for p in (
 )]
 
 
-# Deliberately wider than SLOT_HEADER, which the rotation uses. The rotation
-# must not hand the lead to a project the URL swap cannot resolve; the filter
-# has the opposite duty — miss a header here and a valid report is refused as
-# having no projects at all. repo_name_mapping allows uppercase, "_" and "-".
-FILTER_HEADER = re.compile(r"\*?#([A-Za-z0-9][A-Za-z0-9_-]*)\*?")
-
-
-def _is_header(line):
-    return bool(FILTER_HEADER.fullmatch(line.strip()))
-
-
 def drop_leading_title(text):
     """Remove a leading non-project line the formatter may have written as a title.
 
     The configured share_header is prepended by daily-standup.sh after this
     runs, so any title the LLM invented must go first. A report that already
-    starts with a project hashtag (#name / *#name*) is left alone (after
-    trimming leading blank lines).
+    starts with a project header — a hashtag (#name / *#name*) or a known plain
+    title — is left alone (after trimming leading blank lines).
     """
     if not text:
         return text
@@ -669,7 +707,7 @@ def drop_leading_title(text):
         i += 1
     if i >= len(lines):
         return ""
-    if _is_header(lines[i]):
+    if _is_header(lines[i], first_content=True):
         return "\n".join(lines[i:])
     # Drop the title line and any blank lines that followed it.
     i += 1
@@ -693,8 +731,9 @@ def strip_private(text):
 
     The frame is the title and the closing count, and it takes BOTH position and
     shape to be one. The title is the first non-empty line unless a header
-    starts the report. The trailer is the last non-empty line AND has to look
-    like the formatter's count.
+    starts the report — a hashtag, or a plain title named in
+    STANDUP_PROJECT_TITLES. The trailer is the last non-empty line AND has to
+    look like the formatter's count.
 
     Both halves are load-bearing, and each was wrong on its own once. Shape
     alone made any body line beginning "3 projects ..." exempt from every
@@ -716,18 +755,22 @@ def strip_private(text):
     raw = text.split("\n")
     filled = [i for i, line in enumerate(raw) if line.strip()]
     frame = set()
+    first_i = filled[0] if filled else None
     if filled:
-        # The title is whatever comes first, unless a project starts the report
-        # — which is the shape standup.rb's own output has.
-        if not _is_header(raw[filled[0]].strip()):
-            frame.add(filled[0])
+        # The title is whatever comes first, unless a #hashtag project starts
+        # the report — which is the shape standup.rb's own output has.
+        if not _is_header(raw[first_i], first_content=True):
+            frame.add(first_i)
         # The trailer has to be last AND look like the formatter's count. Last
         # alone is wrong: the raw report ends on a bullet, and exempting it
         # dropped that project's header. Shape alone is worse: it made every
         # body line beginning "3 projects ..." immune to all four patterns.
         last = filled[-1]
-        if not _is_header(raw[last].strip()) and TRAILER_LINE.fullmatch(raw[last]):
+        if not _is_header(raw[last]) and TRAILER_LINE.fullmatch(raw[last]):
             frame.add(last)
+
+    def header_at(i, line):
+        return _is_header(line, first_content=(i == first_i))
 
     # Split keeping the separators, so every line's absolute index falls out of
     # the arithmetic. Re-finding each line by value was fragile: two identical
@@ -744,7 +787,7 @@ def strip_private(text):
     FRAME, HEADED, LOOSE = "frame", "headed", "loose"
     groups = []
     for rows in numbered:
-        if rows and _is_header(rows[0][1].strip()):
+        if rows and header_at(rows[0][0], rows[0][1]):
             groups.append({"kind": HEADED, "rows": rows})
         elif all(i in frame or not line.strip() for i, line in rows):
             groups.append({"kind": FRAME, "rows": rows})
@@ -762,15 +805,15 @@ def strip_private(text):
             # loop below, and changing only one left a glued trailer going out.
             # Headers are still exempt on this path as well as the other: a
             # title-less report whose first line is a header lands here.
-            kept_lines = [line for _, line in group["rows"]
-                          if _is_header(line.strip())
+            kept_lines = [line for i, line in group["rows"]
+                          if header_at(i, line)
                           or not (line.strip() and any(r.search(line) for r in PRIVATE_LINE))]
             if any(line.strip() for line in kept_lines):
                 out.append("\n".join(kept_lines))
             continue
         kept_rows, body = [], 0
         for i, line in group["rows"]:
-            if _is_header(line.strip()):
+            if header_at(i, line):
                 kept_rows.append((i, line))
                 continue
             if line.strip() and any(r.search(line) for r in PRIVATE_LINE):
@@ -979,8 +1022,12 @@ def for_x(text, seed, lead_out=None):
         return text
     try:
         projects = wip_projects()
-    except Exception as e:  # noqa: BLE001 - never let this block a publish
-        log(f"could not read wip.co projects, keeping the hashtags: {e}")
+    # SystemExit too: wip_key() calls die() on a missing token, and SystemExit
+    # is not an Exception. Catching Exception alone let --preview print
+    # "ERROR: …/wip-token is missing" on stdout (die's log) and exit, so the
+    # shell captured that string as the X preview reply.
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - never let this block a publish
+        warn(f"could not read wip.co projects, keeping the hashtags: {e}")
         return _join_share_frame(head, body, tail)
 
     if body:
@@ -1136,10 +1183,25 @@ def selftest():
     real, tmp = STATE_DIR, tempfile.mkdtemp(prefix="standup-selftest-")
     STATE_DIR = pathlib.Path(tmp)
     try:
-        _selftest_body()
+        with _project_titles(None):
+            _selftest_body()
     finally:
         STATE_DIR = real
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _project_titles(value):
+    """Run with STANDUP_PROJECT_TITLES set to `value` (None: unset)."""
+    saved = os.environ.pop("STANDUP_PROJECT_TITLES", None)
+    if value is not None:
+        os.environ["STANDUP_PROJECT_TITLES"] = value
+    try:
+        yield
+    finally:
+        os.environ.pop("STANDUP_PROJECT_TITLES", None)
+        if saved is not None:
+            os.environ["STANDUP_PROJECT_TITLES"] = saved
 
 
 def _selftest_body():
@@ -1371,6 +1433,25 @@ def _selftest_body():
     assert drop_leading_title("📋 *Daily Standup*\n\n*#beta*\n• one") == "*#beta*\n• one"
     assert drop_leading_title("*#beta*\n• one") == "*#beta*\n• one"
     assert drop_leading_title("#beta\n• one") == "#beta\n• one"
+
+    # A plain mapping title opening a title-less report is a project, not a
+    # title, once standup.rb has named it. Unknown, it still reads as a title.
+    plain_first = "*My Food Mate - example.com*\n• one\n\n#beta\n• two\n\n2 projects"
+    with _project_titles(None):
+        assert drop_leading_title(plain_first).startswith("• one"), plain_first
+    with _project_titles("My Food Mate - example.com\n#beta"):
+        assert drop_leading_title(plain_first) == plain_first
+        assert drop_leading_title("Invented\n\n" + plain_first) == plain_first
+        kept, before, after = strip_private(plain_first)
+        assert kept.startswith("*My Food Mate - example.com*\n• one"), kept
+        assert "#beta" in kept and before == after == 2, (kept, before, after)
+        # The known title is a header, so a security line under it takes the
+        # project with it rather than being kept as the report's title.
+        only_private = "My Food Mate - example.com\n• fixed a CVE\n\n#beta\n• two"
+        dropped, before, after = strip_private(only_private)
+        assert "My Food Mate" not in dropped and "#beta" in dropped, dropped
+        assert (before, after) == (2, 1), (before, after)
+
     drop_cli = subprocess.run(
         [sys.executable, __file__, "--drop-title"],
         input="Wrong Title\n\n#beta\n• one", text=True, capture_output=True, check=True,
@@ -1708,8 +1789,40 @@ def _selftest_body():
         assert x_tt.startswith("#alpha"), x_tt
         assert "Alpha —" not in x_tt, x_tt
         assert "Beta — https://beta.example" in x_tt, x_tt
+
+        # Plain mapping titles stay as written on X (no Name — URL swap).
+        plain_x = (
+            "\U0001F4CB Daily Standup\n\n"
+            "My Food Mate - example.com\n\u2022 one\n\n"
+            "#alpha\n\u2022 two\n\n"
+            "2 projects"
+        )
+        x_plain = for_x(plain_x, "2026-09-28")
+        assert "My Food Mate - example.com" in x_plain, x_plain
+        assert "Alpha — https://alpha.example" in x_plain, x_plain
     finally:
         mod.wip_projects = real_wip
+
+    # Missing wip-token must not dump ERROR on stdout (--preview captures it).
+    _reset_rotation()
+    saved_token = WIP_TOKEN_FILE
+    missing = pathlib.Path("/nonexistent/standup-wip-token-for-selftest")
+    mod = sys.modules[__name__]
+    mod.WIP_TOKEN_FILE = missing
+    try:
+        buf = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            got = for_x(
+                "\U0001F4CB Daily Standup\n\n#alpha\n\u2022 one\n\n1 projects",
+                "2026-09-29",
+            )
+        assert "ERROR" not in buf.getvalue(), buf.getvalue()
+        assert buf.getvalue() == "", buf.getvalue()
+        assert "#alpha" in got and "\u2022 one" in got, got
+        assert "could not read wip.co" in err.getvalue(), err.getvalue()
+    finally:
+        mod.WIP_TOKEN_FILE = saved_token
 
     # Footer survives the shuffle in place (after the trailer).
     _reset_rotation()
@@ -1846,6 +1959,44 @@ def _selftest_body():
     for shape in ("#alpha", "#My-App", "#my_app", "*#Alpha*", "#3thingsaday"):
         one = f"\U0001F4CB T\n\n{shape}\n\u2022 Tests: ok\n\n1 projects"
         assert strip_private(one)[1:] == (1, 1), (shape, strip_private(one)[1:])
+
+    # Plain display titles (no #) count as project headers once standup.rb
+    # has named them — and not otherwise, or any prose would.
+    plain = (
+        "\U0001F4CB Daily Standup — 2026-09-24\n\n"
+        "My Food Mate - example.com\n\u2022 Ships the grocery list\n\n"
+        "1 projects"
+    )
+    with _project_titles(None):
+        assert strip_private(plain)[1:] == (0, 0), strip_private(plain)[1:]
+    with _project_titles("My Food Mate - example.com\nJust Five - justfive.example"):
+        pout, pbefore, pafter = strip_private(plain)
+        assert (pbefore, pafter) == (1, 1), (pbefore, pafter)
+        assert "My Food Mate - example.com" in pout, pout
+        assert "Ships the grocery list" in pout, pout
+        # Bolded plain title from the formatter.
+        plain_bold = (
+            "\U0001F4CB Daily Standup\n\n"
+            "*Just Five - justfive.example*\n\u2022 one\n\n"
+            "1 projects"
+        )
+        assert strip_private(plain_bold)[1:] == (1, 1), strip_private(plain_bold)[1:]
+        # The share_header alone is not a project.
+        assert strip_private("\U0001F4CB Daily Standup — alone\n\n1 projects")[1:] == (0, 0)
+
+    # Formatter *bold* on a plain title must not survive as literal asterisks
+    # on Telegram (strip then re-emphasise in MarkdownV2).
+    fmt_plain = (
+        "\U0001F4CB Daily Standup — 2026-09-24\n\n"
+        "*My Food Mate - myfoodmate.net*\n\u2022 Update ads\n\n"
+        "1 projects"
+    )
+    stripped_plain = strip_telegram_markup(fmt_plain)
+    assert "*My Food Mate" not in stripped_plain, stripped_plain
+    assert "My Food Mate - myfoodmate.net" in stripped_plain, stripped_plain
+    tg_plain = to_markdown_v2(stripped_plain)
+    assert tg_plain.splitlines()[2].startswith("*My Food Mate"), tg_plain
+    assert "\\*" not in tg_plain.splitlines()[2], tg_plain.splitlines()[2]
 
     # Qualified only: an unqualified injection or leak is an ordinary commit,
     # and dropping a project's only bullet would fake a quiet day.
