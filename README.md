@@ -216,9 +216,11 @@ to use the account default. Override with `FORMATTER_MODEL`.
 
 A hashtag in a [wip.co](https://wip.co) todo attaches it to that project, which
 is exactly the shape `repo_name_mapping` produces. Give every repository you
-publish an entry in the map: one without an entry prints its bare directory
-name, which attaches to nothing and puts a private-looking name in a public
-post.
+publish an entry in the map. One without an entry is printed under a hashtag
+made from its directory name — lowercase letters and digits only, so
+`app-promo-reel` becomes `#apppromoreel` — which attaches to a wip.co project
+only if one has that tag. The hyphen goes because X ends a hashtag at the first
+`-`, and `#app-promo-reel` would link `#app`.
 
 Keep private work out with `exclude_repos` before you publish anywhere. A
 repository name is a small thing to leak and an awkward one to take back.
@@ -250,8 +252,17 @@ reached X but not wip.co can be retried without tweeting it twice.
 
 The two texts differ on purpose. wip.co needs the project hashtags, because that
 is what attaches a todo to a project there; on X a row of those is just noise,
-so each project header is swapped for that project's name and website, read from
-wip.co at publish time. The title (`share_header`) and the footer
+so each project header is swapped for that project's name and a link, read from
+wip.co at publish time. The link is the first of:
+
+1. the wip.co project's website;
+2. the wip.co project's GitHub URL;
+3. for a tag with no wip.co project, the repository's own GitHub page, from its
+   `origin` remote — only when an anonymous visitor can open it. That is checked
+   once, when the morning message is built, and kept with it, so a private
+   repository never becomes a dead link and the preview matches the post.
+
+A header with none of them keeps its hashtag. The title (`share_header`) and the footer
 (`share_footer`) are left alone on every destination. The X form is sent to you
 as a reply, so you approve the text you will actually post.
 

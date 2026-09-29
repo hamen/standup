@@ -869,6 +869,45 @@ echo "$first" | grep -q 'My Food Mate' ||
 
 printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
 
+# --- 17. The GitHub links are cosmetic: a bad links file costs nothing ---------
+# standup.rb writes the links for X to --links-out; the morning run keeps the
+# public ones in the day's state. Whatever goes wrong there — a file that is not
+# JSON, an entry that is not a GitHub URL — the message still goes out, with its
+# buttons, and the state records no links rather than no state.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• one\n\n1 project\n'
+SH
+for links_body in 'this is not json' '{"alpha": {"name": "a", "url": "https://gitlab.com/o/a"}}'; do
+  cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = --links-out ]; then printf '%s' '$links_body' > "\$2"; fi
+  shift
+done
+printf '#alpha\n• one\n'
+SH
+  chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+  rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+  set +e
+  out=$(run "$TMP/links.log")
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || failures+=("a links file holding '$links_body' failed the run ($rc): $out")
+  call "$TMP/links.log" 1 | grep -q 'inline_keyboard' ||
+    failures+=("a links file holding '$links_body' cost the message its buttons")
+  python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state.get("links") == {}, state.get("links")
+PYEOF
+    failures+=("a links file holding '$links_body' did not become links: {} in the state")
+done
+
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else

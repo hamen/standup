@@ -8,6 +8,16 @@ All notable changes to this project are recorded here. The format follows
 
 ### Changed
 
+- **An unmapped repository is a clean hashtag, and X links its GitHub page.**
+  A repository with no `repo_name_mapping` entry used to be printed under its
+  bare directory name; the formatter added a `#`, and X, which ends a hashtag
+  at the first `-`, published `#app-promo-reel` as a link to `#app`. The header
+  is now `#` plus the name in lowercase letters and digits. On X, a project with
+  no website links its GitHub repository instead: wip.co's `github_url`, or for
+  a tag wip.co does not know, the repository's public GitHub page, recorded by
+  the new `standup.rb --links-out` and checked for anonymous access by
+  `standup-publish.py --public-links` when the morning message is built.
+
 - **Report config: one file, or set `STANDUP_CONFIG`.** When both
   `~/.standup.yml` and `<repo>/standup.yml` exist and `STANDUP_CONFIG` is
   unset, the morning publisher refuses to run (AMBIGUOUS) instead of silently

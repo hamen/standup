@@ -581,6 +581,15 @@ else
   DATE_LABEL="yesterday"
 fi
 
+# The GitHub page of each reported project, which X links when the project has
+# no website. Best-effort from end to end: no temporary file means no links,
+# never no standup.
+LINKS_FILE=$(mktemp 2>/dev/null) || LINKS_FILE=""
+trap 'if [ -n "${LINKS_FILE:-}" ]; then rm -f "$LINKS_FILE"; fi' EXIT
+if [ -n "$LINKS_FILE" ]; then
+  STANDUP_ARGS+=(--links-out "$LINKS_FILE")
+fi
+
 # ---- Run standup ----
 echo "[$TODAY] Running daily standup ($DATE_LABEL)..."
 RAW_STANDUP=$(ruby "$STANDUP_BIN" "${STANDUP_ARGS[@]}" 2>&1) || {
@@ -595,6 +604,17 @@ if [ -z "$RAW_STANDUP" ] || echo "$RAW_STANDUP" | grep -q "^No activity found"; 
 No commits $DATE_LABEL. Rest day? 🏖️"
   echo "[$TODAY] No activity — message sent."
   exit 0
+fi
+
+# Only the links an anonymous visitor can open: a private repository is a dead
+# link on a public timeline. Checked once, here, and stored with the day's
+# state, so the X preview below and the post at the press agree. Any failure
+# is an empty map — the standup goes out, with hashtags where links would be.
+LINKS_JSON='{}'
+if [ -n "$LINKS_FILE" ] && [ -s "$LINKS_FILE" ]; then
+  LINKS_JSON=$("${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --public-links "$LINKS_FILE") \
+    || LINKS_JSON='{}'
+  [ -n "$LINKS_JSON" ] || LINKS_JSON='{}'
 fi
 
 # repo_name_mapping may name a project in plain text ("My Food Mate - site"),
@@ -807,7 +827,7 @@ if echo "$RESP" | grep -q '"ok":true'; then
   # state file is a dead button, and a state file without the id it belongs to
   # cannot be replied to. Text through the environment, not argv, because it is
   # long and multi-line and that is where quoting breaks.
-  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" ARMED="$ARMED" "${PY_UTF8[@]}" python3 - \
+  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" ARMED="$ARMED" LINKS="$LINKS_JSON" "${PY_UTF8[@]}" python3 - \
       "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" <<'PYEOF'
 import json, os, sys
 
@@ -833,6 +853,13 @@ state = {"id": pending_id,
          "posted_x": False, "posted_wip": False}
 if "linkedin" in state["armed"]:
     state["posted_linkedin"] = False
+# The public GitHub links for X, checked when this message was built. Cosmetic:
+# anything unreadable is no links, never a lost state file.
+try:
+    links = json.loads(os.environ.get("LINKS") or "{}")
+    state["links"] = links if isinstance(links, dict) else {}
+except ValueError:
+    state["links"] = {}
 
 tmp = path + ".partial"
 try:

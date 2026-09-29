@@ -975,24 +975,82 @@ def shuffle_projects(text, seed, lead_out=None):
     return _join_share_frame(head, shuffled, tail)
 
 
-def _rewrite_project_headers(body, projects):
-    """Swap project-header lines only — not inline tags, not header/footer."""
+def _rewrite_project_headers(body, projects, links=None):
+    """Swap project-header lines only — not inline tags, not header/footer.
+
+    The link is the project's website, or failing that its GitHub repository:
+    first the one wip.co holds, then the one standup.rb read from the
+    repository's own remote. A header with none of them keeps its hashtag.
+
+    The remote-derived link is used only for a tag wip.co does not know. A
+    wip.co project is described by wip.co alone, so a repository that happens
+    to share its tag cannot put its own link under that project's name.
+    `links` was checked for public access when the morning message was built —
+    see public_links — so a private repository never becomes a dead link here.
+    """
+    links = links or {}
     out = []
     for line in body.split("\n"):
         m = SLOT_HEADER.fullmatch(line.strip())
         if not m:
             out.append(line)
             continue
-        project = projects.get(m.group(1))
-        site = (project or {}).get("website_url")
-        if not project or not site:
-            out.append(line)
-            continue
-        out.append(f"{project.get('name') or m.group(1)} — {site}")
+        tag = m.group(1)
+        project = projects.get(tag)
+        if project:
+            name = project.get("name") or tag
+            url = project.get("website_url") or project.get("github_url")
+        else:
+            link = links.get(tag) or {}
+            name, url = link.get("name") or tag, link.get("url")
+        out.append(f"{name} — {url}" if url else line)
     return "\n".join(out)
 
 
-def for_x(text, seed, lead_out=None):
+def _no_redirect():
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None  # the 3xx then surfaces as an HTTPError
+
+    return urllib.request.build_opener(NoRedirect)
+
+
+def public_links(raw, opener=None):
+    """Keep the standup.rb links an anonymous visitor can open.
+
+    A private repository answers 404 to anyone signed out, and on a public
+    timeline that is a dead link, which is worse than no link. A redirect is
+    dropped too: the check is about the URL that gets posted, not wherever it
+    leads.
+
+    Run once, when the morning message is built, and stored with it. Preview and
+    publish are separate processes hours apart; checking at each would let the
+    posted text differ from the one approved. Nothing here may raise — the
+    links are cosmetic, and the morning message must go out without them.
+    """
+    opener = opener or _no_redirect()
+    try:
+        links = json.loads(raw)
+    except Exception as e:  # noqa: BLE001 - no links is a valid answer
+        warn(f"links file unreadable, publishing without GitHub links: {e}")
+        return {}
+    if not isinstance(links, dict):
+        return {}
+    kept = {}
+    for tag, link in links.items():
+        url = link.get("url") if isinstance(link, dict) else None
+        if not isinstance(url, str) or not url.startswith("https://github.com/"):
+            continue
+        try:
+            with opener.open(urllib.request.Request(url, method="HEAD"), timeout=5) as r:
+                if r.status == 200:
+                    kept[tag] = {"name": str(link.get("name") or tag), "url": url}
+        except Exception as e:  # noqa: BLE001 - 404, 3xx, timeout: all mean no link
+            warn(f"not linking {url}: {e}")
+    return kept
+
+
+def for_x(text, seed, lead_out=None, links=None):
     """Rewrite project hashtags as names and links, for X.
 
     A hashtag is the attach mechanism on wip.co and nothing but text on X, where
@@ -1007,8 +1065,9 @@ def for_x(text, seed, lead_out=None):
     a standup silently hide six repositories, and made a command report a cache
     it did not keep.
 
-    If wip.co cannot be reached, the hashtags stay. A post that reads a little
-    worse beats no post at all.
+    If wip.co cannot be reached, its projects keep their hashtags; the GitHub
+    links standup.rb found (`links`, from the pending state) still apply. A post
+    that reads a little worse beats no post at all.
 
     Nothing here may raise. Same contract as shuffle_projects: the update offset
     is already advanced by the time this runs.
@@ -1027,11 +1086,12 @@ def for_x(text, seed, lead_out=None):
     # "ERROR: …/wip-token is missing" on stdout (die's log) and exit, so the
     # shell captured that string as the X preview reply.
     except (Exception, SystemExit) as e:  # noqa: BLE001 - never let this block a publish
-        warn(f"could not read wip.co projects, keeping the hashtags: {e}")
-        return _join_share_frame(head, body, tail)
+        # The GitHub links do not come from wip.co, so they still apply.
+        warn(f"could not read wip.co projects, keeping their hashtags: {e}")
+        projects = {}
 
     if body:
-        body = _rewrite_project_headers(body, projects)
+        body = _rewrite_project_headers(body, projects, links)
     return _join_share_frame(head, body, tail)
 
 
@@ -1824,6 +1884,94 @@ def _selftest_body():
     finally:
         mod.WIP_TOKEN_FILE = saved_token
 
+    # No website: link the GitHub repository. wip.co's own github_url first,
+    # then the public link standup.rb found — the latter only for a tag wip.co
+    # has no project for. On 2026-09-29 a project with no site went out bare.
+    _reset_rotation()
+    mod = sys.modules[__name__]
+    real_wip = mod.wip_projects
+    mod.wip_projects = lambda: {
+        "site": {"name": "Site", "website_url": "https://site.example",
+                 "github_url": "https://github.com/o/site"},
+        "gh": {"name": "Gh", "website_url": None, "github_url": "https://github.com/o/gh"},
+        "bare": {"name": "Bare", "website_url": None, "github_url": None},
+    }
+    links = {"newrepo": {"name": "new-repo", "url": "https://github.com/o/new-repo"},
+             "bare": {"name": "impostor", "url": "https://github.com/o/impostor"}}
+    report = ("\U0001F4CB Daily Standup\n\n#site\n\u2022 a\n\n#gh\n\u2022 b\n\n"
+              "#newrepo\n\u2022 c\n\n#bare\n\u2022 d\n\n#nolink\n\u2022 e\n\n5 projects")
+    try:
+        got = for_x(report, "2026-09-29", links=links)
+        assert "Site — https://site.example" in got, got
+        assert "Gh — https://github.com/o/gh" in got, got
+        assert "new-repo — https://github.com/o/new-repo" in got, got
+        assert "#bare" in got and "impostor" not in got, got
+        assert "#nolink" in got, got
+        # Without links, today's output: no GitHub fallback for unknown tags.
+        _reset_rotation()
+        plain = for_x(report, "2026-09-29")
+        assert "#newrepo" in plain and "new-repo —" not in plain, plain
+        assert "Gh — https://github.com/o/gh" in plain, plain
+
+        # wip.co unreachable: its projects keep their hashtags, and the links,
+        # which do not come from wip.co, still apply.
+        def down():
+            raise OSError("wip.co is down")
+        mod.wip_projects = down
+        _reset_rotation()
+        with contextlib.redirect_stderr(io.StringIO()):
+            offline = for_x(report, "2026-09-29", links=links)
+        assert "#site" in offline and "#gh" in offline, offline
+        assert "new-repo — https://github.com/o/new-repo" in offline, offline
+        # With wip.co down, "bare" is no longer known to be a wip.co project.
+        assert "impostor — https://github.com/o/impostor" in offline, offline
+    finally:
+        mod.wip_projects = real_wip
+
+    # public_links keeps a 200 and drops everything else: a private repository
+    # is a 404 to an anonymous visitor, and a dead link on a public timeline.
+    class FakeResponse:
+        def __init__(self, status):
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeOpener:
+        answers = {"ok": 200, "private": 404, "moved": 301}
+
+        def __init__(self):
+            self.seen = []
+
+        def open(self, req, timeout=None):
+            self.seen.append((req.full_url, req.get_method(), timeout))
+            name = req.full_url.rsplit("/", 1)[1]
+            if name == "slow":
+                raise TimeoutError("timed out")
+            status = self.answers[name]
+            if status != 200:
+                raise urllib.error.HTTPError(req.full_url, status, "no", {}, None)
+            return FakeResponse(status)
+
+    candidates = {t: {"name": t, "url": f"https://github.com/o/{t}"}
+                  for t in ("ok", "private", "moved", "slow")}
+    candidates["elsewhere"] = {"name": "x", "url": "https://gitlab.com/o/ok"}
+    opener = FakeOpener()
+    with contextlib.redirect_stderr(io.StringIO()):
+        kept = public_links(json.dumps(candidates), opener=opener)
+        assert kept == {"ok": {"name": "ok", "url": "https://github.com/o/ok"}}, kept
+        assert all(m == "HEAD" and t == 5 for _, m, t in opener.seen), opener.seen
+        assert not any("gitlab" in u for u, _, _ in opener.seen), opener.seen
+        assert public_links("not json", opener=FakeOpener()) == {}
+        assert public_links("[1, 2]", opener=FakeOpener()) == {}
+    # The real opener must not follow a redirect, or "moved" would pass as 200.
+    assert not any(isinstance(h, urllib.request.HTTPRedirectHandler)
+                   and type(h) is urllib.request.HTTPRedirectHandler
+                   for h in _no_redirect().handlers), "the stock redirect handler is back"
+
     # Footer survives the shuffle in place (after the trailer).
     _reset_rotation()
     with_foot = (
@@ -2158,7 +2306,20 @@ def main():
     if "--preview" in sys.argv:
         pending = sys.argv[sys.argv.index("--preview") + 1]
         state = json.loads((STATE_DIR / f"pending-{pending}.json").read_text())
-        print(for_x(strip_telegram_markup(state["text"]), pending))
+        print(for_x(strip_telegram_markup(state["text"]), pending,
+                    links=state.get("links") or {}))
+        return
+
+    # Reads the links file standup.rb wrote and prints the public ones as JSON.
+    # Always exits 0 with a JSON object: see public_links.
+    if "--public-links" in sys.argv:
+        path = sys.argv[sys.argv.index("--public-links") + 1]
+        try:
+            raw = pathlib.Path(path).read_text(encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 - no links is a valid answer
+            warn(f"links file unreadable, publishing without GitHub links: {e}")
+            raw = "{}"
+        print(json.dumps(public_links(raw)))
         return
 
     # Reads the report on stdin and writes what Telegram should receive. Kept
@@ -2270,7 +2431,8 @@ def main():
 
         def render_public():
             if "text" not in public:
-                public["text"] = for_x(text, key, lead_out=lead)
+                public["text"] = for_x(text, key, lead_out=lead,
+                                       links=state.get("links") or {})
             return public["text"]
 
         def post_x():

@@ -18,6 +18,7 @@ Encoding.default_internal = nil
 
 require 'date'
 require 'fileutils'
+require 'json'
 require 'open3'
 require 'tmpdir'
 
@@ -237,7 +238,8 @@ Dir.mktmpdir do |root|
     output.include?('the shell-name commit')
   failures << 'the commit of a user whose name holds regex characters is missing' unless
     output.include?('the regex-name commit')
-  %w[shell-repo regex-repo].each do |repo|
+  # An unmapped repository is published under a hashtag made from its name.
+  %w[#shellrepo #regexrepo].each do |repo|
     unless blocks.key?(repo)
       failures << "#{repo} is missing from the report entirely"
       next
@@ -278,7 +280,7 @@ Dir.mktmpdir do |root|
                             'ruby', SCRIPT, '--projects-root', root, '--config', config)
 
   failures << 'a repository missing from repo_name_mapping was filtered out' unless
-    mapped.include?('demo-repo')
+    mapped.include?('#demorepo')
   failures << 'repo_name_mapping did not rename the repository it names' unless
     mapped.include?('#quiet')
   failures << 'a config with no exclude_repos dropped a repository' unless
@@ -299,7 +301,7 @@ Dir.mktmpdir do |root|
                             'ruby', SCRIPT, '--projects-root', root, '--config', excluding)
 
   failures << 'an excluded repository was named in the report' if
-    hidden.include?('shell-repo') || hidden.include?('#renamed')
+    hidden.include?('shell-repo') || hidden.include?('#shellrepo') || hidden.include?('#renamed')
   failures << 'an excluded repository still reported its commits' if
     hidden.include?('the shell-name commit')
   failures << 'excluding one repository dropped the others' unless
@@ -365,7 +367,10 @@ Dir.mktmpdir do |root|
   # Excluding everything with work is the end state of a long enough list. The
   # report has to reach its no-activity line rather than crash or print husks.
   everything = File.join(root, 'everything.yml')
-  File.write(everything, "exclude_repos:\n#{report_blocks(output).keys.map { |n| "  - #{n}\n" }.join}")
+  # Directory names, not report headers: exclude_repos matches the directory,
+  # and an unmapped header is a hashtag made from it, not the name itself.
+  active = Dir.children(root).select { |n| File.directory?(File.join(root, n, '.git')) }
+  File.write(everything, "exclude_repos:\n#{active.map { |n| "  - #{n}\n" }.join}")
   silent, silent_status = Open3.capture2e({ 'HOME' => fake_home },
                                           'ruby', SCRIPT, '--projects-root', root, '--config', everything)
 
@@ -533,6 +538,77 @@ Dir.mktmpdir do |root|
          "--- with a scalar ---\n#{scalar_out}--- with a non-string ---\n#{mixed_out}" \
          "--- with a blank entry ---\n#{blank_out}--- with an empty list ---\n#{emptied}--- excluding a substring ---\n#{partial}" \
          "--- excluding everything ---\n#{silent}----------------------"
+    failures.each { |f| warn "FAIL: #{f}" }
+    exit 1
+  end
+end
+
+# The header an unmapped repository gets, and the GitHub links written beside
+# the report for X.
+#
+# On 2026-09-29 "app-promo-reel" was published as "#app-promo-reel", and X ends
+# a hashtag at the first "-": the post linked "#app". The header is now a
+# hashtag of lowercase letters and digits only, and --links-out records the
+# repository's GitHub page so X can link that instead of a bare tag.
+def build_remote_repo(path, remote)
+  build_odd_name_repo(path, 'Remote User', "the commit of #{File.basename(path)}")
+  git('-C', path, 'remote', 'add', 'origin', remote) if remote
+end
+
+Dir.mktmpdir do |root|
+  fake_home = File.join(root, 'fake-home')
+  FileUtils.mkdir_p(fake_home)
+  build_remote_repo(File.join(root, 'foo-bar_Baz'), 'https://github.com/someone/foo-bar_Baz.git')
+  build_remote_repo(File.join(root, 'scp-form'), 'git@github.com:someone/scp-form.git')
+  build_remote_repo(File.join(root, 'ssh-form'), 'ssh://git@github.com/someone/ssh-form/')
+  build_remote_repo(File.join(root, 'elsewhere'), 'https://gitlab.com/someone/elsewhere.git')
+  build_remote_repo(File.join(root, 'no-remote'), nil)
+  build_remote_repo(File.join(root, 'plain-titled'), 'https://github.com/someone/plain-titled')
+  build_remote_repo(File.join(root, 'mixed-case'), 'https://github.com/someone/mixed-case')
+  # A mapped and an unmapped repository on one tag: the link would be ambiguous.
+  build_remote_repo(File.join(root, 'twin'), 'https://github.com/someone/twin')
+  build_remote_repo(File.join(root, 't-w-i-n'), 'https://github.com/someone/t-w-i-n')
+
+  config = File.join(root, 'standup.yml')
+  File.write(config, <<~YAML)
+    repo_name_mapping:
+      plain-titled: "Plain Title - example.com"
+      mixed-case: "#Mixed-Case"
+      twin: "#twin"
+  YAML
+  links = File.join(root, 'links.json')
+  run = ->(*extra) { Open3.capture3({ 'HOME' => fake_home }, 'ruby', SCRIPT, '--projects-root', root,
+                                    '--config', config, *extra) }
+  out, err, status = run.call('--links-out', links)
+  plain_out, = run.call
+  written = File.exist?(links) ? JSON.parse(File.read(links)) : {}
+  headers = report_blocks(out).keys
+
+  failures = []
+  failures << "an unmapped name was not made a hashtag of [a-z0-9]: #{headers.inspect}" unless
+    headers.include?('#foobarbaz') && headers.include?('#noremote')
+  failures << 'a mapped value was changed' unless
+    headers.include?('Plain Title - example.com') && headers.include?('#Mixed-Case')
+  failures << "--links-out changed the report itself" unless out == plain_out
+  failures << "--links-out failed the run: #{err}" unless status.success?
+  failures << "the remote lookup printed to stderr: #{err}" unless err.empty?
+  want = {
+    'foobarbaz' => { 'name' => 'foo-bar_Baz', 'url' => 'https://github.com/someone/foo-bar_Baz' },
+    'scpform' => { 'name' => 'scp-form', 'url' => 'https://github.com/someone/scp-form' },
+    'sshform' => { 'name' => 'ssh-form', 'url' => 'https://github.com/someone/ssh-form' },
+  }
+  failures << "links: want #{want.inspect}, got #{written.inspect}" unless written == want
+
+  # Best-effort: a path that cannot be written is no links, never no report.
+  bad_out, bad_err, bad_status = run.call('--links-out', File.join(root, 'no-such-dir', 'links.json'))
+  failures << 'an unwritable --links-out failed the run' unless bad_status.success?
+  failures << 'an unwritable --links-out changed the report' unless bad_out == plain_out
+  failures << "an unwritable --links-out printed to stderr: #{bad_err}" unless bad_err.empty?
+
+  if failures.empty?
+    puts 'ok: an unmapped repository is a clean hashtag, and its GitHub link is recorded'
+  else
+    warn "--- output ---\n#{out}--- stderr ---\n#{err}"
     failures.each { |f| warn "FAIL: #{f}" }
     exit 1
   end
