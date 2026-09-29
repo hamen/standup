@@ -23,3 +23,9 @@ exclude_repos:
 # Optional: text appended after the report (Telegram, X, wip.co, LinkedIn).
 # Write only the footer text — a blank line before it is added automatically.
 # share_footer: "#buildinpublic #indiehackers"
+
+# Optional: which CLI formats the morning report. Default: claude
+# formatter: claude   # Claude Code CLI (claude -p)
+# formatter: cursor   # Cursor Agent CLI (agent -p)
+# Optional model; default haiku for claude, account default for cursor if omitted.
+# formatter_model: haiku

@@ -103,6 +103,11 @@ run() { # run <log> <args...>
       ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${FAIL_LAST:+FAIL_LAST=1} \
       ${REJECT_PREVIEW:+REJECT_PREVIEW=1} ${TMPDIR:+TMPDIR=$TMPDIR} \
       ${CLAUDE_BIN+CLAUDE_BIN=$CLAUDE_BIN} \
+      ${STANDUP_FORMATTER+STANDUP_FORMATTER=$STANDUP_FORMATTER} \
+      ${FORMATTER_BIN+FORMATTER_BIN=$FORMATTER_BIN} \
+      ${FORMATTER_MODEL+FORMATTER_MODEL=$FORMATTER_MODEL} \
+      ${AGENT_LOG+AGENT_LOG=$AGENT_LOG} \
+      ${CLAUDE_CALLED+CLAUDE_CALLED=$CLAUDE_CALLED} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -121,9 +126,9 @@ echo "$out" | grep -q 'Test message sent' ||
 
 # --- 2. The whole report path, with the underscore that caused all this ----
 # Stub ruby and claude so the script reaches its real send with known text.
-# Real ruby still handles -ryaml / -e: daily-standup.sh loads share_* that way,
-# and a stub that answers every ruby call with a standup body makes `eval`
-# try to run "•" as a command.
+# Real ruby still handles -ryaml / -e: daily-standup.sh loads share_* and
+# formatter settings that way, and a stub that answers every ruby call with a
+# standup body makes `eval` try to run "•" as a command.
 cat > "$TMP/stub/ruby" <<SH
 #!/usr/bin/env bash
 case " \$* " in
@@ -388,7 +393,7 @@ for rc_file in .zshrc .bashrc; do
     failures+=("$rc_file's chat id was used for the report")
 
   out=$(CLAUDE_BIN=/cron/line/claude run "$TMP/override-$rc_file-check.log" --check)
-  echo "$out" | grep -q 'claude:.*/cron/line/claude' ||
+  echo "$out" | grep -q 'formatter:.*claude.*/cron/line/claude' ||
     failures+=("$rc_file overrode the CLAUDE_BIN set on the cron line")
 done
 rm -f "$TMP/fakehome/.zshrc" "$TMP/fakehome/.bashrc"
@@ -491,7 +496,7 @@ compgen -G "$TMP/fakehome/.local/state/standup/pending-*.partial" > /dev/null &&
 printf 'export CLAUDE_BIN=/profile/wins/claude\n' > "$TMP/fakehome/.zshrc"
 out=$(CLAUDE_BIN= run "$TMP/empty.log" --check)
 rm -f "$TMP/fakehome/.zshrc"
-echo "$out" | grep -q 'claude:.*/profile/wins/claude' &&
+echo "$out" | grep -q 'formatter:.*claude.*/profile/wins/claude' &&
   failures+=("an empty CLAUDE_BIN on the cron line did not clear the profile export")
 
 # --- 12. share_header from config is the only title after strip -----------
@@ -622,6 +627,143 @@ case " \$* " in
 esac
 printf '#alpha\n• Build config: dart_defines from production.env\n'
 SH
+chmod +x "$TMP/stub/ruby"
+
+# --- 13. Cursor agent as formatter ----------------------------------------
+# Stub agent records argv so we can assert -p / --output-format / --mode / --model.
+# Restore the ordinary claude stub: the share_header tests above leave a different body.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+cat > "$TMP/stub/agent" <<'SH'
+#!/usr/bin/env bash
+# Without --trust the real CLI prints Workspace Trust Required; mirror that.
+has_trust=0
+for a in "$@"; do
+  [ "$a" = "--trust" ] && has_trust=1
+done
+if [ "$has_trust" -eq 0 ]; then
+  echo "Workspace Trust Required" >&2
+  exit 1
+fi
+if [ -n "${AGENT_LOG:-}" ]; then
+  # Flags only — the prompt after -- can be huge and is not what we assert on.
+  {
+    pwd
+    for a in "$@"; do
+      [ "$a" = "--" ] && break
+      printf '%s\n' "$a"
+    done
+  } > "$AGENT_LOG"
+fi
+printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/agent"
+
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+: > "$TMP/agent.args"
+out=$(STANDUP_FORMATTER=cursor FORMATTER_BIN="$TMP/stub/agent" \
+      AGENT_LOG="$TMP/agent.args" run "$TMP/cursor.log")
+call "$TMP/cursor.log" 1 | grep -q 'dart\\_defines' ||
+  failures+=("cursor formatter output did not reach Telegram escaped")
+grep -qx -- '-p' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with -p")
+grep -qx -- '--trust' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with --trust")
+grep -qx -- '--output-format' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with --output-format")
+grep -qx -- 'text' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with text output")
+grep -qx -- '--mode' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with --mode")
+grep -qx -- 'ask' "$TMP/agent.args" ||
+  failures+=("agent was not invoked with --mode ask")
+grep -q -- '--model' "$TMP/agent.args" &&
+  failures+=("agent got --model when FORMATTER_MODEL was unset")
+# First line of AGENT_LOG is pwd — must not be $HOME or the work tree.
+agent_pwd=$(head -n 1 "$TMP/agent.args")
+case "$agent_pwd" in
+  "$TMP/fakehome"|"$TMP/fakehome"/*|"$WORK"|"$WORK"/*|"$ROOT"|"$ROOT"/*)
+    failures+=("agent --trust cwd was home or the repo: $agent_pwd")
+    ;;
+esac
+
+: > "$TMP/agent.args"
+out=$(STANDUP_FORMATTER=cursor FORMATTER_BIN="$TMP/stub/agent" \
+      FORMATTER_MODEL=composer-2 AGENT_LOG="$TMP/agent.args" \
+      run "$TMP/cursor-model.log")
+grep -qx -- '--model' "$TMP/agent.args" ||
+  failures+=("agent did not receive --model when FORMATTER_MODEL was set")
+grep -qx -- 'composer-2' "$TMP/agent.args" ||
+  failures+=("agent did not receive the FORMATTER_MODEL value")
+
+# yml formatter: cursor — agent on PATH (stub), no STANDUP_FORMATTER env.
+printf 'projects_root: %s\nformatter: cursor\nformatter_model: composer-2\n' \
+  "$TMP/projects" > "$WORK/standup.yml"
+: > "$TMP/agent.args"
+out=$(AGENT_LOG="$TMP/agent.args" run "$TMP/cursor-yml.log")
+grep -qx -- '--model' "$TMP/agent.args" ||
+  failures+=("yml formatter: cursor did not call agent with --model")
+grep -qx -- 'composer-2' "$TMP/agent.args" ||
+  failures+=("yml formatter_model did not reach agent")
+out=$(run "$TMP/cursor-yml-check.log" --check)
+echo "$out" | grep -q 'formatter:.*cursor' ||
+  failures+=("--check did not report formatter cursor from yml")
+
+# Env wins over yml: STANDUP_FORMATTER=claude must not call agent.
+printf 'projects_root: %s\nformatter: cursor\n' "$TMP/projects" > "$WORK/standup.yml"
+: > "$TMP/agent.args"
+out=$(STANDUP_FORMATTER=claude AGENT_LOG="$TMP/agent.args" run "$TMP/cursor-env-wins.log")
+[ ! -s "$TMP/agent.args" ] ||
+  failures+=("STANDUP_FORMATTER=claude still invoked agent despite yml cursor")
+call "$TMP/cursor-env-wins.log" 1 | grep -q 'dart\\_defines' ||
+  failures+=("claude path after env override did not reach Telegram")
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+
+# --- 14. Formatter exit code and unknown name -----------------------------
+# A formatter that prints partial output and exits non-zero must not publish
+# that partial — fall back to the raw standup instead.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+# Shaped so --repair-headers accepts it: only the exit-code check can stop it.
+printf '*#alpha*\n• partial-should-not-publish\n'
+exit 1
+SH
+chmod +x "$TMP/stub/claude"
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+out=$(run "$TMP/fmt-rc.log")
+echo "$out" | grep -q 'formatter exited 1' ||
+  failures+=("non-zero formatter exit was not logged: $out")
+# MarkdownV2 escapes the dashes, so match the escaped form Telegram receives.
+call "$TMP/fmt-rc.log" 1 | grep -q 'partial\\-should\\-not\\-publish' &&
+  failures+=("partial formatter stdout reached Telegram despite non-zero exit")
+call "$TMP/fmt-rc.log" 1 | grep -q 'dart_defines\|dart\\_defines' ||
+  failures+=("raw fallback missing after formatter non-zero exit")
+
+# Unknown STANDUP_FORMATTER falls back to claude with a warning.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+[ -n "${CLAUDE_CALLED:-}" ] && touch "$CLAUDE_CALLED"
+printf '📋 *Daily Standup*\n\n*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/claude"
+: > "$TMP/agent.args"
+rm -f "$TMP/claude.called"
+out=$(STANDUP_FORMATTER=foo AGENT_LOG="$TMP/agent.args" CLAUDE_CALLED="$TMP/claude.called" \
+      run "$TMP/unknown-fmt.log")
+[ -f "$TMP/claude.called" ] ||
+  failures+=("unknown formatter did not actually run claude")
+echo "$out" | grep -q "unknown formatter 'foo'; using claude" ||
+  failures+=("unknown formatter did not warn and fall back to claude: $out")
+[ ! -s "$TMP/agent.args" ] ||
+  failures+=("unknown formatter still invoked agent")
+call "$TMP/unknown-fmt.log" 1 | grep -q 'dart\\_defines' ||
+  failures+=("unknown-formatter fallback did not reach Telegram")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
