@@ -908,6 +908,49 @@ PYEOF
     failures+=("a links file holding '$links_body' did not become links: {} in the state")
 done
 
+# 17b. The success path: a public link reaches the day's state and the X preview.
+# The HEAD check itself is the selftest's job; here --public-links answers from
+# a wrapper around a copy of the publisher, so nothing touches the network.
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = --links-out ]; then printf '{"alpha": {}}' > "\$2"; fi
+  shift
+done
+printf '#alpha\n• one\n'
+SH
+chmod +x "$TMP/stub/ruby"
+cp "$WORK/bin/standup-publish.py" "$WORK/bin/real-publish.py"
+cat > "$WORK/bin/standup-publish.py" <<'PY'
+import json, os, runpy, sys
+if sys.argv[1:2] == ["--public-links"]:
+    print(json.dumps({"alpha": {"name": "alpha-repo", "url": "https://github.com/o/alpha-repo"}}))
+    sys.exit(0)
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "real-publish.py")
+sys.argv[0] = real
+runpy.run_path(real, run_name="__main__")
+PY
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json "$TMP/links-ok.log"
+set +e
+out=$(run "$TMP/links-ok.log")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || failures+=("a public link failed the run ($rc): $out")
+python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+want = {"alpha": {"name": "alpha-repo", "url": "https://github.com/o/alpha-repo"}}
+assert state.get("links") == want, state.get("links")
+PYEOF
+  failures+=("a public link did not reach the pending state")
+grep -q 'alpha-repo — https://github.com/o/alpha-repo' "$TMP/links-ok.log" ||
+  failures+=("the X preview did not link the public GitHub repository")
+cp "$WORK/bin/real-publish.py" "$WORK/bin/standup-publish.py"
+rm -f "$WORK/bin/real-publish.py"
+
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else
