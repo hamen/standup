@@ -578,13 +578,16 @@ Dir.mktmpdir do |root|
   YAML
   links = File.join(root, 'links.json')
   run = ->(*extra) { Open3.capture3({ 'HOME' => fake_home }, 'ruby', SCRIPT, '--projects-root', root,
-                                    '--config', config, *extra) }
-  out, err, status = run.call('--links-out', links)
+                                    '--config', config, *extra, chdir: root) }
+  # First, and without the option: nothing may be written, anywhere it could land.
   plain_out, = run.call
+  stray = Dir.glob(File.join(root, '**', '*.json'))
+  out, err, status = run.call('--links-out', links)
   written = File.exist?(links) ? JSON.parse(File.read(links)) : {}
   headers = report_blocks(out).keys
 
   failures = []
+  failures << "a run without --links-out wrote #{stray.inspect}" unless stray.empty?
   failures << "an unmapped name was not made a hashtag of [a-z0-9]: #{headers.inspect}" unless
     headers.include?('#foobarbaz') && headers.include?('#noremote')
   failures << 'a mapped value was changed' unless

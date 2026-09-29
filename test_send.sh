@@ -948,8 +948,61 @@ PYEOF
   failures+=("a public link did not reach the pending state")
 grep -q 'alpha-repo — https://github.com/o/alpha-repo' "$TMP/links-ok.log" ||
   failures+=("the X preview did not link the public GitHub repository")
+
+# 17c. --public-links itself failing, in each way it can: a non-zero exit, output
+# that is not JSON, JSON that is not an object. And a links file standup.rb
+# never wrote. Every one is a normal morning message with no links.
+for mode in exit1 notjson notobject nofile; do
+  cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = --links-out ] && [ "$mode" != nofile ]; then printf '{"alpha": {}}' > "\$2"; fi
+  shift
+done
+printf '#alpha\n• one\n'
+SH
+  chmod +x "$TMP/stub/ruby"
+  cat > "$WORK/bin/standup-publish.py" <<PY
+import os, runpy, sys
+if sys.argv[1:2] == ["--public-links"]:
+    mode = "$mode"
+    if mode == "exit1":
+        print("Traceback: boom")
+        sys.exit(1)
+    print("not json" if mode == "notjson" else '[1, 2]')
+    sys.exit(0)
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "real-publish.py")
+sys.argv[0] = real
+runpy.run_path(real, run_name="__main__")
+PY
+  rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+  set +e
+  out=$(run "$TMP/links-$mode.log")
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || failures+=("--public-links failing ($mode) failed the run ($rc): $out")
+  call "$TMP/links-$mode.log" 1 | grep -q 'inline_keyboard' ||
+    failures+=("--public-links failing ($mode) cost the message its buttons")
+  python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+assert state.get("links") == {}, state.get("links")
+PYEOF
+    failures+=("--public-links failing ($mode) did not become links: {} in the state")
+done
 cp "$WORK/bin/real-publish.py" "$WORK/bin/standup-publish.py"
 rm -f "$WORK/bin/real-publish.py"
+
+# 17d. --public-links on a file that is not there: an empty object, exit 0.
+set +e
+got=$(python3 "$WORK/bin/standup-publish.py" --public-links "$TMP/no-such-links.json" 2>/dev/null)
+rc=$?
+set -e
+[ "$rc" -eq 0 ] && [ "$got" = '{}' ] ||
+  failures+=("--public-links on a missing file did not print {} and exit 0 ($rc): $got")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
