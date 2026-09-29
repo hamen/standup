@@ -125,10 +125,13 @@ Configuration is optional. With none at all, `standup` looks in `~/code`, then
 it is not there, `standup` runs with no configuration rather than falling back.
 Without the flag, the first of `~/.standup.yml` and `./standup.yml` that exists.
 
-The Telegram publisher (`bin/daily-standup.sh`) reads `<repo>/standup.yml`
-unless `STANDUP_CONFIG` points elsewhere. It still refuses to run without a
-usable config — with no config there is no `exclude_repos`, and every repository
-under your projects root would be published by directory name.
+The Telegram publisher (`bin/daily-standup.sh`) looks for one report config when
+`STANDUP_CONFIG` is unset or empty: `~/.standup.yml` **or** `<repo>/standup.yml`.
+If both files exist it refuses to run until you set `STANDUP_CONFIG` to the one
+you want (AMBIGUOUS). It still refuses if neither is usable — with no config
+there is no `exclude_repos`, and every repository under your projects root would
+be published by directory name. Each successful morning run logs
+`using config: …` so you can see which file is in force.
 
 **Where it looks for repositories.** The first of these that is set:
 
@@ -266,10 +269,11 @@ the button looks fine and collects nothing.
 For wip.co, put the API key alone in `~/.config/standup/wip-token`.
 
 Credentials live outside the repository. Put the report config in
-`<repo>/standup.yml` (gitignored), or set `STANDUP_CONFIG`; the sender
-**refuses to run without a usable one** rather than falling back to an empty
-default — with no config there is no `exclude_repos`, and every repository under
-your projects root would be published by directory name.
+`~/.standup.yml` or `<repo>/standup.yml` (both gitignored patterns); the
+sender **refuses to run without a usable one** rather than falling back to an
+empty default — with no config there is no `exclude_repos`, and every repository
+under your projects root would be published by directory name. Keep exactly one
+of those files, or set `STANDUP_CONFIG` when both exist.
 
 Check what it resolved before trusting it to a scheduler:
 
