@@ -320,6 +320,28 @@ if [ ! -s "$STANDUP_CONFIG" ] || ! grep -qE '^[[:space:]]*[^#[:space:]-]' "$STAN
   exit 1
 fi
 
+# share_header / share_footer from standup.yml. {date} → TODAY. Footer is plain
+# text only — the blank line before it is added when appending, not in the file.
+# Shellwords so a header with apostrophes or spaces cannot break `eval`.
+# RUBYOPT: cron/tests may run with LC_ALL=C; the default header holds emoji and
+# an ASCII default external encoding refuses the -e script before it can run.
+# Defaults + || true: a failed eval must not leave SHARE_* unset under set -u
+# (cron would abort before Telegram ever sees the report).
+SHARE_HEADER="📋 Daily Standup — $TODAY"
+SHARE_FOOTER=""
+eval "$(RUBYOPT="-Eutf-8:utf-8" ruby -ryaml -rshellwords -e '
+path, date = ARGV[0], ARGV[1]
+raw = File.read(path)
+cfg = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: true) || {}
+cfg = {} unless cfg.is_a?(Hash)
+header = cfg["share_header"].to_s.strip
+header = "📋 Daily Standup — {date}" if header.empty?
+footer = (cfg["share_footer"] || "").to_s.strip
+header = header.gsub("{date}", date)
+puts "SHARE_HEADER=#{Shellwords.escape(header)}"
+puts "SHARE_FOOTER=#{Shellwords.escape(footer)}"
+' "$STANDUP_CONFIG" "$TODAY")" || true
+
 # Build standup args
 # An array, not a string: word splitting would turn a config path containing a
 # space into two arguments and the run would fail on a path that is perfectly
@@ -341,7 +363,7 @@ RAW_STANDUP=$(ruby "$STANDUP_BIN" "${STANDUP_ARGS[@]}" 2>&1) || {
 }
 
 if [ -z "$RAW_STANDUP" ] || echo "$RAW_STANDUP" | grep -q "^No activity found"; then
-  send_telegram "📋 *Daily Standup — $TODAY*
+  send_telegram "$SHARE_HEADER
 
 No commits $DATE_LABEL. Rest day? 🏖️"
   echo "[$TODAY] No activity — message sent."
@@ -359,7 +381,7 @@ Here is the raw standup output (each section is a project hashtag, bullets are c
 $RAW_STANDUP
 
 Format this as a concise, scannable Telegram message:
-- Start with: 📋 *Daily Standup — $TODAY*
+- Do not write a title line. Start directly with the first project hashtag.
 - Group by project hashtag (bold the hashtag)
 - Summarize related commits into one bullet where possible (don't repeat noise like 'chore: bump version')
 - Use plain language, not commit-speak
@@ -371,12 +393,10 @@ Format this as a concise, scannable Telegram message:
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")}"
 ANALYSIS=$(echo "$PROMPT" | timeout 120 "$CLAUDE_BIN" -p --model haiku 2>/dev/null) || ANALYSIS=""
 
-# Fallback: if Claude failed, send raw standup
+# Fallback: if Claude failed, send raw standup (title is prepended after strip)
 if [ -z "$ANALYSIS" ]; then
   echo "  Claude formatting failed, using raw fallback"
-  ANALYSIS="📋 *Daily Standup — $TODAY*
-
-$RAW_STANDUP"
+  ANALYSIS="$RAW_STANDUP"
 fi
 
 # The hashtags are data, not prose: wip.co attaches a todo to a project BY the hashtag, and the X
@@ -389,9 +409,7 @@ fi
 REPAIRED=$(printf '%s' "$ANALYSIS" | RAW_STANDUP="$RAW_STANDUP" \
   python3 "$SCRIPT_DIR/standup-publish.py" --repair-headers) && ANALYSIS="$REPAIRED" || {
   echo "  Formatter lost a project; publishing the raw standup instead"
-  ANALYSIS="📋 *Daily Standup — $TODAY*
-
-$RAW_STANDUP"
+  ANALYSIS="$RAW_STANDUP"
 }
 
 # Security lines never leave this machine, on any destination — not X, not
@@ -424,7 +442,7 @@ case $STRIP_STATUS in
   2)
     echo "[$TODAY] Every project was dropped by the private-line filter; nothing sent."
     disarm_today
-    send_telegram "🔒 *Daily Standup — $TODAY*
+    send_telegram "🔒 $SHARE_HEADER
 
 Niente da pubblicare: ogni riga era di sicurezza. Nessun report inviato."
     exit 0
@@ -435,7 +453,7 @@ Niente da pubblicare: ogni riga era di sicurezza. Nessun report inviato."
     # would send somebody to look in the wrong place.
     echo "[$TODAY] The report has no project blocks; nothing sent."
     disarm_today
-    send_telegram "⚠️ *Daily Standup — $TODAY*
+    send_telegram "⚠️ $SHARE_HEADER
 
 Il report non contiene nessun progetto: la formattazione è fallita a monte. Non ho inviato niente. Controlla il log."
     exit 1
@@ -443,12 +461,35 @@ Il report non contiene nessun progetto: la formattazione è fallita a monte. Non
   *)
     echo "[$TODAY] The private-line filter itself failed; nothing sent."
     disarm_today
-    send_telegram "⚠️ *Daily Standup — $TODAY*
+    send_telegram "⚠️ $SHARE_HEADER
 
 Il filtro delle righe di sicurezza non ha funzionato. Non ho inviato niente, per non pubblicare un report non filtrato. Controlla il log."
     exit 1
     ;;
 esac
+
+# Configured title is the only source: drop whatever title the formatter wrote
+# (if the first line is not a project hashtag), then prepend SHARE_HEADER.
+# Same placement as the footer — after strip-private, so a share_header that is
+# itself a lone #hashtag is never mistaken for an empty project and dropped.
+# A failure here keeps the already-filtered text: two titles beat a message
+# holding only the header under live publish buttons.
+if DROPPED=$(printf '%s' "$ANALYSIS" | python3 "$SCRIPT_DIR/standup-publish.py" --drop-title); then
+  ANALYSIS="$DROPPED"
+else
+  echo "  --drop-title failed; keeping the report as it is"
+fi
+ANALYSIS="${SHARE_HEADER}
+
+${ANALYSIS}"
+
+# share_footer is config text only: trim already done when loading, and the
+# blank line before it is added here so the yml never needs a leading newline.
+if [ -n "$SHARE_FOOTER" ]; then
+  ANALYSIS="${ANALYSIS}
+
+${SHARE_FOOTER}"
+fi
 
 # ---- Send to Telegram, with the button that publishes it ----
 #

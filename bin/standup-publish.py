@@ -228,9 +228,15 @@ def to_markdown_v2(text):
     point.
     """
     out = []
-    for i, line in enumerate(text.split("\n")):
+    seen_content = False
+    for line in text.split("\n"):
         stripped = line.strip()
-        header = RAW_HEADER.fullmatch(stripped) or (i == 0 and stripped.startswith("📋"))
+        # Title: first non-empty line unless a project starts the report.
+        # share_header need not begin with 📋.
+        is_title = bool(stripped) and not seen_content and not RAW_HEADER.fullmatch(stripped)
+        if stripped:
+            seen_content = True
+        header = RAW_HEADER.fullmatch(stripped) or is_title
         out.append(f"*{escape_mdv2(stripped)}*" if header and stripped else escape_mdv2(line))
     return "\n".join(out)
 
@@ -337,6 +343,7 @@ def strip_telegram_markup(text):
     happen costs more than it saves.
     """
     out = []
+    seen_content = False
     for line in text.splitlines():
         bare = line.strip()
         # Asterisks are removed only where they can only be markup: the title,
@@ -349,7 +356,14 @@ def strip_telegram_markup(text):
         # that reaches for ** despite the prompt used to have its stars deleted
         # by the old blanket replace; matching on the bare token restores that
         # without deleting asterisks anywhere else.
-        if bare.startswith("📋") or FMT_HEADER.fullmatch(bare.replace("*", "")):
+        #
+        # The title is the first non-empty line unless a project starts the
+        # report — share_header need not begin with 📋.
+        is_title = bool(bare) and not seen_content and not FMT_HEADER.fullmatch(
+            bare.replace("*", ""))
+        if bare:
+            seen_content = True
+        if is_title or bare.startswith("📋") or FMT_HEADER.fullmatch(bare.replace("*", "")):
             line = line.replace("*", "")
         out.append(line)
     return "\n".join(out).strip()
@@ -639,6 +653,31 @@ def _is_header(line):
     return bool(FILTER_HEADER.fullmatch(line.strip()))
 
 
+def drop_leading_title(text):
+    """Remove a leading non-project line the formatter may have written as a title.
+
+    The configured share_header is prepended by daily-standup.sh after this
+    runs, so any title the LLM invented must go first. A report that already
+    starts with a project hashtag (#name / *#name*) is left alone (after
+    trimming leading blank lines).
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines):
+        return ""
+    if _is_header(lines[i]):
+        return "\n".join(lines[i:])
+    # Drop the title line and any blank lines that followed it.
+    i += 1
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    return "\n".join(lines[i:])
+
+
 def strip_private(text):
     """Remove security lines, and any project they leave with nothing to say.
 
@@ -755,30 +794,81 @@ def strip_private(text):
     return "\n\n".join(b for b in out if b.strip()), before, after
 
 
-def shuffle_projects(text, seed, lead_out=None):
-    """Reorder the project blocks, the same way all day, differently each day.
+def split_share_frame(text):
+    """Split a report into (head, body, tail) for public rewrite.
 
-    X builds the link card from the first URL in the tweet. The standup lists
-    the projects in a stable order, so the same site was always first and the
-    card carried the same image every morning.
+    head — share_header / title (everything before the first project)
+    body — project blocks only; shuffle and hashtag→URL run here
+    tail — the "N projects" trailer plus share_footer (never rewritten)
 
-    Seeded by the day on purpose: --preview renders this text hours before the
-    button is pressed, and a preview that does not match what gets posted is
-    not an approval of anything.
-
-    Blocks with no hashtag — the title, the closing count — keep their place.
-
-    `lead_out`, when given, receives the chosen hashtag under "tag". The caller
-    needs it to record the turn afterwards, and it cannot be read back out of
-    the finished text: for_x has replaced every hashtag with a name and a URL by
-    then, so the key would never match.
-
-    Nothing here may raise. This runs inside post_to_x, which catches nothing,
-    and the update offset is already advanced by the time it does — so an
-    exception would lose the press and the day. Any failure falls back to the
-    plain seeded shuffle.
+    Without a trailer, trailing blocks that are not real projects (no body under
+    a hashtag header) are treated as the footer — so a lone `#foo` after the
+    last project stays a social tag, not a project slot.
     """
+    if not text or not text.strip():
+        return text, "", ""
+
     blocks = re.split(r"\n\s*\n", text)
+
+    def first_line(block):
+        return block.split("\n")[0].strip()
+
+    def is_slot(block):
+        return bool(SLOT_HEADER.fullmatch(first_line(block)))
+
+    def is_trailer_block(block):
+        return bool(TRAILER_LINE.fullmatch(block.strip()))
+
+    def is_real_project(block):
+        if not is_slot(block):
+            return False
+        lines = block.split("\n")
+        return any(ln.strip() for ln in lines[1:])
+
+    def join(parts):
+        return "\n\n".join(parts)
+
+    trailer_i = None
+    for i, block in enumerate(blocks):
+        if is_trailer_block(block):
+            trailer_i = i
+
+    # Leading matter that is not a real project (hashtag + bullets) is the
+    # title / share_header. A lone #hashtag as the first block is the configured
+    # title, not a project — otherwise for_x would turn it into "Name — URL".
+    if trailer_i is not None:
+        i = 0
+        head = []
+        while i < trailer_i and not is_real_project(blocks[i]):
+            head.append(blocks[i])
+            i += 1
+        body = blocks[i:trailer_i]
+        tail = blocks[trailer_i:]
+        return join(head), join(body), join(tail)
+
+    rest = list(blocks)
+    tail = []
+    while len(rest) > 1 and not is_real_project(rest[-1]):
+        tail.insert(0, rest.pop())
+
+    i = 0
+    head = []
+    while i < len(rest) and not is_real_project(rest[i]):
+        head.append(rest[i])
+        i += 1
+    return join(head), join(rest[i:]), join(tail)
+
+
+def _join_share_frame(head, body, tail):
+    return "\n\n".join(p for p in (head, body, tail) if p)
+
+
+def _shuffle_body(body, seed, lead_out=None):
+    """Reorder project slots inside the body only. See shuffle_projects."""
+    if not body or not body.strip():
+        return body
+
+    blocks = re.split(r"\n\s*\n", body)
     slots, tags = [], []
     for i, b in enumerate(blocks):
         m = SLOT_HEADER.fullmatch(b.split("\n")[0].strip())
@@ -807,11 +897,67 @@ def shuffle_projects(text, seed, lead_out=None):
     return "\n\n".join(blocks)
 
 
+def shuffle_projects(text, seed, lead_out=None):
+    """Reorder the project blocks, the same way all day, differently each day.
+
+    X builds the link card from the first URL in the tweet. The standup lists
+    the projects in a stable order, so the same site was always first and the
+    card carried the same image every morning.
+
+    Seeded by the day on purpose: --preview renders this text hours before the
+    button is pressed, and a preview that does not match what gets posted is
+    not an approval of anything.
+
+    The title, the closing count, and the share_footer keep their place —
+    only project blocks in the body move.
+
+    `lead_out`, when given, receives the chosen hashtag under "tag". The caller
+    needs it to record the turn afterwards, and it cannot be read back out of
+    the finished text: for_x has replaced every hashtag with a name and a URL by
+    then, so the key would never match.
+
+    Nothing here may raise. This runs inside post_to_x, which catches nothing,
+    and the update offset is already advanced by the time it does — so an
+    exception would lose the press and the day. Any failure keeps the original
+    text, in its original order.
+    """
+    try:
+        head, body, tail = split_share_frame(text)
+        if not body:
+            return text
+        shuffled = _shuffle_body(body, seed, lead_out=lead_out)
+    except Exception as e:  # noqa: BLE001 - never lose the day
+        warn(f"shuffle failed, keeping original order: {e}")
+        return text
+    return _join_share_frame(head, shuffled, tail)
+
+
+def _rewrite_project_headers(body, projects):
+    """Swap project-header lines only — not inline tags, not header/footer."""
+    out = []
+    for line in body.split("\n"):
+        m = SLOT_HEADER.fullmatch(line.strip())
+        if not m:
+            out.append(line)
+            continue
+        project = projects.get(m.group(1))
+        site = (project or {}).get("website_url")
+        if not project or not site:
+            out.append(line)
+            continue
+        out.append(f"{project.get('name') or m.group(1)} — {site}")
+    return "\n".join(out)
+
+
 def for_x(text, seed, lead_out=None):
-    """Rewrite the hashtags as project names and links, for X.
+    """Rewrite project hashtags as names and links, for X.
 
     A hashtag is the attach mechanism on wip.co and nothing but text on X, where
     a row of them reads as spam. The name and the site say more.
+
+    Only project headers in the body are rewritten. share_header and share_footer
+    stay verbatim — including any hashtags they carry — so social tags at the
+    end of the post are not turned into project links.
 
     The names and URLs come from wip.co itself, at publish time, rather than a
     second list here that would drift from it — the same duplication that made
@@ -820,22 +966,26 @@ def for_x(text, seed, lead_out=None):
 
     If wip.co cannot be reached, the hashtags stay. A post that reads a little
     worse beats no post at all.
+
+    Nothing here may raise. Same contract as shuffle_projects: the update offset
+    is already advanced by the time this runs.
     """
-    text = shuffle_projects(text, seed, lead_out=lead_out)
+    try:
+        head, body, tail = split_share_frame(text)
+        if body:
+            body = _shuffle_body(body, seed, lead_out=lead_out)
+    except Exception as e:  # noqa: BLE001 - never lose the day
+        warn(f"for_x frame/shuffle failed, keeping original text: {e}")
+        return text
     try:
         projects = wip_projects()
     except Exception as e:  # noqa: BLE001 - never let this block a publish
         log(f"could not read wip.co projects, keeping the hashtags: {e}")
-        return text
+        return _join_share_frame(head, body, tail)
 
-    def swap(match):
-        project = projects.get(match.group(1))
-        site = (project or {}).get("website_url")
-        if not project or not site:
-            return match.group(0)
-        return f"{project.get('name') or match.group(1)} — {site}"
-
-    return HASHTAG.sub(swap, text)
+    if body:
+        body = _rewrite_project_headers(body, projects)
+    return _join_share_frame(head, body, tail)
 
 
 def post_to_x(text):
@@ -1200,6 +1350,33 @@ def _selftest_body():
     assert tg.splitlines()[0] == "*\U0001F4CB Daily Standup — 2026\\-09\\-09*", tg.splitlines()[0]
     assert "\\." in tg, "a full stop is reserved in MarkdownV2 and must be escaped"
 
+    # share_header need not begin with 📋 — title is the first non-empty line
+    # that is not a project hashtag.
+    custom_title = "Morning notes — 2026-09-24"
+    custom = f"{custom_title}\n\n#alpha\n{subject}"
+    tg_c = to_markdown_v2(custom)
+    assert tg_c.splitlines()[0] == f"*{escape_mdv2(custom_title)}*", tg_c.splitlines()[0]
+    stripped_c = strip_telegram_markup(f"*{custom_title}*\n\n*#alpha*\n{subject}")
+    assert stripped_c.splitlines()[0] == custom_title, stripped_c.splitlines()[0]
+    assert stripped_c.splitlines()[2] == "#alpha", stripped_c
+
+    # A share_header that is itself a lone #hashtag still composes: bold with
+    # the "#" escaped, and strip_telegram_markup leaves the hashtag intact.
+    hash_title = to_markdown_v2("#alpha\n• one")
+    assert hash_title.splitlines()[0] == "*\\#alpha*", hash_title.splitlines()[0]
+    assert strip_telegram_markup("*#alpha*\n• one").splitlines()[0] == "#alpha"
+
+    # --drop-title removes a prose title so the shell can prepend share_header,
+    # but leaves a leading project hashtag alone.
+    assert drop_leading_title("📋 *Daily Standup*\n\n*#beta*\n• one") == "*#beta*\n• one"
+    assert drop_leading_title("*#beta*\n• one") == "*#beta*\n• one"
+    assert drop_leading_title("#beta\n• one") == "#beta\n• one"
+    drop_cli = subprocess.run(
+        [sys.executable, __file__, "--drop-title"],
+        input="Wrong Title\n\n#beta\n• one", text=True, capture_output=True, check=True,
+    )
+    assert drop_cli.stdout == "#beta\n• one", drop_cli.stdout
+
     # Every reserved character, including a literal backslash. Four assertions
     # would not support "a commit subject can hold anything".
     for ch in "_*[]()~`>#+-=|{}.!\\":
@@ -1463,6 +1640,90 @@ def _selftest_body():
     assert rendered.endswith("2 projects"), rendered
     assert rendered.split("\n\n")[1] == f"*#{got['tag']}*\n\u2022 " + \
         ("one" if got["tag"] == "alpha" else "two"), rendered
+
+    # share_footer and share_header hashtags must not be rewritten for X — only
+    # project headers in the body. A footer that is a lone #tag matching a wip
+    # project still stays a hashtag.
+    _reset_rotation()
+    catalog = {
+        "alpha": {"hashtag": "alpha", "name": "Alpha", "website_url": "https://alpha.example"},
+        "beta": {"hashtag": "beta", "name": "Beta", "website_url": "https://beta.example"},
+        "foo": {"hashtag": "foo", "name": "Foo", "website_url": "https://foo.example"},
+    }
+    mod = sys.modules[__name__]
+    real_wip = mod.wip_projects
+    mod.wip_projects = lambda: catalog
+    try:
+        framed = (
+            "Building #inpublic — 2026-09-23\n\n"
+            "#alpha\n\u2022 one\n\n"
+            "1 projects\n\n"
+            "#buildinpublic #indiehackers"
+        )
+        x_text = for_x(framed, "2026-09-23")
+        assert x_text.startswith("Building #inpublic — 2026-09-23"), x_text
+        assert "Alpha — https://alpha.example" in x_text, x_text
+        assert "#buildinpublic #indiehackers" in x_text, x_text
+        assert "Indie" not in x_text and "#indiehackers" in x_text, x_text
+
+        lone = (
+            "\U0001F4CB Daily Standup\n\n"
+            "#alpha\n\u2022 one\n\n"
+            "1 projects\n\n"
+            "#foo"
+        )
+        x_lone = for_x(lone, "2026-09-24")
+        assert x_lone.rstrip().endswith("#foo"), x_lone
+        assert "Foo — https://foo.example" not in x_lone, x_lone
+        assert "Alpha — https://alpha.example" in x_lone, x_lone
+
+        # No trailer: a trailing lone hashtag is still footer, not a project.
+        no_trail = (
+            "\U0001F4CB Daily Standup\n\n"
+            "#alpha\n\u2022 one\n\n"
+            "#foo"
+        )
+        x_nt = for_x(no_trail, "2026-09-25")
+        assert x_nt.rstrip().endswith("#foo"), x_nt
+        assert "Foo —" not in x_nt, x_nt
+
+        # Inline hashtags in bullets stay put.
+        bullet = (
+            "\U0001F4CB Daily Standup\n\n"
+            "#alpha\n\u2022 fixed #foo in logs\n\n"
+            "1 projects"
+        )
+        x_b = for_x(bullet, "2026-09-26")
+        assert "fixed #foo in logs" in x_b, x_b
+        assert "Alpha — https://alpha.example" in x_b, x_b
+
+        # A share_header that is itself a lone #hashtag must stay a title —
+        # not become "Alpha — URL" on X.
+        tag_title = (
+            "#alpha\n\n"
+            "#beta\n\u2022 one\n\n"
+            "1 projects"
+        )
+        x_tt = for_x(tag_title, "2026-09-27")
+        assert x_tt.startswith("#alpha"), x_tt
+        assert "Alpha —" not in x_tt, x_tt
+        assert "Beta — https://beta.example" in x_tt, x_tt
+    finally:
+        mod.wip_projects = real_wip
+
+    # Footer survives the shuffle in place (after the trailer).
+    _reset_rotation()
+    with_foot = (
+        "\U0001F4CB Daily Standup\n\n"
+        "#alpha\n\u2022 one\n\n"
+        "#beta\n\u2022 two\n\n"
+        "2 projects\n\n"
+        "#buildinpublic #indiehackers"
+    )
+    shuf = shuffle_projects(with_foot, "2026-11-13")
+    assert shuf.startswith("\U0001F4CB Daily Standup"), shuf
+    assert shuf.endswith("#buildinpublic #indiehackers"), shuf
+    assert "2 projects" in shuf, shuf
 
     # Shapes that must not explode.
     _reset_rotation()
@@ -1761,6 +2022,12 @@ def main():
     # message arrives at all, which is the busy day fit_telegram exists for.
     if "--telegram-plain" in sys.argv:
         sys.stdout.write(fit_telegram(strip_telegram_markup(sys.stdin.read())))
+        return
+
+    # Drop a leading non-project title the formatter may have written. The shell
+    # prepends the configured share_header afterwards.
+    if "--drop-title" in sys.argv:
+        sys.stdout.write(drop_leading_title(sys.stdin.read()))
         return
 
     if "--selftest" in sys.argv:

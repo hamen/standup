@@ -53,6 +53,20 @@ echo '{"ok":true,"result":{"message_id":1,"chat":{"id":1}}}'
 SH
 chmod +x "$TMP/stub/curl"
 
+# GNU timeout is what the morning run wraps the formatter with. env -i on macOS
+# has none on PATH, so without a stub every formatter call fails instantly and
+# the suite only ever exercises the raw fallback.
+cat > "$TMP/stub/timeout" <<'SH'
+#!/usr/bin/env bash
+shift
+exec "$@"
+SH
+chmod +x "$TMP/stub/timeout"
+
+# Real ruby still handles -ryaml / -e for share_* loading. Captured before PATH
+# is narrowed by env -i in run().
+REAL_RUBY="$(command -v ruby)"
+
 # As above, but with the locale and the Python UTF-8 variables removed — the
 # environment cron actually provides. The script is supposed to supply those
 # itself; nothing else here proves it does.
@@ -107,8 +121,14 @@ echo "$out" | grep -q 'Test message sent' ||
 
 # --- 2. The whole report path, with the underscore that caused all this ----
 # Stub ruby and claude so the script reaches its real send with known text.
-cat > "$TMP/stub/ruby" <<'SH'
+# Real ruby still handles -ryaml / -e: daily-standup.sh loads share_* that way,
+# and a stub that answers every ruby call with a standup body makes `eval`
+# try to run "•" as a command.
+cat > "$TMP/stub/ruby" <<SH
 #!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
 printf '#alpha\n• Build config: dart_defines from production.env\n'
 SH
 cat > "$TMP/stub/claude" <<'SH'
@@ -473,6 +493,135 @@ out=$(CLAUDE_BIN= run "$TMP/empty.log" --check)
 rm -f "$TMP/fakehome/.zshrc"
 echo "$out" | grep -q 'claude:.*/profile/wins/claude' &&
   failures+=("an empty CLAUDE_BIN on the cron line did not clear the profile export")
+
+# --- 12. share_header from config is the only title after strip -----------
+# A share_header that is itself a #hashtag used to be prepended BEFORE
+# strip-private and then dropped as an empty project. Prepend after strip.
+printf 'projects_root: %s\nshare_header: "#alpha"\n' "$TMP/projects" > "$WORK/standup.yml"
+
+# Raw standup must name the same projects the formatter emits, or
+# --repair-headers falls back to raw and the assertions below never see them.
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#beta\n• one\n'
+SH
+chmod +x "$TMP/stub/ruby"
+
+# 12a. Formatter wrote no title — body starts with a project.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#beta*\n• one\n'
+SH
+chmod +x "$TMP/stub/claude"
+out=$(run "$TMP/share-no-title.log")
+first=$(call "$TMP/share-no-title.log" 1)
+echo "$first" | grep -q 'text=\*\\#alpha\*' ||
+  failures+=("share_header #alpha did not lead Telegram when the formatter omitted a title: $first")
+echo "$first" | grep -q '\\#beta' ||
+  failures+=("project #beta was lost when share_header was prepended")
+
+# 12b. Formatter wrote the old default title — must be dropped, not stacked.
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '📋 *Daily Standup*\n\n*#beta*\n• one\n'
+SH
+chmod +x "$TMP/stub/claude"
+out=$(run "$TMP/share-wrong-title.log")
+first=$(call "$TMP/share-wrong-title.log" 1)
+echo "$first" | grep -q 'Daily Standup' &&
+  failures+=("LLM title survived after share_header enforce: $first")
+echo "$first" | grep -q 'text=\*\\#alpha\*' ||
+  failures+=("share_header #alpha did not replace the LLM title: $first")
+
+# 12c. Formatter started with a project line — still prepend config header.
+# The header differs from the project, or a match on the project alone would
+# pass with no header at all.
+printf 'projects_root: %s\nshare_header: "#gamma"\n' "$TMP/projects" > "$WORK/standup.yml"
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• one\n'
+SH
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• one\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+out=$(run "$TMP/share-hash-project.log")
+first=$(call "$TMP/share-hash-project.log" 1)
+echo "$first" | grep -q 'text=\*\\#gamma\*' ||
+  failures+=("share_header #gamma missing when body already started with *#alpha*: $first")
+echo "$first" | grep -qx '\*\\#alpha\*' ||
+  failures+=("project #alpha lost under share_header #gamma: $first")
+
+# 12d. A failed --drop-title keeps the filtered report instead of sending
+# only the header under live buttons.
+REAL_PYTHON="$(command -v python3)"
+cat > "$TMP/stub/python3" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" --drop-title "*) exit 1 ;;
+esac
+exec "$REAL_PYTHON" "\$@"
+SH
+chmod +x "$TMP/stub/python3"
+out=$(run "$TMP/drop-fail.log")
+rm -f "$TMP/stub/python3"
+first=$(call "$TMP/drop-fail.log" 1)
+echo "$first" | grep -qx '\*\\#alpha\*' ||
+  failures+=("a failed --drop-title emptied the report: $first")
+echo "$first" | grep -q '• one' ||
+  failures+=("a failed --drop-title lost the bullet: $first")
+echo "$out" | grep -q -- '--drop-title failed' ||
+  failures+=("a failed --drop-title was not logged: $out")
+
+# 12e. No share_header: the default title, with {date} filled in, leads.
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+today_esc=$(date '+%Y-%m-%d' | sed 's/-/\\-/g')
+out=$(run "$TMP/share-default.log")
+call "$TMP/share-default.log" 1 | grep -qxF "text=*📋 Daily Standup — ${today_esc}*" ||
+  failures+=("default share_header did not lead Telegram: $(call "$TMP/share-default.log" 1)")
+
+# 12f. An empty share_header means the default, not a blank title.
+printf 'projects_root: %s\nshare_header: ""\n' "$TMP/projects" > "$WORK/standup.yml"
+out=$(run "$TMP/share-empty.log")
+call "$TMP/share-empty.log" 1 | grep -qxF "text=*📋 Daily Standup — ${today_esc}*" ||
+  failures+=("empty share_header did not fall back to the default: $(call "$TMP/share-empty.log" 1)")
+
+# 12g. share_footer closes the Telegram text and the text X and wip.co get.
+printf 'projects_root: %s\nshare_footer: "#buildinpublic"\n' "$TMP/projects" > "$WORK/standup.yml"
+rm -f "$TMP/fakehome"/.local/state/standup/pending-*.json
+out=$(run "$TMP/share-footer.log")
+tg_text=$(call "$TMP/share-footer.log" 1 | awk '/^text=/{on=1} /^--data-urlencode$/{if(on) exit} on')
+# A lone hashtag line is rendered bold like a project header; position is what counts.
+printf '%s\n' "$tg_text" | tail -n 1 | grep -qxE '\*?\\#buildinpublic\*?' ||
+  failures+=("share_footer is not the last Telegram line: $tg_text")
+[ -z "$(printf '%s\n' "$tg_text" | tail -n 2 | head -n 1)" ] ||
+  failures+=("share_footer is not preceded by a blank line: $tg_text")
+python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+text = json.load(open(sys.argv[1], encoding="utf-8"))["text"]
+assert text.endswith("\n\n#buildinpublic"), repr(text[-60:])
+PYEOF
+  failures+=("the pending state text does not end with share_footer")
+
+# Restore default yml and ruby stub for clarity.
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• Build config: dart_defines from production.env\n'
+SH
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
