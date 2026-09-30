@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 require 'date'
+require 'json'
 require 'open3'
 require 'yaml'
 require 'optparse'
@@ -60,8 +61,61 @@ def resolve_projects_root(cli_root:, config_root:, env_root:, verbose: false)
   root
 end
 
+# A repository with no mapping is published under a hashtag made from its
+# directory name. The bare name used to go out as it was, and the formatter,
+# told that every header is a hashtag, put a "#" in front of it: X ends a
+# hashtag at the first "-", so "app-promo-reel" went out as a link to "#app".
+# Lowercase ASCII letters and digits are the only shape every reader of the
+# header agrees on — X, wip.co, and the publisher's own header matching.
 def repo_display_name(repo_basename, repo_name_mapping)
-  (repo_name_mapping && repo_name_mapping[repo_basename]) || repo_basename
+  mapped = repo_name_mapping && repo_name_mapping[repo_basename]
+  return mapped if mapped
+
+  tag = repo_basename.downcase.gsub(/[^a-z0-9]/, '')
+  tag.empty? ? repo_basename : "##{tag}"
+end
+
+# A header the publisher can turn into "name — link" on X.
+SWAPPABLE_HEADER = /\A#([a-z0-9]+)\z/
+
+GITHUB_REMOTE = %r{\A(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)
+                   ([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\z}x
+
+# The public GitHub page of a repository, from its origin remote, or nil.
+#
+# Read with git config rather than git_capture: git_capture warns on stderr,
+# and stderr is part of what the publisher reads as the report. A remote that
+# is missing or elsewhere is a normal answer here, and says nothing.
+def github_url(repo_path)
+  out, _err, status = Open3.capture3('git', '-C', repo_path.to_s, 'config', '--get', 'remote.origin.url')
+  return nil unless status.success?
+
+  m = GITHUB_REMOTE.match(as_utf8(out).strip)
+  m && "https://github.com/#{m[1]}/#{m[2]}"
+rescue SystemCallError
+  nil
+end
+
+# The GitHub link for each reported header the publisher can swap, as JSON.
+#
+# Only a header that names exactly one reported repository gets one: two
+# repositories under one tag would publish a link to either. Nothing here may
+# stop the report — the links are a cosmetic fallback for X, and a report
+# without them is still the report — so every failure is silent, and the
+# publisher treats a missing file as no links at all.
+def write_links(path, reported)
+  counts = reported.map { |r| r[:header] }.tally
+  links = {}
+  reported.each do |r|
+    m = SWAPPABLE_HEADER.match(r[:header])
+    next unless m && counts[r[:header]] == 1
+
+    url = github_url(r[:path])
+    links[m[1]] = { 'name' => r[:name], 'url' => url } if url
+  end
+  File.write(path, JSON.generate(links))
+rescue StandardError
+  nil
 end
 
 # Bytes from outside this process, read as UTF-8 whatever the environment says.
@@ -244,6 +298,7 @@ def show_help
       --config PATH         Load config from PATH (YAML)
       --projects-root PATH  Root folder containing your git projects
       --verbose             Print extra debug output
+      --links-out PATH      Write the GitHub link of each reported project to PATH (JSON)
       --help                Show this help message
     
     Examples:
@@ -290,6 +345,7 @@ if __FILE__ == $0
     opts.on('--config PATH', 'Load config from PATH (YAML)') { |v| options[:config_path] = v }
     opts.on('--projects-root PATH', 'Root folder containing your git projects') { |v| options[:projects_root] = v }
     opts.on('--verbose', 'Print extra debug output') { options[:verbose] = true }
+    opts.on('--links-out PATH', 'Write the GitHub link of each reported project to PATH (JSON)') { |v| options[:links_out] = v }
     opts.on('--help', 'Show help') do
       show_help
       exit 0
@@ -336,6 +392,7 @@ if __FILE__ == $0
   repos = repos.reject { |repo| excluded.include?(File.basename(repo)) }
 
   any_activity = false
+  reported = []
 
   repos.each do |repo|
     commits = get_commits(repo, target_date)
@@ -346,6 +403,7 @@ if __FILE__ == $0
     any_activity = true
     repo_name = File.basename(repo)
     display_name = repo_display_name(repo_name, repo_name_mapping)
+    reported << { path: repo, name: repo_name, header: display_name }
 
     puts "#{display_name}\n"
 
@@ -363,5 +421,6 @@ if __FILE__ == $0
   end
 
   puts "No activity found for #{date_label.downcase}." unless any_activity
+  write_links(options[:links_out], reported) if options[:links_out]
 end
 
