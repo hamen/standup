@@ -761,9 +761,14 @@ def _standup_config():
     raise PrivateDomainError(f"no usable report config (looked in {home} and {repo})")
 
 
-def _parse_domains(value):
-    """Validate the decoded private_domains value. Anything odd raises."""
-    if value is None:
+def _parse_domains(present, value):
+    """Validate the decoded private_domains value. Anything odd raises.
+
+    Only an absent key is "no list". `private_domains:` with nothing after it,
+    or `~`, is null in YAML — a list somebody started and emptied by mistake —
+    and reading it as "no domains" would switch the filter off in silence.
+    """
+    if not present:
         return ()
     if not isinstance(value, list):
         raise PrivateDomainError(f"private_domains must be a list, not {type(value).__name__}")
@@ -781,14 +786,20 @@ def _parse_domains(value):
 def private_domains():
     """The configured private domains, lower-case. Raises PrivateDomainError."""
     path = _standup_config()
-    if path in _DOMAINS_CACHE:
-        return _DOMAINS_CACHE[path]
+    # Keyed on the file's mtime too: an edited list is read again, even by a
+    # process that already read the old one.
+    try:
+        key = (path, path.stat().st_mtime_ns)
+    except OSError as e:
+        raise PrivateDomainError(f"cannot stat {path}: {e}") from e
+    if key in _DOMAINS_CACHE:
+        return _DOMAINS_CACHE[key]
     # Ruby, because Python here is standard-library only and has no YAML, and
     # standup.rb already reads this file with Ruby's — so both read it the same.
     script = ('cfg = YAML.safe_load(File.read(ARGV[0], encoding: "UTF-8"), '
               'permitted_classes: [], permitted_symbols: [], aliases: true) || {}; '
               'abort "the config is not a mapping" unless cfg.is_a?(Hash); '
-              'puts JSON.generate(cfg.fetch("private_domains", nil))')
+              'puts JSON.generate([cfg.key?("private_domains"), cfg["private_domains"]])')
     try:
         result = subprocess.run([RUBY, "-ryaml", "-rjson", "-e", script, str(path)],
                                 capture_output=True, text=True, timeout=30)
@@ -798,20 +809,21 @@ def private_domains():
         raise PrivateDomainError(f"could not read private_domains from {path}: "
                                  f"{(result.stderr or result.stdout).strip()[:200]}")
     try:
-        value = json.loads(result.stdout)
+        present, value = json.loads(result.stdout)
     except ValueError as e:
         raise PrivateDomainError(f"unreadable private_domains from {path}: {e}") from e
-    _DOMAINS_CACHE[path] = _parse_domains(value)
-    return _DOMAINS_CACHE[path]
+    _DOMAINS_CACHE[key] = _parse_domains(present, value)
+    return _DOMAINS_CACHE[key]
 
 
 def _domain_patterns(domains):
-    # The apex or any subdomain, as a whole hostname. The lookbehind keeps
-    # "notexample.org" out; the lookahead keeps "example.org.other.net" out,
-    # while still matching "example.org." at the end of a sentence. ASCII
-    # labels only: a commit naming a host writes it the way it is typed, and an
-    # IDN subdomain under a listed ASCII domain is still caught at the domain.
-    return [re.compile(r"(?i)(?<![A-Za-z0-9.-])(?:[A-Za-z0-9-]+\.)*" + re.escape(d)
+    # The domain itself, preceded by a dot (any subdomain, whatever its labels
+    # are made of: my_app.example.org, münchen.example.org) or by something
+    # that cannot be part of a hostname. A letter, digit, "-" or "_" right
+    # before it makes it another name ("notexample.org"), so that is kept. The
+    # lookahead keeps "example.org.other.net" out, while still matching
+    # "example.org." at the end of a sentence.
+    return [re.compile(r"(?i)(?<![A-Za-z0-9_-])" + re.escape(d)
                        + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])") for d in domains]
 
 
@@ -1458,9 +1470,10 @@ def _selftest_private_domains(config):
     # ---- matcher ----
     hit = ("example.org", "grab.example.org", "Grab.Example.ORG",
            "https://a.b.example.org/path?q=1", "see example.org.", "(sub.example.org)",
-           "user@mail.example.org", "http://example.org:8443/x")
+           "user@mail.example.org", "http://example.org:8443/x",
+           "my_app.example.org", "m\u00fcnchen.example.org", "a.b_c.d.example.org")
     kept = ("notexample.org", "example.org.other.net", "exampleXorg", "example.orgs",
-            "example.com", "an example of org")
+            "example.com", "an example of org", "my-example.org", "my_example.org")
     for text in hit:
         assert names_private_domain(text), text
     for text in kept:
@@ -1486,6 +1499,8 @@ def _selftest_private_domains(config):
                 "private_domains:\n  - 'not a host'\n",
                 "private_domains:\n  - org\n",              # a bare word
                 "private_domains:\n  - 12\n",
+                "private_domains:\n",                        # null: emptied by mistake
+                "private_domains: ~\n",
                 "private_domains: [unclosed\n",              # not YAML
                 "- just\n- a list\n"):                       # not a mapping
         try:
@@ -1578,8 +1593,7 @@ def _selftest_private_domains(config):
         "links": {}}), encoding="utf-8")
     child = subprocess.run([sys.executable, __file__, "--preview", "2027-02-02"],
                            capture_output=True, text=True, timeout=60,
-                           env=dict(os.environ, STANDUP_STATE_DIR=str(STATE_DIR),
-                                    STANDUP_CONFIG_DIR=str(tmp / "noconfig")))
+                           env=dict(os.environ, STANDUP_STATE_DIR=str(STATE_DIR)))
     assert child.returncode == 4 and child.stdout == "", (child.returncode, child.stdout)
     (STATE_DIR / "pending-2027-02-02.json").unlink()
 
