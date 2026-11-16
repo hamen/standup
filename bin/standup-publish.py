@@ -175,6 +175,51 @@ def warn_conflict(token):
         log(f"could not send the conflict warning: {e}")
 
 
+def updates_inbox():
+    """The folder a shared bot's reader writes our button presses to, or None.
+
+    Telegram hands each bot's updates to one getUpdates reader only. When the
+    standup shares a bot with a process that already reads it (video-digest
+    on the social bot), that process writes each `publish:` press to this
+    folder, one `<update_id>.json` per press, and this script must not call
+    getUpdates at all: a second reader gets 409 and steals the other's
+    messages. Set as TELEGRAM_UPDATES_INBOX in telegram.env.
+    """
+    found = optional_env(TELEGRAM_ENVS[0], "TELEGRAM_UPDATES_INBOX")
+    return pathlib.Path(found["TELEGRAM_UPDATES_INBOX"]).expanduser() if found else None
+
+
+def drain_inbox(inbox):
+    """Every press in the inbox, oldest first, removed as it is read.
+
+    Removed before it is handled, the same as the getUpdates offset is
+    advanced before: a crash half-way through loses a press, which is seen
+    and pressed again, rather than posting a day twice. A file that cannot be
+    parsed is set aside, not retried on every tick. `.partial` files are a
+    write still in progress and are left alone.
+    """
+    if not inbox.is_dir():
+        return []
+    updates = []
+    for path in inbox.glob("*.json"):
+        try:
+            update = json.loads(path.read_text(encoding="utf-8"))
+            int(update["update_id"])
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            warn(f"unreadable press {path.name}, set aside: {e}")
+            try:
+                path.rename(path.with_name(path.name + ".bad"))
+            except OSError:
+                pass
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue  # another run took it first
+        updates.append(update)
+    return sorted(updates, key=lambda u: int(u["update_id"]))
+
+
 def ack(token, callback_query_id, text):
     """The little toast on the button. Cosmetic, and allowed to fail.
 
@@ -2784,7 +2829,57 @@ def _selftest_body():
     assert child.returncode == 0, child.stderr[:200]
     assert child.stdout.split("\0") == projects + [frame], child.stdout
 
+    _selftest_inbox()
+
     print("selftest ok")
+
+
+def _selftest_inbox():
+    """A shared bot: presses come from a folder, and getUpdates is never called."""
+    global TELEGRAM_ENVS, telegram, STATE_DIR
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="standup-inbox-"))
+    saved = (TELEGRAM_ENVS, telegram, STATE_DIR, sys.argv)
+    try:
+        env = tmp / "telegram.env"
+        inbox = tmp / "inbox"
+        env.write_text("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+        TELEGRAM_ENVS = [env]
+        assert updates_inbox() is None, "no key, no inbox"
+        env.write_text(f"TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\nTELEGRAM_UPDATES_INBOX={inbox}\n")
+        assert updates_inbox() == inbox, updates_inbox()
+
+        assert drain_inbox(inbox) == [], "a missing folder is no presses"
+        inbox.mkdir()
+        for uid in (12, 3):
+            (inbox / f"{uid}.json").write_text(json.dumps(
+                {"update_id": uid, "callback_query": {"id": f"cb{uid}", "data": "publish:2000-01-01:x"}}))
+        (inbox / "9.json.partial").write_text("{")
+        (inbox / "bad.json").write_text("not json")
+        got = drain_inbox(inbox)
+        assert [u["update_id"] for u in got] == [3, 12], got
+        left = sorted(p.name for p in inbox.iterdir())
+        assert left == ["9.json.partial", "bad.json.bad"], left
+
+        # main(): nothing pending, one press waiting. It is answered from the
+        # folder, and the bot is never polled.
+        calls = []
+
+        def fake(token, method, **params):
+            calls.append(method)
+            return []
+        telegram = fake
+        STATE_DIR = tmp / "state"
+        STATE_DIR.mkdir()
+        (inbox / "20.json").write_text(json.dumps(
+            {"update_id": 20, "callback_query": {"id": "cb20", "data": "publish:2000-01-01:x"}}))
+        sys.argv = [__file__]
+        main()
+        assert "getUpdates" not in calls, calls
+        assert calls == ["answerCallbackQuery"], calls
+        assert not (inbox / "20.json").exists(), "a handled press must leave the inbox"
+    finally:
+        TELEGRAM_ENVS, telegram, STATE_DIR, sys.argv = saved
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -2898,20 +2993,26 @@ def main():
         return
 
     token = read_env(TELEGRAM_ENVS, "TELEGRAM_BOT_TOKEN")
+    inbox = updates_inbox()
 
     states = {s.get("id"): (p, s) for p, s in pending_states()}
-    if not states:
+    if inbox is not None:
+        # A shared bot: its one reader writes our presses here. Drained even
+        # with nothing pending, so a press on a finished day is answered and
+        # gone rather than kept for ever.
+        updates = drain_inbox(inbox)
+    elif not states:
         return  # nothing waiting; say nothing, this runs every few minutes
+    else:
+        offset = 0
+        if OFFSET_FILE.exists():
+            offset = int(OFFSET_FILE.read_text().strip() or 0)
 
-    offset = 0
-    if OFFSET_FILE.exists():
-        offset = int(OFFSET_FILE.read_text().strip() or 0)
-
-    updates = telegram(token, "getUpdates", offset=offset, timeout=0,
-                       allowed_updates=json.dumps(["callback_query"]))
-    if updates:
-        OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        OFFSET_FILE.write_text(str(updates[-1]["update_id"] + 1))
+        updates = telegram(token, "getUpdates", offset=offset, timeout=0,
+                           allowed_updates=json.dumps(["callback_query"]))
+        if updates:
+            OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            OFFSET_FILE.write_text(str(updates[-1]["update_id"] + 1))
 
     for update in updates:
         cb = update.get("callback_query")
