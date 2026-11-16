@@ -541,6 +541,10 @@ if [ "$_cfg_rc" -ne 0 ]; then
   exit 1
 fi
 unset _CONFIG_FROM_ENV _cfg_rc
+# Exported so every standup-publish.py call below reads private_domains from
+# this same file. The button poller resolves it again on its own, with the same
+# rules, and refuses to post when it cannot.
+export STANDUP_CONFIG
 # Every run: which file is in force. Easy to miss when STANDUP_CONFIG points at
 # home and the clone's standup.yml has different exclude_repos.
 echo "using config: $STANDUP_CONFIG"
@@ -714,6 +718,17 @@ Niente da pubblicare: ogni riga era di sicurezza. Nessun report inviato."
 Il report non contiene nessun progetto: la formattazione è fallita a monte. Non ho inviato niente. Controlla il log."
     exit 1
     ;;
+  4)
+    # private_domains in the config could not be read. Without the list the
+    # filter cannot tell a home server's address from prose, so nothing goes.
+    echo "[$TODAY] The private-domain list could not be read; nothing sent."
+    disarm_today
+    # Not $SHARE_HEADER: with no list, nothing says the header is clean.
+    send_telegram "⚠️ Daily standup $TODAY
+
+Non riesco a leggere private_domains dalla config. Non ho inviato niente. Controlla il log."
+    exit 1
+    ;;
   *)
     echo "[$TODAY] The private-line filter itself failed; nothing sent."
     disarm_today
@@ -745,6 +760,20 @@ if [ -n "$SHARE_FOOTER" ]; then
   ANALYSIS="${ANALYSIS}
 
 ${SHARE_FOOTER}"
+fi
+
+# share_header and share_footer joined the text after strip-private, so they
+# were never filtered. This is the last check on everything the morning
+# message, and later the buttons, will carry. It fails closed: any non-zero
+# exit — a private domain, an unreadable list, a crash — sends nothing.
+if ! printf '%s' "$ANALYSIS" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --assert-public; then
+  echo "[$TODAY] The report names a private domain (or the list is unreadable); nothing sent."
+  disarm_today
+  # Not $SHARE_HEADER: it may be the very line that names the domain.
+  send_telegram "⚠️ Daily standup $TODAY
+
+Il report nomina un dominio privato (forse in share_header o share_footer), o la lista non si legge. Non ho inviato niente. Controlla il log."
+  exit 1
 fi
 
 # ---- Send to Telegram, with the button that publishes it ----

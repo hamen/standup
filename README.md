@@ -225,6 +225,16 @@ only if one has that tag. The hyphen goes because X ends a hashtag at the first
 Keep private work out with `exclude_repos` before you publish anywhere. A
 repository name is a small thing to leak and an awkward one to take back.
 
+Keep your own hosts out with `private_domains`. A commit such as "put the tool
+behind an access gate on tools.example.org" tells a stranger where to knock.
+Every line that names a listed domain or any of its subdomains is dropped, a
+project whose header names one is dropped whole, and a website on one is never
+linked on X. Each send — the morning message, the X preview, X, wip.co,
+LinkedIn — checks the final text once more and refuses if a listed domain is in
+it. The button poller reads the list from the same config file itself, so it
+must find that file (see `STANDUP_CONFIG`); if it cannot, or the list is
+malformed, nothing is sent.
+
 ### Framing the shared post
 
 `share_header` and `share_footer` frame the message on every destination. On X,

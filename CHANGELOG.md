@@ -26,6 +26,16 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **`private_domains`: hosts the standup never names.** A list in the report
+  config. Lines that name a listed domain or a subdomain of it are dropped by
+  the private-line filter, a project header that names one drops its project,
+  and a wip.co website on one is not linked on X. The morning message
+  (`--assert-public`, after `share_header` and `share_footer`), the X preview,
+  and the X, wip.co and LinkedIn posts each refuse a text that still names one.
+  The list is read from the config by every process, the button poller
+  included; a missing, ambiguous or malformed config fails closed (new
+  `--strip-private` exit code 4).
+
 - **`repo_name_mapping` values may be plain titles.** A value such as
   `"My Food Mate - myfoodmate.net"` is now a project header, not only a
   `#hashtag`. `daily-standup.sh` exports the headers `standup.rb` printed as

@@ -1004,6 +1004,65 @@ set -e
 [ "$rc" -eq 0 ] && [ "$got" = '{}' ] ||
   failures+=("--public-links on a missing file did not print {} and exit 0 ($rc): $got")
 
+# --- 18. Private domains never reach the wire ------------------------------
+# Everything curl was handed, every call, is searched: the morning message, the
+# X preview reply and any alarm. A private domain in any of them is the leak.
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• Build config: dart_defines from production.env\n\n#beta\n• Published the tool on grab.example.org\n'
+SH
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• Build config: dart_defines from production.env\n\n*#beta*\n• Published the tool on grab.example.org\n\n2 projects\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+private_cfg() { # private_cfg <file> <extra yaml>
+  printf 'projects_root: %s\n%s' "$TMP/projects" "$2" > "$1"
+}
+
+# 18a. A bullet naming the domain is dropped; the rest goes out with buttons.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\n'
+export STANDUP_CONFIG="$TMP/private.yml"
+set +e; out=$(run "$TMP/private.log"); rc=$?; set -e
+grep -qi 'example\.org' "$TMP/private.log" &&
+  failures+=("a private domain reached Telegram")
+call "$TMP/private.log" 1 | grep -q 'inline_keyboard' ||
+  failures+=("the filtered report did not go out with its buttons ($rc): $out")
+call "$TMP/private.log" 1 | grep -q 'dart' ||
+  failures+=("the clean project was lost with the private one")
+grep -qi 'example\.org' "$TMP"/fakehome/.local/state/standup/pending-*.json 2>/dev/null &&
+  failures+=("the pending state holds a private domain; the buttons would publish it")
+
+# 18b. share_footer joins after the filter; the last check must catch it.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\nshare_footer: "more at grab.example.org"\n'
+set +e; out=$(run "$TMP/footer.log"); rc=$?; set -e
+[ "$rc" -ne 0 ] || failures+=("a footer naming a private domain was not refused")
+grep -qi 'example\.org' "$TMP/footer.log" &&
+  failures+=("a footer naming a private domain reached Telegram")
+grep -q 'inline_keyboard' "$TMP/footer.log" &&
+  failures+=("a refused report still went out with buttons")
+grep -q 'dominio privato' "$TMP/footer.log" ||
+  failures+=("the refusal was not reported on Telegram: $out")
+ls "$TMP"/fakehome/.local/state/standup/pending-*.json >/dev/null 2>&1 &&
+  failures+=("a refused report left a pending state behind")
+
+# 18c. A list that is not a list: nothing sent, and it says why.
+private_cfg "$TMP/private.yml" $'private_domains: example.org\n'
+set +e; out=$(run "$TMP/badlist.log"); rc=$?; set -e
+[ "$rc" -ne 0 ] || failures+=("a malformed private_domains was not refused")
+grep -q 'inline_keyboard' "$TMP/badlist.log" &&
+  failures+=("a malformed private_domains still sent the report")
+# Escaped for MarkdownV2 on the wire (private\_domains), so match around it.
+grep -q 'Non riesco a leggere private' "$TMP/badlist.log" ||
+  failures+=("the malformed list was not reported on Telegram: $out")
+unset STANDUP_CONFIG
+
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else
