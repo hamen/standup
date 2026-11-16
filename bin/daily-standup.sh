@@ -786,11 +786,36 @@ else
   KEYBOARD="{\"inline_keyboard\":[${ROW1},[{\"text\":\"🚀 Entrambi\",\"callback_data\":\"publish:${PENDING_ID}:both\"}]]}"
 fi
 
+# One message per project, then the frame with the buttons. Reading only: the
+# state file below still holds the whole ANALYSIS, and that one text is what X,
+# wip.co and LinkedIn receive. A day too small to split, or a splitter that
+# fails, sends the single message it always did — and if any project message is
+# rejected, the button message carries the whole report again, so no project is
+# ever missing from the chat.
+BUTTON_TEXT="$ANALYSIS"
+PIECES=()
+mapfile -d '' -t PIECES < <(printf '%s' "$ANALYSIS" \
+  | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --split-messages 2>/dev/null) || PIECES=()
+if [ "${#PIECES[@]}" -gt 1 ]; then
+  SPLIT_OK=1
+  for ((i = 0; i < ${#PIECES[@]} - 1; i++)); do
+    # Telegram allows about one message per second in one chat.
+    [ "$i" -gt 0 ] && sleep 1
+    send_telegram "${PIECES[$i]}" || SPLIT_OK=0
+  done
+  sleep 1
+  if [ "$SPLIT_OK" = 1 ]; then
+    BUTTON_TEXT="${PIECES[${#PIECES[@]}-1]}"
+  else
+    echo "  A project message was rejected; the button message carries the whole report"
+  fi
+fi
+
 # The state file keeps ANALYSIS unescaped — that text is what X and wip.co
 # receive when the button is pressed, and backslashes are not prose. Only what
 # Telegram sees is escaped.
 RESP=""
-if ESCAPED=$(telegram_markdown "$ANALYSIS") && [ -n "$ESCAPED" ]; then
+if ESCAPED=$(telegram_markdown "$BUTTON_TEXT") && [ -n "$ESCAPED" ]; then
   RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
     --data-urlencode "text=${ESCAPED}" \
@@ -808,7 +833,7 @@ if ! echo "$RESP" | grep -q '"ok":true'; then
   [ -n "$RESP" ] && echo "  Telegram MarkdownV2 send failed: $RESP"
   RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
-    --data-urlencode "text=$(telegram_plain "$ANALYSIS")" \
+    --data-urlencode "text=$(telegram_plain "$BUTTON_TEXT")" \
     --data-urlencode "reply_markup=${KEYBOARD}") || RESP=""
 fi
 

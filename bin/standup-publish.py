@@ -902,6 +902,27 @@ def split_share_frame(text):
     return join(head), join(rest[i:]), join(tail)
 
 
+def split_messages(text):
+    """The report as Telegram messages: one per project, then the frame.
+
+    Returns (projects, frame). `projects` is every blank-line block of the
+    body, in order; `frame` is the head and tail joined — the share_header,
+    the "N projects" trailer and the share_footer — which is the message that
+    carries the publish buttons. Reading only: what X, wip.co and LinkedIn
+    receive is still the whole report, stored unsplit in the state file.
+
+    Fewer than two projects is not worth splitting, and neither is a report
+    with no frame to hang the buttons on: both come back as ([], text), which
+    the caller sends as the single message it always was.
+    """
+    head, body, tail = split_share_frame(text)
+    projects = [b for b in re.split(r"\n\s*\n", body) if b.strip()] if body else []
+    frame = _join_share_frame(head, "", tail)
+    if len(projects) < 2 or not frame.strip():
+        return [], text
+    return projects, frame
+
+
 def _join_share_frame(head, body, tail):
     return "\n\n".join(p for p in (head, body, tail) if p)
 
@@ -2296,6 +2317,21 @@ def _selftest_body():
         body = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
         assert gone not in stripped(body), gone
 
+    # The morning messages: one per project, the frame last, nothing lost.
+    report = ("\U0001F4CB Daily Standup — 2026-11-16\n\n*#alpha*\n• one\n\n"
+              "*#beta*\n• two\n• three\n\n2 projects.\n\n#buildinpublic")
+    projects, frame = split_messages(report)
+    assert projects == ["*#alpha*\n• one", "*#beta*\n• two\n• three"], projects
+    assert frame == "\U0001F4CB Daily Standup — 2026-11-16\n\n2 projects.\n\n#buildinpublic", frame
+    # One project is not worth splitting: the single message it always was.
+    one = "\U0001F4CB T\n\n*#alpha*\n• one\n\n1 project."
+    assert split_messages(one) == ([], one), split_messages(one)
+    # The CLI form: NUL-separated, frame last.
+    child = subprocess.run([sys.executable, __file__, "--split-messages"], input=report,
+                           capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0, child.stderr[:200]
+    assert child.stdout.split("\0") == projects + [frame], child.stdout
+
     print("selftest ok")
 
 
@@ -2340,6 +2376,15 @@ def main():
     # prepends the configured share_header afterwards.
     if "--drop-title" in sys.argv:
         sys.stdout.write(drop_leading_title(sys.stdin.read()))
+        return
+
+    # The report cut into the morning's Telegram messages, NUL-separated so a
+    # block's own newlines survive: every project block first, the frame (the
+    # message that carries the buttons) last. A report not worth splitting
+    # comes back as one piece.
+    if "--split-messages" in sys.argv:
+        projects, frame = split_messages(sys.stdin.read())
+        sys.stdout.write("\0".join(projects + [frame]))
         return
 
     if "--selftest" in sys.argv:
