@@ -44,6 +44,13 @@ if [ -n "${REJECT_PREVIEW:-}" ] && printf '%s\n' "$@" | grep -q reply_to_message
   echo '{"ok":false,"description":"Bad Request: message to reply not found"}'
   exit 0
 fi
+# Every send of one project, both the MarkdownV2 try and the plain retry, but
+# never the message with the buttons: how a rejected project message looks.
+if [ -n "${REJECT_PROJECT:-}" ] && printf '%s\n' "$@" | grep -qF -- "$REJECT_PROJECT" \
+   && ! printf '%s\n' "$@" | grep -q -e inline_keyboard -e reply_to_message_id; then
+  echo '{"ok":false,"description":"Bad Request: stubbed project rejection"}'
+  exit 0
+fi
 # Accepted, but not the shape the script expects. This is what killed it.
 if [ -n "${OK_BUT_ODD:-}" ]; then
   echo '{"ok":true,"result":{"chat":{"id":1}}}'
@@ -102,6 +109,7 @@ run() { # run <log> <args...>
       LC_ALL=C.UTF-8 PYTHONUTF8=1 PYTHONIOENCODING=utf-8 \
       ${FAIL_FIRST:+FAIL_FIRST=1} ${OK_BUT_ODD:+OK_BUT_ODD=1} ${FAIL_LAST:+FAIL_LAST=1} \
       ${REJECT_PREVIEW:+REJECT_PREVIEW=1} ${TMPDIR:+TMPDIR=$TMPDIR} \
+      ${REJECT_PROJECT:+REJECT_PROJECT=$REJECT_PROJECT} \
       ${CLAUDE_BIN+CLAUDE_BIN=$CLAUDE_BIN} \
       ${STANDUP_CONFIG+STANDUP_CONFIG=$STANDUP_CONFIG} \
       ${STANDUP_FORMATTER+STANDUP_FORMATTER=$STANDUP_FORMATTER} \
@@ -845,7 +853,9 @@ out=$(run "$TMP/plain-first.log")
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || failures+=("plain mapping title as first project exited $rc: $out")
-first=$(call "$TMP/plain-first.log" 1)
+# Two projects, so three messages: each project, then the header with the
+# buttons. Read them all; the X preview reply is not among them.
+first=$(cat "$TMP/plain-first.log" | grep -v '^reply_to_message_id')
 echo "$first" | grep -q 'Daily Standup' ||
   failures+=("default share_header missing above a plain first project: $first")
 echo "$first" | grep -q 'My Food Mate' ||
@@ -1004,7 +1014,101 @@ set -e
 [ "$rc" -eq 0 ] && [ "$got" = '{}' ] ||
   failures+=("--public-links on a missing file did not print {} and exit 0 ($rc): $got")
 
-# --- 18. Private domains never reach the wire ------------------------------
+# --- 18. One message per project, the buttons on the frame -----------------
+# Reading only: the chat gets #alpha and #beta as separate messages, then the
+# header and the trailer with the buttons. The state file — what X, wip.co and
+# LinkedIn receive — still holds the whole report.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf 'projects_root: %s\n' "$TMP/projects" > "$WORK/standup.yml"
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• one\n\n#beta\n• two\n'
+SH
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• one\n\n*#beta*\n• two\n\n2 projects.\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+out=$(run "$TMP/split.log")
+c1=$(call "$TMP/split.log" 1); c2=$(call "$TMP/split.log" 2); c3=$(call "$TMP/split.log" 3)
+echo "$c1" | grep -q '\\#alpha' && ! echo "$c1" | grep -q '\\#beta' ||
+  failures+=("the first message is not #alpha alone: $c1")
+echo "$c2" | grep -q '\\#beta' && ! echo "$c2" | grep -q '\\#alpha' ||
+  failures+=("the second message is not #beta alone: $c2")
+echo "$c1$c2" | grep -q 'inline_keyboard' &&
+  failures+=("a project message carries the publish buttons")
+echo "$c3" | grep -q 'inline_keyboard' && echo "$c3" | grep -q 'Daily Standup' &&
+  echo "$c3" | grep -q '2 projects' && ! echo "$c3" | grep -q '\\#alpha' ||
+  failures+=("the button message is not the header and trailer alone: $c3")
+python3 - "$TMP"/fakehome/.local/state/standup/pending-*.json <<'PYEOF' ||
+import json, sys
+text = json.load(open(sys.argv[1], encoding="utf-8"))["text"]
+assert "#alpha" in text and "#beta" in text and "2 projects" in text, text
+PYEOF
+  failures+=("the state file no longer holds the whole report")
+
+# 18b. A rejected project message rides on the button message — only it, so
+# a long report cannot push it past Telegram's limit.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+set +e
+out=$(REJECT_PROJECT=alpha run "$TMP/split-fail.log")
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || failures+=("a rejected project message failed the run ($rc): $out")
+grep -q 'rides on the button message' <<<"$out" ||
+  failures+=("a rejected project message was not reported: $out")
+last=$(awk '/^--- end of call ---$/{n++} END{print n}' "$TMP/split-fail.log")
+# The last call is the X preview reply; the one before it holds the buttons.
+btn=$(call "$TMP/split-fail.log" $((last - 1)))
+echo "$btn" | grep -q 'inline_keyboard' && echo "$btn" | grep -q '\\#alpha' &&
+  ! echo "$btn" | grep -q '\\#beta' && echo "$btn" | grep -q '2 projects' ||
+  failures+=("the button message is not the rejected project plus the frame: $btn")
+
+# 18c. A splitter that dies: one message, as before, with the whole report.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+mv "$WORK/bin/standup-publish.py" "$WORK/bin/real-publish.py"
+cat > "$WORK/bin/standup-publish.py" <<'PY'
+import os, sys
+if "--split-messages" in sys.argv:
+    sys.stdout.write("#alpha\n- partial\0")
+    sys.exit(1)
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "real-publish.py")
+os.execv(sys.executable, [sys.executable, real] + sys.argv[1:])
+PY
+out=$(run "$TMP/split-crash.log")
+mv "$WORK/bin/real-publish.py" "$WORK/bin/standup-publish.py"
+c1=$(call "$TMP/split-crash.log" 1)
+echo "$c1" | grep -q 'inline_keyboard' && echo "$c1" | grep -q '\\#alpha' &&
+  echo "$c1" | grep -q '\\#beta' ||
+  failures+=("a dead splitter did not leave the single message with buttons: $c1")
+grep -q 'Could not split' <<<"$out" ||
+  failures+=("a dead splitter was not reported: $out")
+
+# 18d. One project: the single message it always was.
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• one\n'
+SH
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• one\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+out=$(run "$TMP/split-one.log")
+c1=$(call "$TMP/split-one.log" 1)
+echo "$c1" | grep -q 'inline_keyboard' && echo "$c1" | grep -q '\\#alpha' ||
+  failures+=("a one-project day did not stay one message: $c1")
+
+# --- 19. Private domains never reach the wire ------------------------------
 # Everything curl was handed, every call, is searched: the morning message, the
 # X preview reply and any alarm. A private domain in any of them is the leak.
 cat > "$TMP/stub/ruby" <<SH
@@ -1024,21 +1128,21 @@ private_cfg() { # private_cfg <file> <extra yaml>
   printf 'projects_root: %s\n%s' "$TMP/projects" "$2" > "$1"
 }
 
-# 18a. A bullet naming the domain is dropped; the rest goes out with buttons.
+# 19a. A bullet naming the domain is dropped; the rest goes out with buttons.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
 private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\n'
 export STANDUP_CONFIG="$TMP/private.yml"
 set +e; out=$(run "$TMP/private.log"); rc=$?; set -e
 grep -qi 'example\.org' "$TMP/private.log" &&
   failures+=("a private domain reached Telegram")
-call "$TMP/private.log" 1 | grep -q 'inline_keyboard' ||
+grep -q 'inline_keyboard' "$TMP/private.log" ||
   failures+=("the filtered report did not go out with its buttons ($rc): $out")
-call "$TMP/private.log" 1 | grep -q 'dart' ||
+grep -q 'dart' "$TMP/private.log" ||
   failures+=("the clean project was lost with the private one")
 grep -qi 'example\.org' "$TMP"/fakehome/.local/state/standup/pending-*.json 2>/dev/null &&
   failures+=("the pending state holds a private domain; the buttons would publish it")
 
-# 18b. share_footer joins after the filter; the last check must catch it.
+# 19b. share_footer joins after the filter; the last check must catch it.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
 private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\nshare_footer: "more at grab.example.org"\n'
 set +e; out=$(run "$TMP/footer.log"); rc=$?; set -e
@@ -1052,7 +1156,7 @@ grep -q 'dominio privato' "$TMP/footer.log" ||
 ls "$TMP"/fakehome/.local/state/standup/pending-*.json >/dev/null 2>&1 &&
   failures+=("a refused report left a pending state behind")
 
-# 18c. A list that is not a list: nothing sent, and it says why.
+# 19c. A list that is not a list: nothing sent, and it says why.
 private_cfg "$TMP/private.yml" $'private_domains: example.org\n'
 set +e; out=$(run "$TMP/badlist.log"); rc=$?; set -e
 [ "$rc" -ne 0 ] || failures+=("a malformed private_domains was not refused")

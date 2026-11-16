@@ -1083,6 +1083,53 @@ def split_share_frame(text):
     return join(head), join(rest[i:]), join(tail)
 
 
+def split_messages(text):
+    """The report as Telegram messages: one per project, then the frame.
+
+    Returns (projects, frame). A project runs from a header line (_is_header:
+    a #hashtag or a known plain title) to the next one, blank lines included,
+    so a gap inside a project never cuts it. A header with nothing under it is
+    not a project: before the first real project it is the share_header, after
+    the last one it is the share_footer. The "N projects" trailer and all that
+    follows it is the tail. `frame` is head and tail — the message that carries
+    the publish buttons. Reading only: what X, wip.co and LinkedIn receive is
+    still the whole report, stored unsplit in the state file.
+
+    Fewer than two projects is not worth splitting, and neither is a report
+    with no frame to hang the buttons on: both come back as ([], text), which
+    the caller sends as the single message it always was.
+    """
+    segments, current, tail = [], [], []
+    lines = text.split("\n")
+    for n, line in enumerate(lines):
+        if TRAILER_LINE.fullmatch(line.strip()):
+            tail = lines[n:]
+            break
+        if _is_header(line):
+            segments.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    segments.append(current)
+
+    def real(seg):
+        return any(ln.strip() for ln in seg[1:])
+
+    head, rest = segments[0], segments[1:]
+    while rest and not real(rest[0]):
+        head = head + rest.pop(0)
+    trailing = []
+    while rest and not real(rest[-1]):
+        trailing = rest.pop() + trailing
+
+    projects = ["\n".join(seg).strip() for seg in rest]
+    frame = "\n\n".join(p for p in ("\n".join(head).strip(),
+                                    "\n".join(trailing + tail).strip()) if p)
+    if len(projects) < 2 or not frame:
+        return [], text
+    return projects, frame
+
+
 def _join_share_frame(head, body, tail):
     return "\n\n".join(p for p in (head, body, tail) if p)
 
@@ -2705,6 +2752,38 @@ def _selftest_body():
         body = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
         assert gone not in stripped(body), gone
 
+    # The morning messages: one per project, the frame last, nothing lost.
+    report = ("\U0001F4CB Daily Standup — 2026-11-16\n\n*#alpha*\n• one\n\n"
+              "*#beta*\n• two\n• three\n\n2 projects.\n\n#buildinpublic")
+    projects, frame = split_messages(report)
+    assert projects == ["*#alpha*\n• one", "*#beta*\n• two\n• three"], projects
+    assert frame == "\U0001F4CB Daily Standup — 2026-11-16\n\n2 projects.\n\n#buildinpublic", frame
+    # One project is not worth splitting: the single message it always was.
+    one = "\U0001F4CB T\n\n*#alpha*\n• one\n\n1 project."
+    assert split_messages(one) == ([], one), split_messages(one)
+    # A blank line inside a project does not cut it, so this is still one.
+    gap = "\U0001F4CB T\n\n*#alpha*\n• one\n\n• two\n\n1 project."
+    assert split_messages(gap) == ([], gap), split_messages(gap)
+    # A plain project title splits like a hashtag; a hashtag share_header and
+    # share_footer stay in the frame.
+    with _project_titles("My Food Mate - site"):
+        mixed = ("#alpha\n\nMy Food Mate - site\n• one\n\n• more\n\n"
+                 "*#beta*\n• two\n\n2 projects.\n\n#buildinpublic")
+        m_projects, m_frame = split_messages(mixed)
+    assert m_projects == ["My Food Mate - site\n• one\n\n• more",
+                          "*#beta*\n• two"], m_projects
+    assert m_frame == "#alpha\n\n2 projects.\n\n#buildinpublic", m_frame
+    # No trailer: a lone hashtag after the last project is the footer.
+    notrail = "T\n\n*#alpha*\n• one\n\n*#beta*\n• two\n\n#buildinpublic"
+    n_projects, n_frame = split_messages(notrail)
+    assert n_projects == ["*#alpha*\n• one", "*#beta*\n• two"], n_projects
+    assert n_frame == "T\n\n#buildinpublic", n_frame
+    # The CLI form: NUL-separated, frame last.
+    child = subprocess.run([sys.executable, __file__, "--split-messages"], input=report,
+                           capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0, child.stderr[:200]
+    assert child.stdout.split("\0") == projects + [frame], child.stdout
+
     print("selftest ok")
 
 
@@ -2768,6 +2847,15 @@ def main():
     # prepends the configured share_header afterwards.
     if "--drop-title" in sys.argv:
         sys.stdout.write(drop_leading_title(sys.stdin.read()))
+        return
+
+    # The report cut into the morning's Telegram messages, NUL-separated so a
+    # block's own newlines survive: every project block first, the frame (the
+    # message that carries the buttons) last. A report not worth splitting
+    # comes back as one piece.
+    if "--split-messages" in sys.argv:
+        projects, frame = split_messages(sys.stdin.read())
+        sys.stdout.write("\0".join(projects + [frame]))
         return
 
     if "--selftest" in sys.argv:
