@@ -17,6 +17,14 @@ exclude_repos:
   - some-client-work
   - unannounced-side-project
 
+# Optional: domains no published standup may name. A line that mentions one of
+# them, or any subdomain (grab.example.org, https://a.b.example.org/path), is
+# dropped; a project header that names one drops its whole project; a website
+# on one is not linked on X. Every send is checked again at the last moment and
+# refused if one still appears. A malformed list stops the run: nothing is sent.
+# private_domains:
+#   - example.org
+
 # Optional: title of the shared message. {date} is replaced with YYYY-MM-DD.
 # Default if omitted: 📋 Daily Standup — {date}
 # share_header: "📋 Building in public — {date}"

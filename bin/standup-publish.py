@@ -691,6 +691,157 @@ PRIVATE_LINE = [re.compile(p) for p in (
 )]
 
 
+# ---- Private domains --------------------------------------------------------
+#
+# Hostnames that must never appear in anything this pipeline sends: the morning
+# message, the X preview, X, wip.co, LinkedIn. A line that names one says what
+# runs where — a home server behind an access gate is still an address someone
+# can start knocking on. Listed under `private_domains` in standup.yml, which is
+# gitignored, because this repository is public and the list is the secret.
+#
+# Every process reads the list for itself. The button poller runs from its own
+# cron line, hours after the morning job, and inherits nothing from it — so an
+# environment variable set in the morning would be an empty list at the press,
+# and an empty list is a filter that passes everything.
+#
+# Fail closed, always. A config that cannot be found, is ambiguous, cannot be
+# parsed, or holds something that is not a hostname raises PrivateDomainError,
+# and every caller turns that into "send nothing". "No list" is only ever the
+# answer when the config was read and has no private_domains key.
+
+REPO_DIR = pathlib.Path(__file__).resolve().parent.parent
+RUBY = os.environ.get("RUBY_BIN") or shutil.which("ruby") or "/usr/bin/ruby"
+# One DNS label, then at least one more: a bare word is not a domain, and a
+# pattern built from one would drop every line that uses the word.
+DOMAIN_SHAPE = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+
+# One read per config file per process. --selftest clears it between cases.
+_DOMAINS_CACHE = {}
+
+
+class PrivateDomainError(Exception):
+    """The private-domain list could not be established. Send nothing."""
+
+
+def _config_is_usable(path):
+    """Mirror of config_is_usable in daily-standup.sh: non-empty, and holding a
+    line that is not blank, a comment or a document marker."""
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        return any(re.match(r"\s*[^#\s-]", line)
+                   for line in path.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return False
+
+
+def _standup_config():
+    """The same file daily-standup.sh resolves, or PrivateDomainError.
+
+    STANDUP_CONFIG when set and non-empty; otherwise ~/.standup.yml OR
+    <repo>/standup.yml, never both. Two files is ambiguous there and here: the
+    morning job refuses to run, and picking one here could pick the file
+    without the list.
+    """
+    env = os.environ.get("STANDUP_CONFIG", "")
+    if env:
+        path = pathlib.Path(env).expanduser()
+        if not _config_is_usable(path):
+            raise PrivateDomainError(f"no usable report config at {path}")
+        return path
+    home, repo = pathlib.Path.home() / ".standup.yml", REPO_DIR / "standup.yml"
+    home_ok, repo_ok = _config_is_usable(home), _config_is_usable(repo)
+    if home_ok and repo_ok:
+        raise PrivateDomainError(f"both {home} and {repo} exist (AMBIGUOUS)")
+    if home_ok:
+        return home
+    if repo_ok:
+        return repo
+    raise PrivateDomainError(f"no usable report config (looked in {home} and {repo})")
+
+
+def _parse_domains(present, value):
+    """Validate the decoded private_domains value. Anything odd raises.
+
+    Only an absent key is "no list". `private_domains:` with nothing after it,
+    or `~`, is null in YAML — a list somebody started and emptied by mistake —
+    and reading it as "no domains" would switch the filter off in silence.
+    """
+    if not present:
+        return ()
+    if not isinstance(value, list):
+        raise PrivateDomainError(f"private_domains must be a list, not {type(value).__name__}")
+    out = []
+    for entry in value:
+        if not isinstance(entry, str):
+            raise PrivateDomainError(f"private_domains entry is not a string: {entry!r}")
+        domain = entry.strip().lower().rstrip(".")
+        if not DOMAIN_SHAPE.fullmatch(domain):
+            raise PrivateDomainError(f"private_domains entry is not a hostname: {entry!r}")
+        out.append(domain)
+    return tuple(dict.fromkeys(out))
+
+
+def private_domains():
+    """The configured private domains, lower-case. Raises PrivateDomainError."""
+    path = _standup_config()
+    # Keyed on the file's mtime too: an edited list is read again, even by a
+    # process that already read the old one.
+    try:
+        key = (path, path.stat().st_mtime_ns)
+    except OSError as e:
+        raise PrivateDomainError(f"cannot stat {path}: {e}") from e
+    if key in _DOMAINS_CACHE:
+        return _DOMAINS_CACHE[key]
+    # Ruby, because Python here is standard-library only and has no YAML, and
+    # standup.rb already reads this file with Ruby's — so both read it the same.
+    script = ('cfg = YAML.safe_load(File.read(ARGV[0], encoding: "UTF-8"), '
+              'permitted_classes: [], permitted_symbols: [], aliases: true) || {}; '
+              'abort "the config is not a mapping" unless cfg.is_a?(Hash); '
+              'puts JSON.generate([cfg.key?("private_domains"), cfg["private_domains"]])')
+    try:
+        result = subprocess.run([RUBY, "-ryaml", "-rjson", "-e", script, str(path)],
+                                capture_output=True, text=True, timeout=30)
+    except Exception as e:  # noqa: BLE001 - any failure is a failure to filter
+        raise PrivateDomainError(f"could not run ruby to read {path}: {e}") from e
+    if result.returncode != 0:
+        raise PrivateDomainError(f"could not read private_domains from {path}: "
+                                 f"{(result.stderr or result.stdout).strip()[:200]}")
+    try:
+        present, value = json.loads(result.stdout)
+    except ValueError as e:
+        raise PrivateDomainError(f"unreadable private_domains from {path}: {e}") from e
+    _DOMAINS_CACHE[key] = _parse_domains(present, value)
+    return _DOMAINS_CACHE[key]
+
+
+def _domain_patterns(domains):
+    # The domain itself, preceded by a dot (any subdomain, whatever its labels
+    # are made of: my_app.example.org, münchen.example.org) or by something
+    # that cannot be part of a hostname. A letter, digit, "-" or "_" right
+    # before it makes it another name ("notexample.org"), so that is kept. The
+    # lookahead keeps "example.org.other.net" out, while still matching
+    # "example.org." at the end of a sentence.
+    return [re.compile(r"(?i)(?<![A-Za-z0-9_-])" + re.escape(d)
+                       + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])") for d in domains]
+
+
+def names_private_domain(text, domains=None):
+    """True when `text` names a private domain. Raises PrivateDomainError."""
+    if not text:
+        return False
+    domains = private_domains() if domains is None else domains
+    return any(p.search(text) for p in _domain_patterns(domains))
+
+
+def assert_no_private_domain(text):
+    """The last check before any text leaves this machine."""
+    if names_private_domain(text):
+        raise PrivateDomainError("the text names a private domain; not sent")
+    return text
+
+
 def drop_leading_title(text):
     """Remove a leading non-project line the formatter may have written as a title.
 
@@ -797,17 +948,47 @@ def strip_private(text):
         else:
             groups.append({"kind": LOOSE, "rows": rows})
 
+    # A private domain is matched on every line, headers included. Raises
+    # PrivateDomainError when the list cannot be read: the caller sends nothing.
+    domains = _domain_patterns(private_domains())
+
+    def names_domain(line):
+        return any(p.search(line) for p in domains)
+
+    def is_private(line):
+        return bool(line.strip()) and (any(r.search(line) for r in PRIVATE_LINE)
+                                       or names_domain(line))
+
     before = sum(g["kind"] == HEADED for g in groups)
     out, after = [], 0
+    # A header is exempt from the word patterns, because dropping it alone would
+    # orphan its bullets into the project above. A header that names a private
+    # domain (a plain title with the site in it) takes its whole project with it
+    # instead, on every path: no bullet of a project named that way is worth the
+    # address. `dropping` carries that across the loose groups that follow it,
+    # until the next project or frame starts. Frame lines glued to a dropped
+    # project survive on their own merit.
+    dropping = False
     for group in groups:
+        rows = group["rows"]
+        if any(header_at(i, line) and names_domain(line) for i, line in rows):
+            dropping = True
+        elif group["kind"] in (HEADED, FRAME):
+            dropping = False
+        if dropping:
+            survivors = [line for i, line in rows
+                         if i in frame and line.strip() and not is_private(line)]
+            if survivors:
+                out.append("\n".join(survivors))
+            continue
         if group["kind"] == FRAME:
             # Filtered too. The exemption used to live here as well as in the
             # loop below, and changing only one left a glued trailer going out.
-            # Headers are still exempt on this path as well as the other: a
-            # title-less report whose first line is a header lands here.
-            kept_lines = [line for i, line in group["rows"]
-                          if header_at(i, line)
-                          or not (line.strip() and any(r.search(line) for r in PRIVATE_LINE))]
+            # Headers are still exempt from the word patterns on this path as
+            # well as the other: a title-less report whose first line is a
+            # header lands here.
+            kept_lines = [line for i, line in rows
+                          if header_at(i, line) or not is_private(line)]
             if any(line.strip() for line in kept_lines):
                 out.append("\n".join(kept_lines))
             continue
@@ -816,7 +997,7 @@ def strip_private(text):
             if header_at(i, line):
                 kept_rows.append((i, line))
                 continue
-            if line.strip() and any(r.search(line) for r in PRIVATE_LINE):
+            if is_private(line):
                 continue
             kept_rows.append((i, line))
             # A frame line that survives is still not body. Counting a glued
@@ -1036,6 +1217,15 @@ def _rewrite_project_headers(body, projects, links=None):
     see public_links — so a private repository never becomes a dead link here.
     """
     links = links or {}
+    # A name or a URL on a private domain is no link: the header keeps its
+    # hashtag. If the list cannot be read, no header is rewritten at all — and
+    # assert_no_private_domain refuses the post at the send anyway. This
+    # function must not raise (see for_x).
+    try:
+        domains = private_domains()
+    except PrivateDomainError as e:
+        warn(f"not rewriting project headers: {e}")
+        return body
     out = []
     for line in body.split("\n"):
         m = SLOT_HEADER.fullmatch(line.strip())
@@ -1050,6 +1240,8 @@ def _rewrite_project_headers(body, projects, links=None):
         else:
             link = links.get(tag) or {}
             name, url = link.get("name") or tag, link.get("url")
+        if url and names_private_domain(f"{name} {url}", domains):
+            url = None
         out.append(f"{name} — {url}" if url else line)
     return "\n".join(out)
 
@@ -1144,6 +1336,7 @@ def for_x(text, seed, lead_out=None, links=None):
 
 def post_to_x(text):
     """`text` is already rendered for a public timeline — see render_public."""
+    assert_no_private_domain(text)
     result = subprocess.run([BIRD, "tweet", text], capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
         return False, (result.stderr or result.stdout).strip()[:300]
@@ -1157,6 +1350,7 @@ def post_to_linkedin(text, config):
     appears at some later slot is not what the button promised. The key reaches
     the child through the environment; a file it never reads would not.
     """
+    assert_no_private_domain(text)
     result = subprocess.run(
         [BUFFER, "posts", "create",
          "--channel-id", config["BUFFER_LINKEDIN_CHANNEL"],
@@ -1172,6 +1366,9 @@ def post_to_linkedin(text, config):
 
 
 def post_to_wip(text):
+    # Raises before the request. publish_pending records the raise as a failed
+    # post, so the reply says why and posted_wip stays false.
+    assert_no_private_domain(text)
     data = urllib.parse.urlencode({"body": text}).encode()
     url = "https://api.wip.co/v1/todos?" + urllib.parse.urlencode({"api_key": wip_key()})
     req = urllib.request.Request(url, data=data, method="POST")
@@ -1289,12 +1486,224 @@ def selftest():
     global STATE_DIR
     real, tmp = STATE_DIR, tempfile.mkdtemp(prefix="standup-selftest-")
     STATE_DIR = pathlib.Path(tmp)
+    # A config of its own, through the real loader, inherited by every child
+    # process below. Without it a live standup.yml on this machine would decide
+    # what the filter tests see, and on a runner with no config every child
+    # --strip-private would refuse with exit 4.
+    config = pathlib.Path(tmp) / "standup.yml"
+    config.write_text("projects_root: ~/code\nprivate_domains:\n  - example.org\n",
+                      encoding="utf-8")
+    saved_config = os.environ.get("STANDUP_CONFIG")
+    os.environ["STANDUP_CONFIG"] = str(config)
+    _DOMAINS_CACHE.clear()
     try:
         with _project_titles(None):
             _selftest_body()
+            _selftest_private_domains(config)
     finally:
         STATE_DIR = real
+        if saved_config is None:
+            os.environ.pop("STANDUP_CONFIG", None)
+        else:
+            os.environ["STANDUP_CONFIG"] = saved_config
+        _DOMAINS_CACHE.clear()
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selftest_private_domains(config):
+    """Private domains: the matcher, the loader, every place text leaves."""
+    tmp = config.parent
+
+    # ---- matcher ----
+    hit = ("example.org", "grab.example.org", "Grab.Example.ORG",
+           "https://a.b.example.org/path?q=1", "see example.org.", "(sub.example.org)",
+           "user@mail.example.org", "http://example.org:8443/x",
+           "my_app.example.org", "m\u00fcnchen.example.org", "a.b_c.d.example.org")
+    kept = ("notexample.org", "example.org.other.net", "exampleXorg", "example.orgs",
+            "example.com", "an example of org", "my-example.org", "my_example.org")
+    for text in hit:
+        assert names_private_domain(text), text
+    for text in kept:
+        assert not names_private_domain(text), text
+
+    # ---- loader: every odd config raises, never "no list" ----
+    def loads(body):
+        path = tmp / "probe.yml"
+        path.write_text(body, encoding="utf-8")
+        saved = os.environ["STANDUP_CONFIG"]
+        os.environ["STANDUP_CONFIG"] = str(path)
+        _DOMAINS_CACHE.clear()
+        try:
+            return private_domains()
+        finally:
+            os.environ["STANDUP_CONFIG"] = saved
+            _DOMAINS_CACHE.clear()
+
+    assert loads("projects_root: ~/code\n") == ()
+    assert loads("private_domains:\n  - Example.ORG.\n  - example.org\n") == ("example.org",)
+    for bad in ("private_domains: example.org\n",          # a string, not a list
+                "private_domains: {a: b}\n",
+                "private_domains:\n  - 'not a host'\n",
+                "private_domains:\n  - org\n",              # a bare word
+                "private_domains:\n  - 12\n",
+                "private_domains:\n",                        # null: emptied by mistake
+                "private_domains: ~\n",
+                "private_domains: [unclosed\n",              # not YAML
+                "- just\n- a list\n"):                       # not a mapping
+        try:
+            loads(bad)
+        except PrivateDomainError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+    saved = os.environ["STANDUP_CONFIG"]
+    try:
+        os.environ["STANDUP_CONFIG"] = str(tmp / "missing.yml")
+        _DOMAINS_CACHE.clear()
+        try:
+            private_domains()
+            raise AssertionError("a missing config gave a list")
+        except PrivateDomainError:
+            pass
+    finally:
+        os.environ["STANDUP_CONFIG"] = saved
+        _DOMAINS_CACHE.clear()
+
+    # ---- strip_private ----
+    report = ("#alpha\n\n• Published the tool on grab.example.org\n\n"
+              "#beta\n\n• Tests: ok\n• moved https://x.example.org/a to a new box\n\n"
+              "2 projects")
+    out, before, after = strip_private(report)
+    assert "example.org" not in out, out
+    assert "#alpha" not in out, "a project left empty must go"
+    assert "#beta" in out and "Tests: ok" in out, out
+    assert (before, after) == (2, 1), (before, after)
+
+    with _project_titles("Grab Tool - https://grab.example.org\nPantry"):
+        titled = ("Grab Tool - https://grab.example.org\n• Added the cookie export\n\n"
+                  "Pantry\n• Fixed the list\n\n2 projects")
+        out, before, after = strip_private(titled)
+    assert "example.org" not in out and "cookie export" not in out, out
+    assert "Pantry" in out and "Fixed the list" in out, out
+
+    # Every shape a header naming the domain can take must lose its bullets too:
+    # standup.rb's own (name, blank line, bullets), one glued under a title, and
+    # one with the closing count glued to it — which survives on its own merit.
+    with _project_titles("Grab Tool - https://grab.example.org\nPantry"):
+        for shape in ("Grab Tool - https://grab.example.org\n\n• Added the cookie export\n\n"
+                      "Pantry\n\n• Fixed the list",
+                      "\U0001F4CB T\nGrab Tool - https://grab.example.org\n• Added the cookie export\n\n"
+                      "Pantry\n• Fixed the list\n\n2 projects",
+                      "Pantry\n• Fixed the list\n\n"
+                      "Grab Tool - https://grab.example.org\n• Added the cookie export\n2 projects"):
+            out = strip_private(shape)[0]
+            assert "example.org" not in out and "cookie export" not in out, (shape, out)
+            assert "Fixed the list" in out, (shape, out)
+        glued = strip_private("Pantry\n• Fixed the list\n\n"
+                              "Grab Tool - https://grab.example.org\n• Added the cookie export\n"
+                              "2 projects")[0]
+        assert glued.rstrip().endswith("2 projects"), glued
+
+    # Two configs, no STANDUP_CONFIG: ambiguous, as in daily-standup.sh.
+    global REPO_DIR
+    saved_repo, saved_home = REPO_DIR, os.environ.get("HOME")
+    saved_cfg = os.environ.pop("STANDUP_CONFIG")
+    both = tmp / "both"
+    (both / "home").mkdir(parents=True)
+    (both / "home" / ".standup.yml").write_text("projects_root: ~/code\n", encoding="utf-8")
+    (both / "standup.yml").write_text("projects_root: ~/code\n", encoding="utf-8")
+    REPO_DIR, os.environ["HOME"] = both, str(both / "home")
+    _DOMAINS_CACHE.clear()
+    try:
+        try:
+            private_domains()
+            raise AssertionError("two configs gave a list")
+        except PrivateDomainError as e:
+            assert "AMBIGUOUS" in str(e), e
+        # One of them, and only comments in the other: not ambiguous, like the shell.
+        (both / "standup.yml").write_text("# nothing\n---\n", encoding="utf-8")
+        assert private_domains() == ()
+    finally:
+        REPO_DIR = saved_repo
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        os.environ["STANDUP_CONFIG"] = saved_cfg
+        _DOMAINS_CACHE.clear()
+
+    # --preview: refused with NOTHING on stdout, because the shell posts
+    # whatever it printed. share_footer carries the domain here, the way a
+    # filter-dodging line would arrive at preview time.
+    (STATE_DIR / "pending-2027-02-02.json").write_text(json.dumps({
+        "id": "2027-02-02", "text": "\U0001F4CB T\n\n#beta\n• Tests: ok\n\nmore at grab.example.org",
+        "links": {}}), encoding="utf-8")
+    child = subprocess.run([sys.executable, __file__, "--preview", "2027-02-02"],
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, STANDUP_STATE_DIR=str(STATE_DIR)))
+    assert child.returncode == 4 and child.stdout == "", (child.returncode, child.stdout)
+    (STATE_DIR / "pending-2027-02-02.json").unlink()
+
+    # The child process reads the same file through STANDUP_CONFIG.
+    child = subprocess.run([sys.executable, __file__, "--strip-private"], input=report,
+                           capture_output=True, text=True, timeout=60)
+    assert child.returncode == 0 and "example.org" not in child.stdout, (child.returncode, child.stdout)
+    child = subprocess.run([sys.executable, __file__, "--strip-private"], input=report,
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, STANDUP_CONFIG=str(tmp / "missing.yml")))
+    assert child.returncode == 4 and child.stdout == "", (child.returncode, child.stdout)
+
+    # ---- --assert-public ----
+    for text, code in (("#beta\n• Tests: ok", 0), ("footer: grab.example.org", 4)):
+        child = subprocess.run([sys.executable, __file__, "--assert-public"], input=text,
+                               capture_output=True, text=True, timeout=60)
+        assert child.returncode == code and child.stdout == "", (text, child.returncode)
+
+    # ---- header links: a website on a private domain is no link ----
+    projects = {"alpha": {"name": "Alpha", "website_url": "https://alpha.example.org"},
+                "beta": {"name": "Beta", "website_url": "https://beta.test"}}
+    body = _rewrite_project_headers("#alpha\n• one\n\n#beta\n• two", projects)
+    assert "example.org" not in body and "#alpha" in body, body
+    assert "Beta — https://beta.test" in body, body
+
+    # ---- every send refuses, and nothing runs ----
+    def must_not_run(*a, **k):
+        raise AssertionError("a poster ran with a private domain in its text")
+
+    real_run, real_open = subprocess.run, urllib.request.urlopen
+    subprocess.run, urllib.request.urlopen = must_not_run, must_not_run
+    try:
+        for send in (lambda t: post_to_x(t), lambda t: post_to_wip(t),
+                     lambda t: post_to_linkedin(t, {"BUFFER_LINKEDIN_CHANNEL": "c",
+                                                    "BUFFER_API_KEY": "k"})):
+            try:
+                send("hello from grab.example.org")
+                raise AssertionError("a private domain was sent")
+            except PrivateDomainError:
+                pass
+        # Through publish_pending: recorded as failed, never as posted.
+        state = {"posted_x": False}
+        lines = publish_pending(state, "x", (("X", "x", "posted_x",
+                                              lambda: post_to_x("a grab.example.org b")),),
+                                lambda s: None)
+        assert state["posted_x"] is False and lines[0].startswith("❌"), lines
+    finally:
+        subprocess.run, urllib.request.urlopen = real_run, real_open
+
+    # ---- an unreadable list blocks the send too ----
+    saved = os.environ["STANDUP_CONFIG"]
+    os.environ["STANDUP_CONFIG"] = str(tmp / "missing.yml")
+    _DOMAINS_CACHE.clear()
+    try:
+        try:
+            assert_no_private_domain("perfectly ordinary text")
+            raise AssertionError("sent with no list")
+        except PrivateDomainError:
+            pass
+        assert _rewrite_project_headers("#alpha\n• one", projects) == "#alpha\n• one"
+    finally:
+        os.environ["STANDUP_CONFIG"] = saved
+        _DOMAINS_CACHE.clear()
 
 
 @contextlib.contextmanager
@@ -2385,8 +2794,27 @@ def main():
     if "--preview" in sys.argv:
         pending = sys.argv[sys.argv.index("--preview") + 1]
         state = json.loads((STATE_DIR / f"pending-{pending}.json").read_text())
-        print(for_x(strip_telegram_markup(state["text"]), pending,
-                    links=state.get("links") or {}))
+        preview = for_x(strip_telegram_markup(state["text"]), pending,
+                        links=state.get("links") or {})
+        # Nothing on stdout when it fails: daily-standup.sh posts whatever this
+        # printed, even on a non-zero exit.
+        try:
+            assert_no_private_domain(preview)
+        except PrivateDomainError as e:
+            warn(f"X preview not sent: {e}")
+            sys.exit(4)
+        print(preview)
+        return
+
+    # The last check on the morning message, after share_header and
+    # share_footer are on it. Reads stdin, prints nothing. 0 = it may be sent;
+    # 4 = it names a private domain, or the list could not be read.
+    if "--assert-public" in sys.argv:
+        try:
+            assert_no_private_domain(sys.stdin.read())
+        except PrivateDomainError as e:
+            warn(str(e))
+            sys.exit(4)
         return
 
     # Reads the links file standup.rb wrote and prints the public ones as JSON.
@@ -2440,8 +2868,13 @@ def main():
     # Reads the report on stdin. 0 = filtered report on stdout, 2 = nothing of
     # it survived, anything else = it failed. daily-standup.sh must treat every
     # non-zero as "send nothing": a privacy filter that fails open is not one.
+    # 4 = the private-domain list could not be read (see private_domains).
     if "--strip-private" in sys.argv:
-        stripped, before, after = strip_private(sys.stdin.read())
+        try:
+            stripped, before, after = strip_private(sys.stdin.read())
+        except PrivateDomainError as e:
+            warn(f"private domains: {e}")
+            sys.exit(4)
         if not before:
             # No project headers at all. That is a formatter failure, not a
             # quiet security day, and reporting it as one would hide it.
