@@ -175,6 +175,62 @@ def warn_conflict(token):
         log(f"could not send the conflict warning: {e}")
 
 
+def updates_inbox():
+    """The folder a shared bot's reader writes our button presses to, or None.
+
+    Telegram hands each bot's updates to one getUpdates reader only. When the
+    standup shares a bot with a process that already reads it (video-digest
+    on the social bot), that process writes each `publish:` press to this
+    folder, one `<update_id>.json` per press, and this script must not call
+    getUpdates at all: a second reader gets 409 and steals the other's
+    messages. Set as TELEGRAM_UPDATES_INBOX in telegram.env.
+    """
+    found = optional_env(TELEGRAM_ENVS[0], "TELEGRAM_UPDATES_INBOX")
+    return pathlib.Path(found["TELEGRAM_UPDATES_INBOX"]).expanduser() if found else None
+
+
+def drain_inbox(inbox):
+    """Every press in the inbox, oldest first, removed as it is read.
+
+    Removed before it is handled, the same as the getUpdates offset is
+    advanced before: a crash half-way through loses a press, which is seen
+    and pressed again, rather than posting a day twice. A file that cannot be
+    parsed is set aside, not retried on every tick. `.partial` files are a
+    write still in progress and are left alone.
+    """
+    if not inbox.is_dir():
+        return []
+    updates = []
+    for path in inbox.glob("*.json"):
+        # Every field main() reads, checked before the file goes: a press
+        # that would raise there would do it after the others were deleted,
+        # and take them with it.
+        try:
+            update = json.loads(path.read_text(encoding="utf-8"))
+            cb = update["callback_query"]
+            if type(update["update_id"]) is not int or not isinstance(cb, dict) \
+                    or not isinstance(cb.get("id"), str) or not isinstance(cb.get("data"), str):
+                raise ValueError("not a callback press")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            warn(f"unreadable press {path.name}, set aside: {e}")
+            try:
+                path.rename(path.with_name(f"{path.name}.bad-{time.time_ns()}"))
+            except OSError as e2:
+                warn(f"could not set {path.name} aside: {e2}")
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue  # another run took it first
+        except OSError as e:
+            # Not handled, because it could not be removed: handling it now
+            # would handle it again on every tick.
+            warn(f"could not remove press {path.name}, skipped: {e}")
+            continue
+        updates.append(update)
+    return sorted(updates, key=lambda u: u["update_id"])
+
+
 def ack(token, callback_query_id, text):
     """The little toast on the button. Cosmetic, and allowed to fail.
 
@@ -2784,7 +2840,92 @@ def _selftest_body():
     assert child.returncode == 0, child.stderr[:200]
     assert child.stdout.split("\0") == projects + [frame], child.stdout
 
+    _selftest_inbox()
+
     print("selftest ok")
+
+
+def _selftest_inbox():
+    """A shared bot: presses come from a folder, and getUpdates is never called."""
+    global TELEGRAM_ENVS, telegram, STATE_DIR
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="standup-inbox-"))
+    saved = (TELEGRAM_ENVS, telegram, STATE_DIR, sys.argv)
+    try:
+        env = tmp / "telegram.env"
+        inbox = tmp / "inbox"
+        env.write_text("TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\n")
+        TELEGRAM_ENVS = [env]
+        assert updates_inbox() is None, "no key, no inbox"
+        env.write_text(f"TELEGRAM_BOT_TOKEN=t\nTELEGRAM_CHAT_ID=1\nTELEGRAM_UPDATES_INBOX={inbox}\n")
+        assert updates_inbox() == inbox, updates_inbox()
+
+        assert drain_inbox(inbox) == [], "a missing folder is no presses"
+        inbox.mkdir()
+        for uid in (12, 3):
+            (inbox / f"{uid}.json").write_text(json.dumps(
+                {"update_id": uid, "callback_query": {"id": f"cb{uid}", "data": "publish:2000-01-01:x"}}))
+        (inbox / "9.json.partial").write_text("{")
+        (inbox / "bad.json").write_text("not json")
+        got = drain_inbox(inbox)
+        assert [u["update_id"] for u in got] == [3, 12], got
+        left = sorted(p.name for p in inbox.iterdir())
+        assert len(left) == 2 and left[0] == "9.json.partial" \
+            and left[1].startswith("bad.json.bad-"), left
+
+        # main(): nothing pending, one press waiting. It is answered from the
+        # folder, and the bot is never polled.
+        calls = []
+
+        def fake(token, method, **params):
+            calls.append(method)
+            return []
+        telegram = fake
+        STATE_DIR = tmp / "state"
+        STATE_DIR.mkdir()
+        (inbox / "20.json").write_text(json.dumps(
+            {"update_id": 20, "callback_query": {"id": "cb20", "data": "publish:2000-01-01:x"}}))
+        sys.argv = [__file__]
+        main()
+        assert "getUpdates" not in calls, calls
+        assert calls == ["answerCallbackQuery"], calls
+        assert not (inbox / "20.json").exists(), "a handled press must leave the inbox"
+
+        # A press with no callback id parses, and would raise in main() after
+        # the good press beside it was deleted. It is set aside instead, and
+        # the good one is still delivered.
+        (inbox / "30.json").write_text(json.dumps({"update_id": 30, "callback_query": {"data": "x"}}))
+        (inbox / "31.json").write_text(json.dumps({"update_id": True, "callback_query": {"id": "a", "data": "b"}}))
+        (inbox / "32.json").write_text(json.dumps(
+            {"update_id": 32, "callback_query": {"id": "cb32", "data": "publish:2000-01-01:x"}}))
+        got = drain_inbox(inbox)
+        assert [u["update_id"] for u in got] == [32], got
+        assert len(list(inbox.glob("30.json.bad-*"))) == 1 and len(list(inbox.glob("31.json.bad-*"))) == 1
+
+        # A real day: the press from the folder posts once, the state records
+        # it, and the bot is still never polled.
+        global post_to_wip
+        real_wip = post_to_wip
+        posted = []
+        post_to_wip = lambda text: (posted.append(text), (True, "ok"))[1]  # noqa: E731
+        try:
+            day = STATE_DIR / "pending-2000-01-02.json"
+            day.write_text(json.dumps({"id": "2000-01-02", "message_id": 7, "chat_id": 1,
+                                       "text": "T\n\n#alpha\n• one", "armed": ["x", "wip"],
+                                       "posted_x": False, "posted_wip": False}))
+            (inbox / "40.json").write_text(json.dumps(
+                {"update_id": 40, "callback_query": {"id": "cb40", "data": "publish:2000-01-02:wip"}}))
+            calls.clear()
+            main()
+        finally:
+            post_to_wip = real_wip
+        assert len(posted) == 1 and "#alpha" in posted[0], posted
+        assert "getUpdates" not in calls, calls
+        assert not (inbox / "40.json").exists()
+        after = json.loads(day.read_text()) if day.exists() else None
+        assert after is None or after["posted_wip"] is True, after
+    finally:
+        TELEGRAM_ENVS, telegram, STATE_DIR, sys.argv = saved
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main():
@@ -2898,20 +3039,26 @@ def main():
         return
 
     token = read_env(TELEGRAM_ENVS, "TELEGRAM_BOT_TOKEN")
+    inbox = updates_inbox()
 
     states = {s.get("id"): (p, s) for p, s in pending_states()}
-    if not states:
+    if inbox is not None:
+        # A shared bot: its one reader writes our presses here. Drained even
+        # with nothing pending, so a press on a finished day is answered and
+        # gone rather than kept for ever.
+        updates = drain_inbox(inbox)
+    elif not states:
         return  # nothing waiting; say nothing, this runs every few minutes
+    else:
+        offset = 0
+        if OFFSET_FILE.exists():
+            offset = int(OFFSET_FILE.read_text().strip() or 0)
 
-    offset = 0
-    if OFFSET_FILE.exists():
-        offset = int(OFFSET_FILE.read_text().strip() or 0)
-
-    updates = telegram(token, "getUpdates", offset=offset, timeout=0,
-                       allowed_updates=json.dumps(["callback_query"]))
-    if updates:
-        OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        OFFSET_FILE.write_text(str(updates[-1]["update_id"] + 1))
+        updates = telegram(token, "getUpdates", offset=offset, timeout=0,
+                           allowed_updates=json.dumps(["callback_query"]))
+        if updates:
+            OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            OFFSET_FILE.write_text(str(updates[-1]["update_id"] + 1))
 
     for update in updates:
         cb = update.get("callback_query")

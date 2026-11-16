@@ -6,6 +6,14 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The standup can share its Telegram bot.** Telegram gives a bot's updates
+  to one reader only. With `TELEGRAM_UPDATES_INBOX` in `telegram.env`, the
+  publisher reads its button presses from that folder, one `<update_id>.json`
+  per press, and never calls `getUpdates`. The program that already reads the
+  bot writes them there (video-digest does, with `VD_STANDUP_INBOX`).
+
 ### Changed
 
 - **The morning Telegram report is one message per project.** Each project
