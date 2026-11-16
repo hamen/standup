@@ -808,7 +808,9 @@ def private_domains():
 def _domain_patterns(domains):
     # The apex or any subdomain, as a whole hostname. The lookbehind keeps
     # "notexample.org" out; the lookahead keeps "example.org.other.net" out,
-    # while still matching "example.org." at the end of a sentence.
+    # while still matching "example.org." at the end of a sentence. ASCII
+    # labels only: a commit naming a host writes it the way it is typed, and an
+    # IDN subdomain under a listed ASCII domain is still caught at the domain.
     return [re.compile(r"(?i)(?<![A-Za-z0-9.-])(?:[A-Za-z0-9-]+\.)*" + re.escape(d)
                        + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])") for d in domains]
 
@@ -947,28 +949,36 @@ def strip_private(text):
 
     before = sum(g["kind"] == HEADED for g in groups)
     out, after = [], 0
+    # A header is exempt from the word patterns, because dropping it alone would
+    # orphan its bullets into the project above. A header that names a private
+    # domain (a plain title with the site in it) takes its whole project with it
+    # instead, on every path: no bullet of a project named that way is worth the
+    # address. `dropping` carries that across the loose groups that follow it,
+    # until the next project or frame starts. Frame lines glued to a dropped
+    # project survive on their own merit.
+    dropping = False
     for group in groups:
-        if group["kind"] == FRAME:
-            # Filtered too. The exemption used to live here as well as in the
-            # loop below, and changing only one left a glued trailer going out.
-            # Headers are still exempt on this path as well as the other: a
-            # title-less report whose first line is a header lands here.
-            kept_lines = [line for i, line in group["rows"]
-                          if (header_at(i, line) and not names_domain(line))
-                          or not is_private(line)]
-            if any(line.strip() for line in kept_lines):
-                out.append("\n".join(kept_lines))
-            continue
-        # A header is exempt from the word patterns, because dropping it alone
-        # would orphan its bullets into the project above. A header that names
-        # a private domain (a plain title with the site in it) takes its whole
-        # project with it instead: no bullet of a project named that way is
-        # worth the address. Frame lines glued to it survive on their own merit.
-        if any(header_at(i, line) and names_domain(line) for i, line in group["rows"]):
-            survivors = [line for i, line in group["rows"]
+        rows = group["rows"]
+        if any(header_at(i, line) and names_domain(line) for i, line in rows):
+            dropping = True
+        elif group["kind"] in (HEADED, FRAME):
+            dropping = False
+        if dropping:
+            survivors = [line for i, line in rows
                          if i in frame and line.strip() and not is_private(line)]
             if survivors:
                 out.append("\n".join(survivors))
+            continue
+        if group["kind"] == FRAME:
+            # Filtered too. The exemption used to live here as well as in the
+            # loop below, and changing only one left a glued trailer going out.
+            # Headers are still exempt from the word patterns on this path as
+            # well as the other: a title-less report whose first line is a
+            # header lands here.
+            kept_lines = [line for i, line in rows
+                          if header_at(i, line) or not is_private(line)]
+            if any(line.strip() for line in kept_lines):
+                out.append("\n".join(kept_lines))
             continue
         kept_rows, body = [], 0
         for i, line in group["rows"]:
@@ -1300,7 +1310,7 @@ def post_to_wip(text):
     # Raises before the request. publish_pending records the raise as a failed
     # post, so the reply says why and posted_wip stays false.
     assert_no_private_domain(text)
-    data =urllib.parse.urlencode({"body": text}).encode()
+    data = urllib.parse.urlencode({"body": text}).encode()
     url = "https://api.wip.co/v1/todos?" + urllib.parse.urlencode({"api_key": wip_key()})
     req = urllib.request.Request(url, data=data, method="POST")
     try:
@@ -1513,6 +1523,65 @@ def _selftest_private_domains(config):
         out, before, after = strip_private(titled)
     assert "example.org" not in out and "cookie export" not in out, out
     assert "Pantry" in out and "Fixed the list" in out, out
+
+    # Every shape a header naming the domain can take must lose its bullets too:
+    # standup.rb's own (name, blank line, bullets), one glued under a title, and
+    # one with the closing count glued to it — which survives on its own merit.
+    with _project_titles("Grab Tool - https://grab.example.org\nPantry"):
+        for shape in ("Grab Tool - https://grab.example.org\n\n• Added the cookie export\n\n"
+                      "Pantry\n\n• Fixed the list",
+                      "\U0001F4CB T\nGrab Tool - https://grab.example.org\n• Added the cookie export\n\n"
+                      "Pantry\n• Fixed the list\n\n2 projects",
+                      "Pantry\n• Fixed the list\n\n"
+                      "Grab Tool - https://grab.example.org\n• Added the cookie export\n2 projects"):
+            out = strip_private(shape)[0]
+            assert "example.org" not in out and "cookie export" not in out, (shape, out)
+            assert "Fixed the list" in out, (shape, out)
+        glued = strip_private("Pantry\n• Fixed the list\n\n"
+                              "Grab Tool - https://grab.example.org\n• Added the cookie export\n"
+                              "2 projects")[0]
+        assert glued.rstrip().endswith("2 projects"), glued
+
+    # Two configs, no STANDUP_CONFIG: ambiguous, as in daily-standup.sh.
+    global REPO_DIR
+    saved_repo, saved_home = REPO_DIR, os.environ.get("HOME")
+    saved_cfg = os.environ.pop("STANDUP_CONFIG")
+    both = tmp / "both"
+    (both / "home").mkdir(parents=True)
+    (both / "home" / ".standup.yml").write_text("projects_root: ~/code\n", encoding="utf-8")
+    (both / "standup.yml").write_text("projects_root: ~/code\n", encoding="utf-8")
+    REPO_DIR, os.environ["HOME"] = both, str(both / "home")
+    _DOMAINS_CACHE.clear()
+    try:
+        try:
+            private_domains()
+            raise AssertionError("two configs gave a list")
+        except PrivateDomainError as e:
+            assert "AMBIGUOUS" in str(e), e
+        # One of them, and only comments in the other: not ambiguous, like the shell.
+        (both / "standup.yml").write_text("# nothing\n---\n", encoding="utf-8")
+        assert private_domains() == ()
+    finally:
+        REPO_DIR = saved_repo
+        if saved_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved_home
+        os.environ["STANDUP_CONFIG"] = saved_cfg
+        _DOMAINS_CACHE.clear()
+
+    # --preview: refused with NOTHING on stdout, because the shell posts
+    # whatever it printed. share_footer carries the domain here, the way a
+    # filter-dodging line would arrive at preview time.
+    (STATE_DIR / "pending-2027-02-02.json").write_text(json.dumps({
+        "id": "2027-02-02", "text": "\U0001F4CB T\n\n#beta\n• Tests: ok\n\nmore at grab.example.org",
+        "links": {}}), encoding="utf-8")
+    child = subprocess.run([sys.executable, __file__, "--preview", "2027-02-02"],
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(os.environ, STANDUP_STATE_DIR=str(STATE_DIR),
+                                    STANDUP_CONFIG_DIR=str(tmp / "noconfig")))
+    assert child.returncode == 4 and child.stdout == "", (child.returncode, child.stdout)
+    (STATE_DIR / "pending-2027-02-02.json").unlink()
 
     # The child process reads the same file through STANDUP_CONFIG.
     child = subprocess.run([sys.executable, __file__, "--strip-private"], input=report,
