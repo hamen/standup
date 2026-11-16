@@ -789,26 +789,41 @@ fi
 # One message per project, then the frame with the buttons. Reading only: the
 # state file below still holds the whole ANALYSIS, and that one text is what X,
 # wip.co and LinkedIn receive. A day too small to split, or a splitter that
-# fails, sends the single message it always did — and if any project message is
-# rejected, the button message carries the whole report again, so no project is
-# ever missing from the chat.
+# fails, sends the single message it always did — and a project message that is
+# rejected goes back onto the button message, so no project is ever missing
+# from the chat. Only the rejected ones: the whole report could be over
+# Telegram's limit and be cut, which would lose the very project it was for.
+#
+# Through a file and an exit code, not mapfile on a process substitution:
+# mapfile succeeds whatever the splitter did, and a splitter that died half-way
+# would leave project pieces with no frame, putting the buttons on a project.
 BUTTON_TEXT="$ANALYSIS"
 PIECES=()
-mapfile -d '' -t PIECES < <(printf '%s' "$ANALYSIS" \
-  | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --split-messages 2>/dev/null) || PIECES=()
+SPLIT_FILE=$(mktemp 2>/dev/null) || SPLIT_FILE=""
+if [ -n "$SPLIT_FILE" ]; then
+  if printf '%s' "$ANALYSIS" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" \
+       --split-messages > "$SPLIT_FILE"; then
+    mapfile -d '' -t PIECES < "$SPLIT_FILE"
+  else
+    echo "  Could not split the report; sending it as one message"
+  fi
+  rm -f "$SPLIT_FILE"
+fi
 if [ "${#PIECES[@]}" -gt 1 ]; then
-  SPLIT_OK=1
+  REJECTED=""
   for ((i = 0; i < ${#PIECES[@]} - 1; i++)); do
     # Telegram allows about one message per second in one chat.
     [ "$i" -gt 0 ] && sleep 1
-    send_telegram "${PIECES[$i]}" || SPLIT_OK=0
+    if ! send_telegram "${PIECES[$i]}"; then
+      REJECTED="${REJECTED}${PIECES[$i]}
+
+"
+    fi
   done
   sleep 1
-  if [ "$SPLIT_OK" = 1 ]; then
-    BUTTON_TEXT="${PIECES[${#PIECES[@]}-1]}"
-  else
-    echo "  A project message was rejected; the button message carries the whole report"
-  fi
+  BUTTON_TEXT="${REJECTED}${PIECES[${#PIECES[@]}-1]}"
+  [ -n "$REJECTED" ] &&
+    echo "  A project message was rejected; it rides on the button message instead"
 fi
 
 # The state file keeps ANALYSIS unescaped — that text is what X and wip.co

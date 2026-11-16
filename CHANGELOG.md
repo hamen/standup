@@ -13,8 +13,8 @@ All notable changes to this project are recorded here. The format follows
   the "N projects" line, the footer and the publish buttons. Reading only: the
   state file still holds the whole report, so X, wip.co and LinkedIn receive
   the same single post as before. A day with one project, or a splitter that
-  fails, sends the single message as before; if a project message is rejected,
-  the button message carries the whole report again.
+  fails, sends the single message as before; a project message that Telegram
+  rejects goes onto the button message instead, so no project goes missing.
 
 - **An unmapped repository is a clean hashtag, and X links its GitHub page.**
   A repository with no `repo_name_mapping` entry used to be printed under its

@@ -46,8 +46,8 @@ if [ -n "${REJECT_PREVIEW:-}" ] && printf '%s\n' "$@" | grep -q reply_to_message
 fi
 # Every send of one project, both the MarkdownV2 try and the plain retry, but
 # never the message with the buttons: how a rejected project message looks.
-if [ -n "${REJECT_PROJECT:-}" ] && printf '%s\n' "$@" | grep -q -- "$REJECT_PROJECT" \
-   && ! printf '%s\n' "$@" | grep -q inline_keyboard; then
+if [ -n "${REJECT_PROJECT:-}" ] && printf '%s\n' "$@" | grep -qF -- "$REJECT_PROJECT" \
+   && ! printf '%s\n' "$@" | grep -q -e inline_keyboard -e reply_to_message_id; then
   echo '{"ok":false,"description":"Bad Request: stubbed project rejection"}'
   exit 0
 fi
@@ -853,7 +853,9 @@ out=$(run "$TMP/plain-first.log")
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || failures+=("plain mapping title as first project exited $rc: $out")
-first=$(call "$TMP/plain-first.log" 1)
+# Two projects, so three messages: each project, then the header with the
+# buttons. Read them all; the X preview reply is not among them.
+first=$(cat "$TMP/plain-first.log" | grep -v '^reply_to_message_id')
 echo "$first" | grep -q 'Daily Standup' ||
   failures+=("default share_header missing above a plain first project: $first")
 echo "$first" | grep -q 'My Food Mate' ||
@@ -1049,17 +1051,62 @@ assert "#alpha" in text and "#beta" in text and "2 projects" in text, text
 PYEOF
   failures+=("the state file no longer holds the whole report")
 
-# 18b. A rejected project message: the button message carries everything.
+# 18b. A rejected project message rides on the button message — only it, so
+# a long report cannot push it past Telegram's limit.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+set +e
 out=$(REJECT_PROJECT=alpha run "$TMP/split-fail.log")
-grep -q 'carries the whole report' <<<"$out" ||
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || failures+=("a rejected project message failed the run ($rc): $out")
+grep -q 'rides on the button message' <<<"$out" ||
   failures+=("a rejected project message was not reported: $out")
 last=$(awk '/^--- end of call ---$/{n++} END{print n}' "$TMP/split-fail.log")
 # The last call is the X preview reply; the one before it holds the buttons.
 btn=$(call "$TMP/split-fail.log" $((last - 1)))
 echo "$btn" | grep -q 'inline_keyboard' && echo "$btn" | grep -q '\\#alpha' &&
-  echo "$btn" | grep -q '\\#beta' ||
-  failures+=("after a rejected project message the button message lost a project: $btn")
+  ! echo "$btn" | grep -q '\\#beta' && echo "$btn" | grep -q '2 projects' ||
+  failures+=("the button message is not the rejected project plus the frame: $btn")
+
+# 18c. A splitter that dies: one message, as before, with the whole report.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+mv "$WORK/bin/standup-publish.py" "$WORK/bin/real-publish.py"
+cat > "$WORK/bin/standup-publish.py" <<'PY'
+import os, sys
+if "--split-messages" in sys.argv:
+    sys.stdout.write("#alpha\n- partial\0")
+    sys.exit(1)
+real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "real-publish.py")
+os.execv(sys.executable, [sys.executable, real] + sys.argv[1:])
+PY
+out=$(run "$TMP/split-crash.log")
+mv "$WORK/bin/real-publish.py" "$WORK/bin/standup-publish.py"
+c1=$(call "$TMP/split-crash.log" 1)
+echo "$c1" | grep -q 'inline_keyboard' && echo "$c1" | grep -q '\\#alpha' &&
+  echo "$c1" | grep -q '\\#beta' ||
+  failures+=("a dead splitter did not leave the single message with buttons: $c1")
+grep -q 'Could not split' <<<"$out" ||
+  failures+=("a dead splitter was not reported: $out")
+
+# 18d. One project: the single message it always was.
+cat > "$TMP/stub/ruby" <<SH
+#!/usr/bin/env bash
+case " \$* " in
+  *" -ryaml "*|*" -e "*) exec "$REAL_RUBY" "\$@" ;;
+esac
+printf '#alpha\n• one\n'
+SH
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+cat > /dev/null
+printf '*#alpha*\n• one\n\n1 project.\n'
+SH
+chmod +x "$TMP/stub/ruby" "$TMP/stub/claude"
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+out=$(run "$TMP/split-one.log")
+c1=$(call "$TMP/split-one.log" 1)
+echo "$c1" | grep -q 'inline_keyboard' && echo "$c1" | grep -q '\\#alpha' ||
+  failures+=("a one-project day did not stay one message: $c1")
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'

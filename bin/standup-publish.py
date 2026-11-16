@@ -905,20 +905,46 @@ def split_share_frame(text):
 def split_messages(text):
     """The report as Telegram messages: one per project, then the frame.
 
-    Returns (projects, frame). `projects` is every blank-line block of the
-    body, in order; `frame` is the head and tail joined — the share_header,
-    the "N projects" trailer and the share_footer — which is the message that
-    carries the publish buttons. Reading only: what X, wip.co and LinkedIn
-    receive is still the whole report, stored unsplit in the state file.
+    Returns (projects, frame). A project runs from a header line (_is_header:
+    a #hashtag or a known plain title) to the next one, blank lines included,
+    so a gap inside a project never cuts it. A header with nothing under it is
+    not a project: before the first real project it is the share_header, after
+    the last one it is the share_footer. The "N projects" trailer and all that
+    follows it is the tail. `frame` is head and tail — the message that carries
+    the publish buttons. Reading only: what X, wip.co and LinkedIn receive is
+    still the whole report, stored unsplit in the state file.
 
     Fewer than two projects is not worth splitting, and neither is a report
     with no frame to hang the buttons on: both come back as ([], text), which
     the caller sends as the single message it always was.
     """
-    head, body, tail = split_share_frame(text)
-    projects = [b for b in re.split(r"\n\s*\n", body) if b.strip()] if body else []
-    frame = _join_share_frame(head, "", tail)
-    if len(projects) < 2 or not frame.strip():
+    segments, current, tail = [], [], []
+    lines = text.split("\n")
+    for n, line in enumerate(lines):
+        if TRAILER_LINE.fullmatch(line.strip()):
+            tail = lines[n:]
+            break
+        if _is_header(line):
+            segments.append(current)
+            current = [line]
+        else:
+            current.append(line)
+    segments.append(current)
+
+    def real(seg):
+        return any(ln.strip() for ln in seg[1:])
+
+    head, rest = segments[0], segments[1:]
+    while rest and not real(rest[0]):
+        head = head + rest.pop(0)
+    trailing = []
+    while rest and not real(rest[-1]):
+        trailing = rest.pop() + trailing
+
+    projects = ["\n".join(seg).strip() for seg in rest]
+    frame = "\n\n".join(p for p in ("\n".join(head).strip(),
+                                    "\n".join(trailing + tail).strip()) if p)
+    if len(projects) < 2 or not frame:
         return [], text
     return projects, frame
 
@@ -2326,6 +2352,23 @@ def _selftest_body():
     # One project is not worth splitting: the single message it always was.
     one = "\U0001F4CB T\n\n*#alpha*\n• one\n\n1 project."
     assert split_messages(one) == ([], one), split_messages(one)
+    # A blank line inside a project does not cut it, so this is still one.
+    gap = "\U0001F4CB T\n\n*#alpha*\n• one\n\n• two\n\n1 project."
+    assert split_messages(gap) == ([], gap), split_messages(gap)
+    # A plain project title splits like a hashtag; a hashtag share_header and
+    # share_footer stay in the frame.
+    with _project_titles("My Food Mate - site"):
+        mixed = ("#alpha\n\nMy Food Mate - site\n• one\n\n• more\n\n"
+                 "*#beta*\n• two\n\n2 projects.\n\n#buildinpublic")
+        m_projects, m_frame = split_messages(mixed)
+    assert m_projects == ["My Food Mate - site\n• one\n\n• more",
+                          "*#beta*\n• two"], m_projects
+    assert m_frame == "#alpha\n\n2 projects.\n\n#buildinpublic", m_frame
+    # No trailer: a lone hashtag after the last project is the footer.
+    notrail = "T\n\n*#alpha*\n• one\n\n*#beta*\n• two\n\n#buildinpublic"
+    n_projects, n_frame = split_messages(notrail)
+    assert n_projects == ["*#alpha*\n• one", "*#beta*\n• two"], n_projects
+    assert n_frame == "T\n\n#buildinpublic", n_frame
     # The CLI form: NUL-separated, frame last.
     child = subprocess.run([sys.executable, __file__, "--split-messages"], input=report,
                            capture_output=True, text=True, timeout=60)
