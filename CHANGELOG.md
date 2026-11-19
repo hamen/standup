@@ -64,6 +64,14 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **The morning run died on macOS with `mapfile: command not found`.** Splitting
+  the report into one message per project used `mapfile`, which bash 3.2 —
+  the `/bin/bash` macOS ships, and what `#!/usr/bin/env bash` finds on a stock
+  Mac — does not have. Under `set -e` the run stopped before anything was
+  sent. It now reads the pieces with a `read -d ''` loop, and `test_send.sh`
+  fails if `daily-standup.sh` uses a bash 4 feature again, since CI's bash 5
+  would not notice.
+
 - **The standup could be sent and then leave a button that did nothing.** The
   message id and chat id were pulled out of Telegram's response with unguarded
   command substitutions, under `set -e`. A response Telegram accepted but shaped

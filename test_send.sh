@@ -1167,6 +1167,15 @@ grep -q 'Non riesco a leggere private' "$TMP/badlist.log" ||
   failures+=("the malformed list was not reported on Telegram: $out")
 unset STANDUP_CONFIG
 
+# --- 20. Nothing newer than macOS's bash 3.2 --------------------------------
+# /usr/bin/env bash is /bin/bash 3.2 on a stock Mac, and CI's bash 5 runs a
+# bash-4-only builtin without complaint. mapfile reached main that way and
+# stopped every morning run there. Comment lines are allowed to name them.
+bash4=$(grep -nE '(^|[^[:alnum:]_])(mapfile|readarray|coproc)([^[:alnum:]_]|$)|(declare|local) -[a-zA-Z]*A|\$\{[A-Za-z_][A-Za-z0-9_]*(,,?|\^\^?)\}|wait -n' \
+  "$ROOT/bin/daily-standup.sh" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+[ -z "$bash4" ] ||
+  failures+=("daily-standup.sh uses bash 4+ features that macOS's bash 3.2 lacks: $bash4")
+
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else

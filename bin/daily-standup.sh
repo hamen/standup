@@ -823,16 +823,21 @@ fi
 # from the chat. Only the rejected ones: the whole report could be over
 # Telegram's limit and be cut, which would lose the very project it was for.
 #
-# Through a file and an exit code, not mapfile on a process substitution:
-# mapfile succeeds whatever the splitter did, and a splitter that died half-way
-# would leave project pieces with no frame, putting the buttons on a project.
+# Through a file and an exit code, not a read on a process substitution: that
+# succeeds whatever the splitter did, and a splitter that died half-way would
+# leave project pieces with no frame, putting the buttons on a project.
+# A read loop, not mapfile: macOS ships bash 3.2, which has no mapfile, and
+# under set -e its "command not found" ended the run before anything was sent.
+# The pieces are NUL-joined with no trailing NUL, hence the -n on the last one.
 BUTTON_TEXT="$ANALYSIS"
 PIECES=()
 SPLIT_FILE=$(mktemp 2>/dev/null) || SPLIT_FILE=""
 if [ -n "$SPLIT_FILE" ]; then
   if printf '%s' "$ANALYSIS" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" \
        --split-messages > "$SPLIT_FILE"; then
-    mapfile -d '' -t PIECES < "$SPLIT_FILE"
+    while IFS= read -r -d '' piece || [ -n "$piece" ]; do
+      PIECES+=("$piece")
+    done < "$SPLIT_FILE"
   else
     echo "  Could not split the report; sending it as one message"
   fi
