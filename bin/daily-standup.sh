@@ -646,8 +646,15 @@ Format this as a concise, scannable Telegram message:
 - Group by project, keeping each project name exactly as written in the raw output, alone on its line (bold it)
 - Summarize related commits into one bullet where possible (don't repeat noise like 'chore: bump version')
 - Use plain language, not commit-speak
-- Add a brief one-line summary at the end with total project count
+- Add a brief one-line summary at the end with the count of projects that have product bullets
 - Keep it short — this is a standup, not a changelog
+
+This message is published as-is on X, LinkedIn and wip.co as build-in-public marketing. Strangers read it, including people who look for servers to attack. Write about the PRODUCT only:
+- KEEP: features, changes and fixes a user of the app or site can see; store builds and releases; website, SEO and content work; design.
+- DROP, with no trace and no paraphrase: dependency, runtime, framework, library or SDK updates (Ruby, Rails, gems, npm, Flutter, Gradle and the like); anything patched, audited, flagged, pinned or bumped; security, hardening, validation, guards, sanitising, rate limits, auth, keys, secrets; servers, tunnels, firewalls, Docker, Kamal, deploy and build config; CI, git hooks, pre-push gates; refactors, linting, code-review findings; test-only changes; internal tooling and runbooks.
+- NEVER write a version number of a library, runtime, framework or tool. Store build numbers such as iOS 48 or Android 1224 are fine.
+- If every commit of a project falls under DROP, keep the project name and write exactly one bullet under it: • [internal]
+  Never leave a project out: the name must stay, with that single bullet. It is removed automatically before anything is sent.
 - Bold ONLY the project name on its own line, with single asterisks (*#project* or *Project Name*), never double. Use no other markup anywhere — no italics, no inline bold, no code spans. Every other character is escaped before sending, so a stray marker is published literally to X and wip.co rather than rendered.
 - Output ONLY the formatted message, nothing else"
 

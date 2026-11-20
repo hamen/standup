@@ -744,6 +744,52 @@ PRIVATE_LINE = [re.compile(p) for p in (
     # A key or a token is only interesting when something qualifies it.
     r"(?i)\b(api|signing|private|public|ssh|gpg|jwt|auth|access|refresh|session)"
     r"[ _-]?(keys?|tokens?)\b",
+
+    # ---- Dependency work (added 2026-11-20) ----
+    # On 2026-11-20 the post carried "Moved to Ruby 4.0.10" in ten projects,
+    # "patched gems flagged by bundler-audit" and "Patched msgpack and Rails
+    # gems", and was deleted by hand. None of it says CVE or security, and all
+    # of it tells a reader which runtime and which libraries each app ran, and
+    # how recently a hole was closed: enough to go and test the ones that are
+    # not patched yet. A dependency line is never product, so it goes whole.
+    # Patched, audited, flagged, pinned, bumped: the vocabulary of the fix.
+    r"(?i)\bpatch\w*",
+    r"(?i)\b(bump\w*|pinned|pinning|unpin\w*)\b",
+    r"(?i)\b(bundler|npm|yarn|pnpm|pip|cargo|gem|dependency|dependencies|deps)"
+    r"[ -]?audit\w*",
+    r"(?i)\b(brakeman|dependabot|renovate|snyk|osv[ -]scanner|flagged by)\b",
+    # Runtimes, frameworks, package managers and the libraries that have shown
+    # up in a commit subject. Bare names, because "Moved to Ruby" with the number
+    # dropped by the formatter is still the disclosure.
+    r"(?i)\b(ruby|rails|node\.?js|python|flutter|kotlin|gradle|jdk|php|xcode"
+    r"|cocoapods|gems?|gemfile|npm|yarn|pnpm|bundler|minitest|rspec|msgpack"
+    r"|nokogiri|rubyzip|openssl|puma|sidekiq|rack)\b",
+    # Any "to <version>" after a move word: "Upgraded the SDK to 24.1",
+    # "Moved to 4.0.10". The word list above cannot name every library.
+    r"(?i)\b(moved|mov\w+|upgrad\w*|downgrad\w*|updat\w*|migrat\w*|switch\w*)\b"
+    r".{0,40}?\bto\s+v?\d+(\.\d+)+",
+
+    # ---- Not product (added 2026-11-20) ----
+    # The post is build-in-public marketing. CI gates, hooks, deploy config,
+    # review rounds and input guards say how the machinery works, not what a
+    # user got, and the guards in particular describe what an attacker would
+    # probe. The formatter is told to drop these too; this is the backstop for
+    # a formatter that does not, and for the raw-report fallback, which skips
+    # the formatter entirely.
+    r"\bCI\b",
+    r"(?i)(\bbin/ci\b|\bpre-?(push|commit)\b|\bgit hooks?\b|\bdeploy\.ya?ml\b"
+    r"|\bdockerfile\b|\bkamal\b|\bgithub actions?\b|\bcloudflared?\b|\bfirewall\w*"
+    r"|\btailscale\b|\bnftables\b|\bufw\b)",
+    r"(?i)\b(review (findings?|rounds?|fixes)|code review|lint\w*|rubocop|refactor\w*)\b",
+    r"(?i)\b(guards?|sanitiz\w*|input validation|rate[ -]?limit\w*|allowlist\w*"
+    r"|denylist\w*|blocklist\w*)\b",
+
+    # The formatter writes this marker under a project whose whole day was
+    # internal work, instead of dropping the project — a project missing from
+    # the formatted text means "the formatter lost work" to --repair-headers,
+    # which then publishes the raw report. The marker goes here, and the
+    # project it leaves empty goes with it.
+    r"(?i)^\W*\[internal\]\W*$",
 )]
 
 
@@ -2660,7 +2706,9 @@ def _selftest_body():
 
     # Qualified only: an unqualified injection or leak is an ordinary commit,
     # and dropping a project's only bullet would fake a quiet day.
-    for kept in ("\u2022 Fixed a memory leak", "\u2022 Refactor dependency injection",
+    # Not "Refactor dependency injection" any more: since 2026-11-20 a refactor
+    # is not product and goes. The point here is the bare word "injection".
+    for kept in ("\u2022 Fixed a memory leak", "\u2022 Dependency injection for the player screen",
                  "\u2022 vulgar language filter"):
         one = f"\U0001F4CB T\n\n#alpha\n{kept}\n\n1 projects"
         assert kept in stripped(one), kept
@@ -2760,6 +2808,48 @@ def _selftest_body():
     for gone in ("*#wallpapers*", "*#mygoo*", "*#phototoss*", "CVE", "Hardened",
                  "security hardening"):
         assert gone not in out, (gone, out)
+
+    # The 2026-11-20 post, deleted by hand: dependency work, CI and guards, none
+    # of it worded as security. Every one of these lines went out that day.
+    for gone in ("\u2022 Moved to Ruby 4.0.10",
+                 "\u2022 Pinned minitest to 5.27.0 and patched gems flagged by bundler-audit",
+                 "\u2022 Patched msgpack and Rails gems flagged by bundler-audit",
+                 "\u2022 Added a pre-push gate that runs bin/ci",
+                 "\u2022 Fixed the commented build arg in deploy.yml",
+                 "\u2022 Fixed review findings: CLI version check per event, Unicode and "
+                 "control-character guards, timeout setting, and visibility in tool text",
+                 # The same disclosures in words the formatter might pick instead.
+                 "\u2022 Upgraded the ads SDK to 24.1.0",
+                 "\u2022 Updated dependencies to 3.2",
+                 "\u2022 Bumped the gem versions",
+                 "\u2022 Ran npm audit and fixed what it flagged",
+                 "\u2022 Server now accepts traffic only through the Cloudflare tunnel",
+                 "\u2022 Closed every inbound port on the firewall",
+                 "\u2022 Added rate limiting to the login endpoint",
+                 "\u2022 [internal]", "[internal]", "- [internal]", "\u2022 *[internal]*"):
+        body = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
+        assert gone.strip("\u2022 -*") not in stripped(body), gone
+    # Product lines from the same post stay: the filter must not empty a real day.
+    for kept in ("\u2022 Shipped iOS 48 to TestFlight and built Android 1224",
+                 "\u2022 Fixed the setup wizard so its steps update when the reminder banner appears",
+                 "\u2022 Startup: Remote Config fetch now retries, capped at 10 seconds, "
+                 "and falls back to cached values",
+                 "\u2022 Waiting list for full classes: freed seats go to the line, a held seat "
+                 "lasts 30 minutes, and there is an 08:30 class reminder",
+                 "\u2022 SEO: the /en/chinups/ page now targets informational intent",
+                 "\u2022 Added onboarding B: problem, demo, Plus choice, and first item",
+                 "\u2022 Create HEY calendar events through the filter"):
+        one = f"\U0001F4CB T\n\n#alpha\n{kept}\n\n1 projects"
+        assert kept in stripped(one), kept
+    # A project the formatter marked as internal-only disappears whole, header
+    # and marker, and the product project next to it is untouched.
+    marked = ("\U0001F4CB T\n\n*#giftit*\n\u2022 [internal]\n\n"
+              "*#mygoo*\n\u2022 Fixed the iPad share sheet anchor\n\u2022 Moved to Ruby 4.0.10\n\n"
+              "1 project had activity yesterday.")
+    out, before, after = strip_private(marked)
+    assert (before, after) == (2, 1), (out, before, after)
+    assert "#giftit" not in out and "[internal]" not in out, out
+    assert "Fixed the iPad share sheet anchor" in out and "Ruby" not in out, out
 
     # A header carrying a matching word is exempt, or its bullets would orphan.
     hdr = "\U0001F4CB T\n\n#security\n\u2022 Tests: ok\n\n1 projects"
