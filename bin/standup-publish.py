@@ -754,19 +754,25 @@ PRIVATE_LINE = [re.compile(p) for p in (
     # not patched yet. A dependency line is never product, so it goes whole.
     # Patched, audited, flagged, pinned, bumped: the vocabulary of the fix.
     r"(?i)\bpatch\w*",
-    r"(?i)\b(bump\w*|pinned|pinning|unpin\w*)\b",
+    r"(?i)\bbump\w*",
     r"(?i)\b(bundler|npm|yarn|pnpm|pip|cargo|gem|dependency|dependencies|deps)"
     r"[ -]?audit\w*",
+    r"(?i)\baudit\w*\s+(the\s+|our\s+)?(dependenc\w*|deps|gems|packages|librar\w*)",
     r"(?i)\b(brakeman|dependabot|renovate|snyk|osv[ -]scanner|flagged by)\b",
     # Runtimes, frameworks, package managers and the libraries that have shown
     # up in a commit subject. Bare names, because "Moved to Ruby" with the number
-    # dropped by the formatter is still the disclosure.
-    r"(?i)\b(ruby|rails|node\.?js|python|flutter|kotlin|gradle|jdk|php|xcode"
-    r"|cocoapods|gems?|gemfile|npm|yarn|pnpm|bundler|minitest|rspec|msgpack"
-    r"|nokogiri|rubyzip|openssl|puma|sidekiq|rack)\b",
+    # dropped by the formatter is still the disclosure. Only names that are not
+    # also product words: no "gems" (an in-game currency), no "rack" (a squat
+    # rack in a gym app), no "python"/"php" (an SEO page can be about them).
+    # "Patched gems" is still caught by "patch".
+    r"(?i)\b(ruby|rails|node\.?js|flutter|kotlin|gradle|jdk|xcode|cocoapods"
+    r"|gemfile|npm|yarn|pnpm|bundler|minitest|rspec|msgpack|nokogiri|rubyzip"
+    r"|openssl|sidekiq)\b",
     # Any "to <version>" after a move word: "Upgraded the SDK to 24.1",
-    # "Moved to 4.0.10". The word list above cannot name every library.
-    r"(?i)\b(moved|mov\w+|upgrad\w*|downgrad\w*|updat\w*|migrat\w*|switch\w*)\b"
+    # "Moved to 4.0.10", "Pinned minitest to 5.27.0". The word list above
+    # cannot name every library. "Pinned" counts only here, with a version:
+    # "Pinned the tab bar" is product.
+    r"(?i)\b(moved|upgrad\w*|downgrad\w*|updat\w*|migrat\w*|switch\w*|pinn\w*)\b"
     r".{0,40}?\bto\s+v?\d+(\.\d+)+",
 
     # ---- Not product (added 2026-11-20) ----
@@ -776,9 +782,11 @@ PRIVATE_LINE = [re.compile(p) for p in (
     # probe. The formatter is told to drop these too; this is the backstop for
     # a formatter that does not, and for the raw-report fallback, which skips
     # the formatter entirely.
+    # Case-sensitive on purpose: "ci" is a common Italian word, and commit
+    # subjects in Italian would lose ordinary lines to an (?i) match.
     r"\bCI\b",
     r"(?i)(\bbin/ci\b|\bpre-?(push|commit)\b|\bgit hooks?\b|\bdeploy\.ya?ml\b"
-    r"|\bdockerfile\b|\bkamal\b|\bgithub actions?\b|\bcloudflared?\b|\bfirewall\w*"
+    r"|\bdocker\w*|\bkamal\b|\bgithub actions?\b|\bcloudflared?\b|\bfirewall\w*"
     r"|\btailscale\b|\bnftables\b|\bufw\b)",
     r"(?i)\b(review (findings?|rounds?|fixes)|code review|lint\w*|rubocop|refactor\w*)\b",
     r"(?i)\b(guards?|sanitiz\w*|input validation|rate[ -]?limit\w*|allowlist\w*"
@@ -788,8 +796,9 @@ PRIVATE_LINE = [re.compile(p) for p in (
     # internal work, instead of dropping the project — a project missing from
     # the formatted text means "the formatter lost work" to --repair-headers,
     # which then publishes the raw report. The marker goes here, and the
-    # project it leaves empty goes with it.
-    r"(?i)^\W*\[internal\]\W*$",
+    # project it leaves empty goes with it. Anywhere in the line, so a marker
+    # the formatter decorated ("• [internal] — deps") still goes.
+    r"(?i)\[internal\]",
 )]
 
 
@@ -2826,7 +2835,10 @@ def _selftest_body():
                  "\u2022 Server now accepts traffic only through the Cloudflare tunnel",
                  "\u2022 Closed every inbound port on the firewall",
                  "\u2022 Added rate limiting to the login endpoint",
-                 "\u2022 [internal]", "[internal]", "- [internal]", "\u2022 *[internal]*"):
+                 "\u2022 Audited dependencies and replaced two",
+                 "\u2022 Updated the Docker base image",
+                 "\u2022 [internal]", "[internal]", "- [internal]", "\u2022 *[internal]*",
+                 "\u2022 [internal] \u2014 deps only"):
         body = f"\U0001F4CB T\n\n#alpha\n\u2022 Tests: ok\n{gone}\n\n1 projects"
         assert gone.strip("\u2022 -*") not in stripped(body), gone
     # Product lines from the same post stay: the filter must not empty a real day.
@@ -2838,7 +2850,14 @@ def _selftest_body():
                  "lasts 30 minutes, and there is an 08:30 class reminder",
                  "\u2022 SEO: the /en/chinups/ page now targets informational intent",
                  "\u2022 Added onboarding B: problem, demo, Plus choice, and first item",
-                 "\u2022 Create HEY calendar events through the filter"):
+                 "\u2022 Create HEY calendar events through the filter",
+                 # Product words that share a name with a library or a fix word
+                 # (review round 1): the gym, the games, the UI, the SEO pages.
+                 "\u2022 Members can book the squat rack",
+                 "\u2022 Added 5 bonus gems to the daily reward",
+                 "\u2022 Pinned the tab bar to the bottom of the screen",
+                 "\u2022 Movie night list reorganised",
+                 "\u2022 SEO: rewrote the learn-python landing page"):
         one = f"\U0001F4CB T\n\n#alpha\n{kept}\n\n1 projects"
         assert kept in stripped(one), kept
     # A project the formatter marked as internal-only disappears whole, header
