@@ -1205,6 +1205,20 @@ preview=$(awk '/reply_to_message_id/{p=1} p' "$TMP/post.log")
 echo "$preview" | grep -q 'Yesterday Alpha got a build config' ||
   failures+=("the preview reply does not show the written post")
 
+# The PROJECTS line is data for the links, never part of the post, and it does
+# not count against the limit. Here wip.co is out of reach, so no link is added.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s\n%s\n' 'Alpha starts faster now.' 'PROJECTS: #alpha' > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/tags.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+python3 - "$state_file" <<'PYEOF2' || failures+=("the PROJECTS line was not taken out of the post: $out")
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+assert s["post"] == "Alpha starts faster now.", s
+PYEOF2
+grep -q 'PROJECTS:' "$TMP/tags.log" && failures+=("the PROJECTS line reached Telegram")
+grep -q 'write PROJECTS:' "$CLAUDE_CALLED" || failures+=("the prompt does not ask for the PROJECTS line")
+
 # NONE means no post: X and LinkedIn get the report, as before.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
 printf '%s' NONE > "$CLAUDE_CALLED.reply"

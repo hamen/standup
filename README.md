@@ -260,6 +260,12 @@ picks the model (default `sonnet` with Claude). No guide, an answer of `NONE`,
 a post over 1500 characters, or a post that names a private domain all mean no
 post, and X and LinkedIn get the report as before.
 
+Under the post go the links of the projects it talks about, one per line, so
+the timeline shows a link to click and its preview card. The model only names
+the projects (a last `PROJECTS:` line, which never reaches the post); each URL
+is the project's website on wip.co, then its GitHub page, resolved once when
+the morning message is built. No link is found: the post goes out without one.
+
 ### The publisher in `bin/`
 
 `standup` itself only reads and prints. What is in `bin/` is the pipeline built

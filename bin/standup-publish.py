@@ -1455,6 +1455,69 @@ def public_text(state, text, seed, lead_out=None):
                                       links=state.get("links") or {})
 
 
+POST_TAGS_LINE = re.compile(r"PROJECTS:(.*)")
+POST_LINKS_MAX = 3
+
+
+def split_post_tags(answer):
+    """Split the post model's answer into (post, tags).
+
+    The model ends with a line "PROJECTS: #tag #tag" that names the projects
+    the post talks about. The line is data for post_links, never part of the
+    post. No such line means no tags, and the post goes out without links.
+    """
+    lines, tags = [], []
+    for line in answer.split("\n"):
+        m = POST_TAGS_LINE.fullmatch(line.strip())
+        if m:
+            tags = re.findall(r"#?([a-z0-9]+)", m.group(1).lower())
+        else:
+            lines.append(line)
+    return "\n".join(lines).rstrip(), tags
+
+
+def post_links(tags, report, links=None):
+    """The public site of each project the post talks about, one URL per line.
+
+    The model only names the projects; it never writes a URL. Each URL comes
+    from wip.co (website first, then GitHub), or for a project wip.co does not
+    know, from the public GitHub links standup.rb found. A tag that is not a
+    project of the report, a URL on a private domain, and a project with no
+    link are left out. Resolved once, when the morning message is built, so the
+    preview shows the text that gets published.
+
+    Nothing here may raise: the links help reach, and a post without them is
+    still a post.
+    """
+    links = links or {}
+    try:
+        reported = set(re.findall(r"#([a-z0-9]+)", report))
+        domains = private_domains()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - no links is a valid answer
+        warn(f"post without links: {e}")
+        return ""
+    try:
+        projects = wip_projects()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - see for_x
+        warn(f"could not read wip.co projects, post links from GitHub only: {e}")
+        projects = {}
+    urls = []
+    for tag in tags:
+        if tag not in reported:
+            continue
+        project = projects.get(tag)
+        if project:
+            url = project.get("website_url") or project.get("github_url")
+        else:
+            url = (links.get(tag) or {}).get("url")
+        if not isinstance(url, str) or not url.startswith("https://"):
+            continue
+        if names_private_domain(url, domains) or url in urls:
+            continue
+        urls.append(url)
+    return "\n".join(urls[:POST_LINKS_MAX])
+
+
 def post_to_x(text):
     """`text` is already rendered for a public timeline — see render_public."""
     assert_no_private_domain(text)
@@ -2467,6 +2530,36 @@ def _selftest_body():
     finally:
         mod.WIP_TOKEN_FILE = saved_token
 
+    # The post's PROJECTS line becomes links: the URLs come from wip.co or the
+    # public GitHub links, never from the model. A tag outside the report, a
+    # project with no link and a duplicate URL are left out.
+    post, tags = split_post_tags("Alpha got faster.\n\nWhat do you think?\nPROJECTS: #alpha #Beta, #ghost #nolink #twin")
+    assert post == "Alpha got faster.\n\nWhat do you think?", post
+    assert tags == ["alpha", "beta", "ghost", "nolink", "twin"], tags
+    assert split_post_tags("Just prose.") == ("Just prose.", [])
+    mod = sys.modules[__name__]
+    real_wip = mod.wip_projects
+    mod.wip_projects = lambda: {
+        "alpha": {"website_url": "https://alpha.example/", "github_url": "https://github.com/o/a"},
+        "nolink": {"website_url": None, "github_url": None},
+        "twin": {"website_url": "https://alpha.example/"},
+        "ghost": {"website_url": "https://ghost.example/"},
+    }
+    gh = {"beta": {"name": "beta", "url": "https://github.com/o/beta"}}
+    report = "#alpha\n\u2022 a\n\n#beta\n\u2022 b\n\n#nolink\n\u2022 c\n\n#twin\n\u2022 d"
+    try:
+        got = post_links(tags, report, gh)
+        assert got == "https://alpha.example/\nhttps://github.com/o/beta", got
+
+        def down():
+            raise OSError("wip.co is down")
+        mod.wip_projects = down
+        with contextlib.redirect_stderr(io.StringIO()):
+            offline = post_links(tags, report, gh)
+        assert offline == "https://github.com/o/beta", offline
+    finally:
+        mod.wip_projects = real_wip
+
     # No website: link the GitHub repository. wip.co's own github_url first,
     # then the public link standup.rb found — the latter only for a tag wip.co
     # has no project for. On 2026-09-29 a project with no site went out bare.
@@ -3080,6 +3173,20 @@ def main():
         except PrivateDomainError as e:
             warn(str(e))
             sys.exit(4)
+        return
+
+    # Reads the post model's answer on stdin; REPORT and LINKS (public GitHub
+    # links, JSON) come from the environment. Prints the post with its
+    # PROJECTS line replaced by the project links. Always exits 0.
+    if "--post-links" in sys.argv:
+        post, tags = split_post_tags(sys.stdin.read())
+        try:
+            links = json.loads(os.environ.get("LINKS") or "{}")
+        except Exception:  # noqa: BLE001 - no links is a valid answer
+            links = {}
+        urls = post_links(tags, os.environ.get("REPORT", ""),
+                          links if isinstance(links, dict) else {})
+        print(f"{post}\n\n{urls}" if post and urls else post)
         return
 
     # Reads the links file standup.rb wrote and prints the public ones as JSON.
