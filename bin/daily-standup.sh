@@ -24,6 +24,8 @@ set -euo pipefail
 #   FORMATTER_MODEL      model id for the formatter
 #   CLAUDE_TOKEN_ENV     headless Claude Code auth    (~/.config/claude-code-token.env)
 #   CLAUDE_BIN           Claude CLI (alias when formatter is claude)
+#   STANDUP_POST_VOICE   voice guide for the X/LinkedIn post (<config dir>/post-voice.md)
+#   POST_MODEL           model id for that post (sonnet with claude)
 # ============================================================================
 
 # readlink -f, not dirname alone: the README teaches symlinking this into
@@ -79,6 +81,7 @@ linkedin_armed() {
 # this failure and the least visible.
 _OVERRIDES=(CLAUDE_BIN BIRD_BIN BUFFER_BIN CLAUDE_TOKEN_ENV STANDUP_CONFIG STANDUP_CONFIG_DIR
             STANDUP_STATE_DIR STANDUP_FORMATTER FORMATTER_BIN FORMATTER_MODEL
+            STANDUP_POST_VOICE POST_MODEL
             TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID)
 for _v in "${_OVERRIDES[@]}"; do
   # ${!_v+set}, not -n: a caller that writes VAR= on the cron line means "empty",
@@ -351,6 +354,12 @@ if [ "${1:-}" = "--check" ]; then
   model_note="—"
   [ -n "$FORMATTER_MODEL" ] && model_note="$FORMATTER_MODEL"
   echo "formatter:     $STANDUP_FORMATTER  $FORMATTER_BIN  model=$model_note$formatter_note"
+  post_voice="${STANDUP_POST_VOICE:-$STANDUP_CONFIG_DIR/post-voice.md}"
+  if [ -s "$post_voice" ]; then
+    echo "post:          $post_voice  model=${POST_MODEL:-$([ "$STANDUP_FORMATTER" = claude ] && echo sonnet || echo "${FORMATTER_MODEL:-default}")}"
+  else
+    echo "post:          off (no voice guide at $post_voice); X and LinkedIn get the report"
+  fi
   echo "timeout:       $(timeout_backend)"
   echo "bird:          $bird_at $([ -x "$bird_at" ] || echo '(MISSING — set BIRD_BIN; only needed to post to X)')"
   if linkedin_armed; then
@@ -757,6 +766,8 @@ if DROPPED=$(printf '%s' "$ANALYSIS" | python3 "$SCRIPT_DIR/standup-publish.py" 
 else
   echo "  --drop-title failed; keeping the report as it is"
 fi
+# The post below is written from the filtered body alone, without header and footer.
+POST_SOURCE="$ANALYSIS"
 ANALYSIS="${SHARE_HEADER}
 
 ${ANALYSIS}"
@@ -781,6 +792,57 @@ if ! printf '%s' "$ANALYSIS" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publ
 
 Il report nomina un dominio privato (forse in share_header o share_footer), o la lista non si legge. Non ho inviato niente. Controlla il log."
   exit 1
+fi
+
+# ---- The post for X and LinkedIn ----
+#
+# The report above is a changelog: it suits wip.co, where each line is a todo,
+# and reads as a bug bulletin on a timeline. So a second pass writes one post
+# about the one or two changes a user would notice, in the author's voice. The
+# voice guide is a local file (it names the author and his apps, so it stays
+# out of this repository); without it there is no post, and X and LinkedIn get
+# the report exactly as before. The post is never published on its own: it is
+# what the preview reply shows, and the button still decides.
+POST=""
+POST_VOICE="${STANDUP_POST_VOICE:-$STANDUP_CONFIG_DIR/post-voice.md}"
+if [ -s "$POST_VOICE" ]; then
+  if [ "$STANDUP_FORMATTER" = claude ]; then
+    POST_MODEL="${POST_MODEL:-sonnet}"
+  else
+    POST_MODEL="${POST_MODEL:-$FORMATTER_MODEL}"
+  fi
+  echo "  Writing the post with $STANDUP_FORMATTER (${POST_MODEL:-default model})..."
+  POST_PROMPT="You write one social post for X and LinkedIn from a developer's daily work report.
+
+Report of yesterday's work (each section is a project, the bullets are what changed):
+
+$POST_SOURCE
+
+The author's voice and style guide, and the product names of his projects:
+
+$(cat "$POST_VOICE")
+
+Rules:
+- Pick the one or two changes a user of an app or a website would notice or care about. Leave everything else out. Do not list projects.
+- Use only facts from the report. Never add a number, a feature, a result or a reason that the report does not state. If the report does not say why a change was made, say what changed and what a user sees, not why.
+- Call a project by its product name from the guide. If the guide has no name for a project, leave that project out.
+- Plain text only: no markdown, no hashtags, no links, no bullets, no title.
+- At most 1000 characters.
+- If nothing in the report is a change a user would notice, write exactly NONE.
+- Output only the post, nothing else."
+  POST=$(FORMATTER_MODEL="$POST_MODEL" run_formatter "$POST_PROMPT") || POST=""
+  # Trim surrounding blank lines and spaces.
+  POST=$(printf '%s' "$POST" | sed -e 's/[[:space:]]*$//' | sed -e '/./,$!d')
+  if [ -z "$POST" ] || [ "$POST" = NONE ]; then
+    echo "  No post today; X and LinkedIn get the report"
+    POST=""
+  elif [ "${#POST}" -gt 1500 ]; then
+    echo "  The post is ${#POST} characters, over the limit; X and LinkedIn get the report"
+    POST=""
+  elif ! printf '%s' "$POST" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --assert-public; then
+    echo "  The post names a private domain (or the list is unreadable); X and LinkedIn get the report"
+    POST=""
+  fi
 fi
 
 # ---- Send to Telegram, with the button that publishes it ----
@@ -903,7 +965,7 @@ if echo "$RESP" | grep -q '"ok":true'; then
   # state file is a dead button, and a state file without the id it belongs to
   # cannot be replied to. Text through the environment, not argv, because it is
   # long and multi-line and that is where quoting breaks.
-  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" ARMED="$ARMED" LINKS="$LINKS_JSON" "${PY_UTF8[@]}" python3 - \
+  if ! MESSAGE_ID=$(RESP="$RESP" ANALYSIS="$ANALYSIS" POST="$POST" ARMED="$ARMED" LINKS="$LINKS_JSON" "${PY_UTF8[@]}" python3 - \
       "$STATE_DIR/pending-${PENDING_ID}.json" "$PENDING_ID" <<'PYEOF'
 import json, os, sys
 
@@ -929,6 +991,9 @@ state = {"id": pending_id,
          "posted_x": False, "posted_wip": False}
 if "linkedin" in state["armed"]:
     state["posted_linkedin"] = False
+# The post for X and LinkedIn, when one was written. wip.co always gets "text".
+if os.environ.get("POST"):
+    state["post"] = os.environ["POST"]
 # The public GitHub links for X, checked when this message was built. Cosmetic:
 # anything unreadable is no links, never a lost state file.
 try:

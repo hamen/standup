@@ -8,6 +8,15 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **A written post for X and LinkedIn.** The report reads as a changelog on a
+  timeline. With a voice guide at `<config dir>/post-voice.md` (or
+  `STANDUP_POST_VOICE`), a second formatter call writes one post about the one
+  or two changes a user would notice, from the filtered report only, with
+  `POST_MODEL` (default `sonnet` with Claude). The preview reply shows it, and X
+  and LinkedIn publish it when the button is pressed. wip.co keeps the report.
+  With no guide, an answer of `NONE`, a post over 1500 characters, or one that
+  names a private domain, X and LinkedIn get the report as before.
+
 - **The standup can share its Telegram bot.** Telegram gives a bot's updates
   to one reader only. With `TELEGRAM_UPDATES_INBOX` in `telegram.env`, the
   publisher reads its button presses from that folder, one `<update_id>.json`

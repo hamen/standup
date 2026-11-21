@@ -117,6 +117,7 @@ run() { # run <log> <args...>
       ${FORMATTER_MODEL+FORMATTER_MODEL=$FORMATTER_MODEL} \
       ${AGENT_LOG+AGENT_LOG=$AGENT_LOG} \
       ${CLAUDE_CALLED+CLAUDE_CALLED=$CLAUDE_CALLED} \
+      ${POST_REPLY+POST_REPLY=$POST_REPLY} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -1166,6 +1167,62 @@ grep -q 'inline_keyboard' "$TMP/badlist.log" &&
 grep -q 'Non riesco a leggere private' "$TMP/badlist.log" ||
   failures+=("the malformed list was not reported on Telegram: $out")
 unset STANDUP_CONFIG
+
+# --- 20. The written post for X and LinkedIn ------------------------------
+# With a voice guide, a second formatter call writes the post: it goes into the
+# state file and into the preview reply, while the report stays as the wip.co text.
+mkdir -p "$TMP/fakehome/.config/standup"
+printf 'Write like a person.\n' > "$TMP/fakehome/.config/standup/post-voice.md"
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+prompt=$(cat)
+printf '%s\n%s\n--- end of prompt ---\n' "$*" "$prompt" >> "$CLAUDE_CALLED"
+case "$prompt" in
+  "You write one social post"*) printf '%s\n' "${POST_REPLY:-Yesterday Alpha got a build config a user will never see.}" ;;
+  *) printf '*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n' ;;
+esac
+SH
+chmod +x "$TMP/stub/claude"
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+export CLAUDE_CALLED="$TMP/claude-calls.log"; : > "$CLAUDE_CALLED"
+out=$(run "$TMP/post.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+python3 - "$state_file" <<'PYEOF2' || failures+=("the written post did not reach the state file next to the report: $out")
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+assert s["post"] == "Yesterday Alpha got a build config a user will never see.", s
+assert "dart_defines" in s["text"], s
+PYEOF2
+grep -q -- '--model' "$CLAUDE_CALLED" && grep -q 'sonnet' "$CLAUDE_CALLED" ||
+  failures+=("the post was not written with the post model")
+grep -q 'Write like a person.' "$CLAUDE_CALLED" ||
+  failures+=("the voice guide did not reach the post prompt")
+preview=$(awk '/reply_to_message_id/{p=1} p' "$TMP/post.log")
+echo "$preview" | grep -q 'Yesterday Alpha got a build config' ||
+  failures+=("the preview reply does not show the written post")
+
+# NONE means no post: X and LinkedIn get the report, as before.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+out=$(POST_REPLY=NONE; export POST_REPLY; run "$TMP/none.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a NONE answer was stored as the post")
+echo "$out" | grep -q 'No post today' ||
+  failures+=("a day with no post was not reported: $out")
+
+# A post that names a private domain is dropped, and the report still goes out.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\n'
+export STANDUP_CONFIG="$TMP/private.yml"
+out=$(POST_REPLY='Alpha_moved_to_grab.example.org'; export POST_REPLY; run "$TMP/privpost.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+[ -n "$state_file" ] || failures+=("a private post cost the day its report: $out")
+grep -qi 'example\.org' "$TMP/privpost.log" &&
+  failures+=("a post naming a private domain reached Telegram")
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a post naming a private domain was stored")
+unset STANDUP_CONFIG CLAUDE_CALLED
+rm -f "$TMP/fakehome/.config/standup/post-voice.md"
 
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'

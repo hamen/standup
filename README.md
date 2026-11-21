@@ -244,6 +244,22 @@ bullets, the title and the footer stay as written, so social hashtags belong in
 to wip.co, where it attaches the todo to a project with that hashtag if you
 have one.
 
+### A written post for X and LinkedIn
+
+The report is a list of changes, which suits wip.co and reads as a changelog
+on X. Put a voice guide at `~/.config/standup/post-voice.md` (or point
+`STANDUP_POST_VOICE` at one) and the morning run asks the formatter for one
+more thing: a single post about the one or two changes a user would notice,
+written from the already filtered report. The guide is yours to write: how you
+sound, and the product name of each project hashtag. A project the guide does
+not name is left out of the post.
+
+The post is what the "Su X esce così" reply shows, and what X and LinkedIn
+receive when you press the button. wip.co always gets the report. `POST_MODEL`
+picks the model (default `sonnet` with Claude). No guide, an answer of `NONE`,
+a post over 1500 characters, or a post that names a private domain all mean no
+post, and X and LinkedIn get the report as before.
+
 ### The publisher in `bin/`
 
 `standup` itself only reads and prints. What is in `bin/` is the pipeline built
@@ -325,7 +341,7 @@ with nowhere to say so is indistinguishable from a quiet morning.
 
 Everything is overridable by environment variable: `STANDUP_CONFIG`,
 `STANDUP_CONFIG_DIR`, `STANDUP_STATE_DIR`, `STANDUP_FORMATTER`, `FORMATTER_BIN`,
-`FORMATTER_MODEL`, `CLAUDE_BIN`, `CLAUDE_TOKEN_ENV`, `BIRD_BIN`.
+`FORMATTER_MODEL`, `STANDUP_POST_VOICE`, `POST_MODEL`, `CLAUDE_BIN`, `CLAUDE_TOKEN_ENV`, `BIRD_BIN`.
 
 ## `llm-context.md`
 
