@@ -1167,6 +1167,105 @@ grep -q 'Non riesco a leggere private' "$TMP/badlist.log" ||
   failures+=("the malformed list was not reported on Telegram: $out")
 unset STANDUP_CONFIG
 
+# --- 20. The written post for X and LinkedIn ------------------------------
+# With a voice guide, a second formatter call writes the post: it goes into the
+# state file and into the preview reply, while the report stays as the wip.co text.
+mkdir -p "$TMP/fakehome/.config/standup"
+printf 'Write like a person.\n' > "$TMP/fakehome/.config/standup/post-voice.md"
+cat > "$TMP/stub/claude" <<'SH'
+#!/usr/bin/env bash
+prompt=$(cat)
+printf '%s\n%s\n--- end of prompt ---\n' "$*" "$prompt" >> "$CLAUDE_CALLED"
+case "$prompt" in
+  "You write one social post"*)
+    # The answer the test wants, from a file: env -i in run() would split it on spaces.
+    reply="Yesterday Alpha got a build config a user will never see."
+    [ -f "$CLAUDE_CALLED.reply" ] && reply=$(cat "$CLAUDE_CALLED.reply")
+    [ "$reply" = FAIL ] && exit 1
+    printf '%s\n' "$reply" ;;
+  *) printf '*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n' ;;
+esac
+SH
+chmod +x "$TMP/stub/claude"
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+export CLAUDE_CALLED="$TMP/claude-calls.log"; : > "$CLAUDE_CALLED"
+out=$(run "$TMP/post.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+python3 - "$state_file" <<'PYEOF2' || failures+=("the written post did not reach the state file next to the report: $out")
+import json, sys
+s = json.load(open(sys.argv[1], encoding="utf-8"))
+assert s["post"] == "Yesterday Alpha got a build config a user will never see.", s
+assert "dart_defines" in s["text"], s
+PYEOF2
+grep -q -- '--model' "$CLAUDE_CALLED" && grep -q 'sonnet' "$CLAUDE_CALLED" ||
+  failures+=("the post was not written with the post model")
+grep -q 'Write like a person.' "$CLAUDE_CALLED" ||
+  failures+=("the voice guide did not reach the post prompt")
+preview=$(awk '/reply_to_message_id/{p=1} p' "$TMP/post.log")
+echo "$preview" | grep -q 'Yesterday Alpha got a build config' ||
+  failures+=("the preview reply does not show the written post")
+
+# NONE means no post: X and LinkedIn get the report, as before.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' NONE > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/none.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a NONE answer was stored as the post")
+echo "$out" | grep -q 'No post today' ||
+  failures+=("a day with no post was not reported: $out")
+
+# The same NONE with a leading space and a full stop, as a model may write it.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' ' NONE.' > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/none2.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a NONE with a leading space was stored as the post")
+
+# Over the limit, counted in characters: X and LinkedIn get the report.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' $(printf 'è%.0s' $(seq 1501)) > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/long.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a post over 1500 characters was stored")
+echo "$out" | grep -q '1501 characters, over the limit' ||
+  failures+=("an overlong post was not reported in characters: $out")
+# 1000 two-byte characters are 2000 bytes, and still a post.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' $(printf 'è%.0s' $(seq 1000)) > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/accent.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null ||
+  failures+=("a post of 1000 accented characters was counted in bytes and dropped")
+
+# A failed second call is said as such, and the day still goes out.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' FAIL > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/postfail.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+[ -n "$state_file" ] || failures+=("a failed post call cost the day its report: $out")
+grep -q '"post"' "$state_file" 2>/dev/null && failures+=("a failed post call stored a post")
+echo "$out" | grep -q 'no answer from the formatter' ||
+  failures+=("a failed post call was reported as a day with no post: $out")
+
+# A post that names a private domain is dropped, and the report still goes out.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\n'
+export STANDUP_CONFIG="$TMP/private.yml"
+printf '%s' 'Alpha moved to grab.example.org' > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/privpost.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+[ -n "$state_file" ] || failures+=("a private post cost the day its report: $out")
+grep -qi 'example\.org' "$TMP/privpost.log" &&
+  failures+=("a post naming a private domain reached Telegram")
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a post naming a private domain was stored")
+rm -f "$CLAUDE_CALLED.reply"
+unset STANDUP_CONFIG CLAUDE_CALLED
+rm -f "$TMP/fakehome/.config/standup/post-voice.md"
+
 if [ ${#failures[@]} -eq 0 ]; then
   echo 'ok: the report reaches Telegram escaped, retries unescaped, and refuses to send what it could not filter'
 else

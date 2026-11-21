@@ -1445,6 +1445,16 @@ def for_x(text, seed, lead_out=None, links=None):
     return _join_share_frame(head, body, tail)
 
 
+def public_text(state, text, seed, lead_out=None):
+    """What X and LinkedIn receive, and what the morning preview shows.
+
+    The post written that morning wins when there is one. Without it, the
+    report with its hashtags turned into names and links, as before.
+    """
+    return state.get("post") or for_x(text, seed, lead_out=lead_out,
+                                      links=state.get("links") or {})
+
+
 def post_to_x(text):
     """`text` is already rendered for a public timeline — see render_public."""
     assert_no_private_domain(text)
@@ -2374,6 +2384,12 @@ def _selftest_body():
         assert "#buildinpublic #indiehackers" in x_text, x_text
         assert "Indie" not in x_text and "#indiehackers" in x_text, x_text
 
+        # The written post wins for X and LinkedIn; without one, the report as before.
+        post = "Yesterday Alpha learned to do one thing a user can see."
+        assert public_text({"post": post}, framed, "2026-09-23") == post
+        assert public_text({"post": ""}, framed, "2026-09-23") == x_text
+        assert public_text({}, framed, "2026-09-23") == x_text
+
         lone = (
             "\U0001F4CB Daily Standup\n\n"
             "#alpha\n\u2022 one\n\n"
@@ -3044,8 +3060,7 @@ def main():
     if "--preview" in sys.argv:
         pending = sys.argv[sys.argv.index("--preview") + 1]
         state = json.loads((STATE_DIR / f"pending-{pending}.json").read_text())
-        preview = for_x(strip_telegram_markup(state["text"]), pending,
-                        links=state.get("links") or {})
+        preview = public_text(state, strip_telegram_markup(state["text"]), pending)
         # Nothing on stdout when it fails: daily-standup.sh posts whatever this
         # printed, even on a non-zero exit.
         try:
@@ -3208,8 +3223,7 @@ def main():
 
         def render_public():
             if "text" not in public:
-                public["text"] = for_x(text, key, lead_out=lead,
-                                       links=state.get("links") or {})
+                public["text"] = public_text(state, text, key, lead_out=lead)
             return public["text"]
 
         def post_x():
