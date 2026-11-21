@@ -836,8 +836,8 @@ Rules:
   # Trim blank lines and spaces around the post: a stray "  NONE" must still read as NONE.
   POST=$(printf '%s' "$POST" | sed -e 's/[[:space:]]*$//' -e '/./,$!d' -e '1s/^[[:space:]]*//')
   POST_ANSWER="$POST"
-  # The checks below are about the prose: the PROJECTS line is data, not post.
-  POST=$(printf '%s' "$POST" | sed -e '/^[[:space:]]*PROJECTS:/d')
+  # The checks below are about the prose: the last line, PROJECTS:, is data, not post.
+  POST=$(printf '%s' "$POST" | sed -e '${/^[[:space:]]*PROJECTS:/d;}')
   # NONE with quotes, a full stop or code fences around it is still NONE.
   POST_WORD=$(printf '%s' "$POST" | tr -d '[:space:][:punct:]')
   # Characters, not bytes: under cron's C locale ${#POST} counts bytes.

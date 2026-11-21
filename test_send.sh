@@ -1216,7 +1216,7 @@ import json, sys
 s = json.load(open(sys.argv[1], encoding="utf-8"))
 assert s["post"] == "Alpha starts faster now.", s
 PYEOF2
-grep -q 'PROJECTS:' "$TMP/tags.log" && failures+=("the PROJECTS line reached Telegram")
+grep -q 'PROJECTS: #alpha' "$TMP/tags.log" && failures+=("the PROJECTS line reached Telegram")
 grep -q 'write PROJECTS:' "$CLAUDE_CALLED" || failures+=("the prompt does not ask for the PROJECTS line")
 
 # NONE means no post: X and LinkedIn get the report, as before.

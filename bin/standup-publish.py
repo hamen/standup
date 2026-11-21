@@ -1457,64 +1457,68 @@ def public_text(state, text, seed, lead_out=None):
 
 POST_TAGS_LINE = re.compile(r"PROJECTS:(.*)")
 POST_LINKS_MAX = 3
+POST_URL = re.compile(r"https://\S+")
 
 
 def split_post_tags(answer):
     """Split the post model's answer into (post, tags).
 
     The model ends with a line "PROJECTS: #tag #tag" that names the projects
-    the post talks about. The line is data for post_links, never part of the
-    post. No such line means no tags, and the post goes out without links.
+    the post talks about. Only the last line counts: it is data for post_links,
+    never part of the post. No such line means no tags, and the post goes out
+    without links. daily-standup.sh drops the same last line before it checks
+    the prose.
     """
-    lines, tags = [], []
-    for line in answer.split("\n"):
-        m = POST_TAGS_LINE.fullmatch(line.strip())
-        if m:
-            tags = re.findall(r"#?([a-z0-9]+)", m.group(1).lower())
-        else:
-            lines.append(line)
-    return "\n".join(lines).rstrip(), tags
+    lines = answer.rstrip().split("\n")
+    m = POST_TAGS_LINE.fullmatch(lines[-1].strip())
+    if not m:
+        return answer.rstrip(), []
+    return "\n".join(lines[:-1]).rstrip(), re.findall(r"#([a-z0-9]+)", m.group(1).lower())
 
 
 def post_links(tags, report, links=None):
     """The public site of each project the post talks about, one URL per line.
 
     The model only names the projects; it never writes a URL. Each URL comes
-    from wip.co (website first, then GitHub), or for a project wip.co does not
-    know, from the public GitHub links standup.rb found. A tag that is not a
-    project of the report, a URL on a private domain, and a project with no
-    link are left out. Resolved once, when the morning message is built, so the
-    preview shows the text that gets published.
+    from wip.co (website, then GitHub), then from the public GitHub links
+    standup.rb found. A tag that is not a project header of the report, a URL
+    that is not one https token, a URL on a private domain, and a project with
+    no link are left out. Resolved once, when the morning message is built, so
+    the preview shows the text that gets published.
+
+    The 1500-character check runs on the prose before this: X counts a link as
+    23 characters whatever its length, and there are at most three.
 
     Nothing here may raise: the links help reach, and a post without them is
     still a post.
     """
     links = links or {}
     try:
-        reported = set(re.findall(r"#([a-z0-9]+)", report))
+        reported = {m.group(1) for line in report.split("\n")
+                    if (m := SLOT_HEADER.fullmatch(line.strip()))}
         domains = private_domains()
-    except (Exception, SystemExit) as e:  # noqa: BLE001 - no links is a valid answer
+    except Exception as e:  # noqa: BLE001 - no links is a valid answer
         warn(f"post without links: {e}")
         return ""
     try:
         projects = wip_projects()
-    except (Exception, SystemExit) as e:  # noqa: BLE001 - see for_x
+    # SystemExit too: wip_key() calls die() on a missing token (see for_x).
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - never lose the post
         warn(f"could not read wip.co projects, post links from GitHub only: {e}")
         projects = {}
     urls = []
     for tag in tags:
         if tag not in reported:
             continue
-        project = projects.get(tag)
-        if project:
-            url = project.get("website_url") or project.get("github_url")
-        else:
-            url = (links.get(tag) or {}).get("url")
-        if not isinstance(url, str) or not url.startswith("https://"):
-            continue
-        if names_private_domain(url, domains) or url in urls:
-            continue
-        urls.append(url)
+        project = projects.get(tag) or {}
+        candidates = [project.get("website_url"), project.get("github_url"),
+                      (links.get(tag) or {}).get("url")]
+        for url in candidates:
+            if (isinstance(url, str) and POST_URL.fullmatch(url)
+                    and not names_private_domain(url, domains)):
+                if url not in urls:
+                    urls.append(url)
+                break
     return "\n".join(urls[:POST_LINKS_MAX])
 
 
@@ -2531,25 +2535,34 @@ def _selftest_body():
         mod.WIP_TOKEN_FILE = saved_token
 
     # The post's PROJECTS line becomes links: the URLs come from wip.co or the
-    # public GitHub links, never from the model. A tag outside the report, a
-    # project with no link and a duplicate URL are left out.
-    post, tags = split_post_tags("Alpha got faster.\n\nWhat do you think?\nPROJECTS: #alpha #Beta, #ghost #nolink #twin")
-    assert post == "Alpha got faster.\n\nWhat do you think?", post
-    assert tags == ["alpha", "beta", "ghost", "nolink", "twin"], tags
+    # public GitHub links, never from the model. A tag that is not a project
+    # header of the report, a project with no link, a bad or private URL and a
+    # duplicate are left out, and there are at most three.
+    post, tags = split_post_tags("Alpha got faster.\nPROJECTS: in prose\n\nWhy?\nPROJECTS: #alpha #Beta, #ghost #123 #nolink #twin #bad #priv #c #d")
+    assert post == "Alpha got faster.\nPROJECTS: in prose\n\nWhy?", post
+    assert tags == ["alpha", "beta", "ghost", "123", "nolink", "twin", "bad", "priv", "c", "d"], tags
     assert split_post_tags("Just prose.") == ("Just prose.", [])
+    assert split_post_tags("PROJECTS: #alpha\nThen prose.") == ("PROJECTS: #alpha\nThen prose.", [])
     mod = sys.modules[__name__]
-    real_wip = mod.wip_projects
+    real_wip, real_domains = mod.wip_projects, mod.private_domains
     mod.wip_projects = lambda: {
         "alpha": {"website_url": "https://alpha.example/", "github_url": "https://github.com/o/a"},
         "nolink": {"website_url": None, "github_url": None},
         "twin": {"website_url": "https://alpha.example/"},
         "ghost": {"website_url": "https://ghost.example/"},
+        "bad": {"website_url": "https://bad.example/\nInjected line",
+                "github_url": "https://github.com/o/bad"},
+        "priv": {"website_url": "https://app.private.example/"},
+        "c": {"website_url": "https://c.example/"},
+        "d": {"website_url": "https://d.example/"},
     }
+    mod.private_domains = lambda: ["private.example"]
     gh = {"beta": {"name": "beta", "url": "https://github.com/o/beta"}}
-    report = "#alpha\n\u2022 a\n\n#beta\n\u2022 b\n\n#nolink\n\u2022 c\n\n#twin\n\u2022 d"
+    report = ("*#alpha*\n\u2022 fixed issue #123\n\n#beta\n\u2022 b\n\n#nolink\n\u2022 c\n\n"
+              "#twin\n\u2022 d\n\n#bad\n\u2022 e\n\n#priv\n\u2022 f\n\n#c\n\u2022 g\n\n#d\n\u2022 h")
     try:
         got = post_links(tags, report, gh)
-        assert got == "https://alpha.example/\nhttps://github.com/o/beta", got
+        assert got == "https://alpha.example/\nhttps://github.com/o/beta\nhttps://github.com/o/bad", got
 
         def down():
             raise OSError("wip.co is down")
@@ -2557,8 +2570,20 @@ def _selftest_body():
         with contextlib.redirect_stderr(io.StringIO()):
             offline = post_links(tags, report, gh)
         assert offline == "https://github.com/o/beta", offline
+
+        # The CLI path daily-standup.sh calls: wip.co out of reach (no token
+        # in this environment), so the GitHub link from LINKS is the one used.
+        cfg = pathlib.Path(tempfile.mkdtemp(prefix="standup-postlinks-")) / "standup.yml"
+        cfg.write_text("private_domains: []\n", encoding="utf-8")
+        env = dict(os.environ, STANDUP_CONFIG=str(cfg), REPORT="#beta\n\u2022 b",
+                   LINKS=json.dumps(gh), STANDUP_CONFIG_DIR=str(cfg.parent))
+        child = subprocess.run([sys.executable, __file__, "--post-links"],
+                               input="Beta is out.\nPROJECTS: #beta\n", env=env,
+                               capture_output=True, text=True, timeout=60)
+        assert child.returncode == 0, child.stderr
+        assert child.stdout == "Beta is out.\n\nhttps://github.com/o/beta\n", child.stdout
     finally:
-        mod.wip_projects = real_wip
+        mod.wip_projects, mod.private_domains = real_wip, real_domains
 
     # No website: link the GitHub repository. wip.co's own github_url first,
     # then the public link standup.rb found — the latter only for a tag wip.co
