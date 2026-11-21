@@ -8,6 +8,12 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **Project links under the written post.** The post named the apps but had
+  nothing to click and no preview card. The model now ends with a `PROJECTS:`
+  line naming the projects it wrote about; the script removes it and adds the
+  wip.co website (or the GitHub page) of each, at most three. The model never
+  writes a URL, and a tag outside the report or a private domain gets no link.
+
 - **A written post for X and LinkedIn.** The report reads as a changelog on a
   timeline. With a voice guide at `<config dir>/post-voice.md` (or
   `STANDUP_POST_VOICE`), a second formatter call writes one post about the one

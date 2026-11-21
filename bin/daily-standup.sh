@@ -828,12 +828,16 @@ Rules:
 - Call a project by its product name from the guide. If the guide has no name for a project, leave that project out.
 - Plain text only: no markdown, no hashtags, no links, no bullets, no title.
 - At most 1000 characters.
-- If nothing in the report is a change a user would notice, write exactly NONE.
-- Output only the post, nothing else."
+- After the post, on a last line of its own, write PROJECTS: and the hashtags of the projects the post talks about, as the report writes them (for example: PROJECTS: #alpha #beta). The script turns that line into links.
+- If nothing in the report is a change a user would notice, write exactly NONE, with no PROJECTS line.
+- Output only the post and the PROJECTS line, nothing else."
   # run_formatter answers nothing, not an error, when the call fails.
   POST=$(FORMATTER_MODEL="$POST_MODEL" run_formatter "$POST_PROMPT") || POST=""
   # Trim blank lines and spaces around the post: a stray "  NONE" must still read as NONE.
   POST=$(printf '%s' "$POST" | sed -e 's/[[:space:]]*$//' -e '/./,$!d' -e '1s/^[[:space:]]*//')
+  POST_ANSWER="$POST"
+  # The checks below are about the prose: the last line, PROJECTS:, is data, not post.
+  POST=$(printf '%s' "$POST" | sed -e '${/^[[:space:]]*PROJECTS:/d;}')
   # NONE with quotes, a full stop or code fences around it is still NONE.
   POST_WORD=$(printf '%s' "$POST" | tr -d '[:space:][:punct:]')
   # Characters, not bytes: under cron's C locale ${#POST} counts bytes.
@@ -847,7 +851,15 @@ Rules:
   elif [ "$POST_CHARS" -gt 1500 ]; then
     echo "  The post is $POST_CHARS characters, over the limit; X and LinkedIn get the report"
     POST=""
-  elif ! printf '%s' "$POST" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --assert-public; then
+  else
+    # The links of the projects the post names: the model names them, the URLs
+    # come from wip.co (or the public GitHub links). A failure keeps the post
+    # without links.
+    POST_LINKED=$(printf '%s' "$POST_ANSWER" | REPORT="$POST_SOURCE" LINKS="$LINKS_JSON" \
+      "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --post-links) && [ -n "$POST_LINKED" ] &&
+      POST="$POST_LINKED"
+  fi
+  if [ -n "$POST" ] && ! printf '%s' "$POST" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --assert-public; then
     echo "  The post names a private domain (or the list is unreadable); X and LinkedIn get the report"
     POST=""
   fi
