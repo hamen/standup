@@ -830,14 +830,22 @@ Rules:
 - At most 1000 characters.
 - If nothing in the report is a change a user would notice, write exactly NONE.
 - Output only the post, nothing else."
+  # run_formatter answers nothing, not an error, when the call fails.
   POST=$(FORMATTER_MODEL="$POST_MODEL" run_formatter "$POST_PROMPT") || POST=""
-  # Trim surrounding blank lines and spaces.
-  POST=$(printf '%s' "$POST" | sed -e 's/[[:space:]]*$//' | sed -e '/./,$!d')
-  if [ -z "$POST" ] || [ "$POST" = NONE ]; then
+  # Trim blank lines and spaces around the post: a stray "  NONE" must still read as NONE.
+  POST=$(printf '%s' "$POST" | sed -e 's/[[:space:]]*$//' -e '/./,$!d' -e '1s/^[[:space:]]*//')
+  # NONE with quotes, a full stop or code fences around it is still NONE.
+  POST_WORD=$(printf '%s' "$POST" | tr -d '[:space:][:punct:]')
+  # Characters, not bytes: under cron's C locale ${#POST} counts bytes.
+  POST_CHARS=$(printf '%s' "$POST" | "${PY_UTF8[@]}" python3 -c 'import sys; print(len(sys.stdin.read()))' 2>/dev/null) || POST_CHARS=0
+  # The prompt asks for 1000; the margin keeps a slightly long but good post.
+  if [ -z "$POST" ]; then
+    echo "  The post could not be written (no answer from the formatter); X and LinkedIn get the report"
+  elif [ "$POST_WORD" = NONE ]; then
     echo "  No post today; X and LinkedIn get the report"
     POST=""
-  elif [ "${#POST}" -gt 1500 ]; then
-    echo "  The post is ${#POST} characters, over the limit; X and LinkedIn get the report"
+  elif [ "$POST_CHARS" -gt 1500 ]; then
+    echo "  The post is $POST_CHARS characters, over the limit; X and LinkedIn get the report"
     POST=""
   elif ! printf '%s' "$POST" | "${PY_UTF8[@]}" python3 "$SCRIPT_DIR/standup-publish.py" --assert-public; then
     echo "  The post names a private domain (or the list is unreadable); X and LinkedIn get the report"

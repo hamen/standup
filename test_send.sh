@@ -117,7 +117,6 @@ run() { # run <log> <args...>
       ${FORMATTER_MODEL+FORMATTER_MODEL=$FORMATTER_MODEL} \
       ${AGENT_LOG+AGENT_LOG=$AGENT_LOG} \
       ${CLAUDE_CALLED+CLAUDE_CALLED=$CLAUDE_CALLED} \
-      ${POST_REPLY+POST_REPLY=$POST_REPLY} \
       TELEGRAM_BOT_TOKEN=not-a-token TELEGRAM_CHAT_ID=not-a-chat \
       bash "$WORK/bin/daily-standup.sh" "$@" 2>&1
 }
@@ -1178,7 +1177,12 @@ cat > "$TMP/stub/claude" <<'SH'
 prompt=$(cat)
 printf '%s\n%s\n--- end of prompt ---\n' "$*" "$prompt" >> "$CLAUDE_CALLED"
 case "$prompt" in
-  "You write one social post"*) printf '%s\n' "${POST_REPLY:-Yesterday Alpha got a build config a user will never see.}" ;;
+  "You write one social post"*)
+    # The answer the test wants, from a file: env -i in run() would split it on spaces.
+    reply="Yesterday Alpha got a build config a user will never see."
+    [ -f "$CLAUDE_CALLED.reply" ] && reply=$(cat "$CLAUDE_CALLED.reply")
+    [ "$reply" = FAIL ] && exit 1
+    printf '%s\n' "$reply" ;;
   *) printf '*#alpha*\n• Build config: dart_defines from production.env\n\n1 project.\n' ;;
 esac
 SH
@@ -1203,24 +1207,62 @@ echo "$preview" | grep -q 'Yesterday Alpha got a build config' ||
 
 # NONE means no post: X and LinkedIn get the report, as before.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
-out=$(POST_REPLY=NONE; export POST_REPLY; run "$TMP/none.log")
+printf '%s' NONE > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/none.log")
 state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
 grep -q '"post"' "$state_file" 2>/dev/null &&
   failures+=("a NONE answer was stored as the post")
 echo "$out" | grep -q 'No post today' ||
   failures+=("a day with no post was not reported: $out")
 
+# The same NONE with a leading space and a full stop, as a model may write it.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' ' NONE.' > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/none2.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a NONE with a leading space was stored as the post")
+
+# Over the limit, counted in characters: X and LinkedIn get the report.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' $(printf 'è%.0s' $(seq 1501)) > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/long.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null &&
+  failures+=("a post over 1500 characters was stored")
+echo "$out" | grep -q '1501 characters, over the limit' ||
+  failures+=("an overlong post was not reported in characters: $out")
+# 1000 two-byte characters are 2000 bytes, and still a post.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' $(printf 'è%.0s' $(seq 1000)) > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/accent.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+grep -q '"post"' "$state_file" 2>/dev/null ||
+  failures+=("a post of 1000 accented characters was counted in bytes and dropped")
+
+# A failed second call is said as such, and the day still goes out.
+rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
+printf '%s' FAIL > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/postfail.log")
+state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
+[ -n "$state_file" ] || failures+=("a failed post call cost the day its report: $out")
+grep -q '"post"' "$state_file" 2>/dev/null && failures+=("a failed post call stored a post")
+echo "$out" | grep -q 'no answer from the formatter' ||
+  failures+=("a failed post call was reported as a day with no post: $out")
+
 # A post that names a private domain is dropped, and the report still goes out.
 rm -f "$TMP"/fakehome/.local/state/standup/pending-*.json
 private_cfg "$TMP/private.yml" $'private_domains:\n  - example.org\n'
 export STANDUP_CONFIG="$TMP/private.yml"
-out=$(POST_REPLY='Alpha_moved_to_grab.example.org'; export POST_REPLY; run "$TMP/privpost.log")
+printf '%s' 'Alpha moved to grab.example.org' > "$CLAUDE_CALLED.reply"
+out=$(run "$TMP/privpost.log")
 state_file=$(compgen -G "$TMP/fakehome/.local/state/standup/pending-*.json" | head -1) || state_file=""
 [ -n "$state_file" ] || failures+=("a private post cost the day its report: $out")
 grep -qi 'example\.org' "$TMP/privpost.log" &&
   failures+=("a post naming a private domain reached Telegram")
 grep -q '"post"' "$state_file" 2>/dev/null &&
   failures+=("a post naming a private domain was stored")
+rm -f "$CLAUDE_CALLED.reply"
 unset STANDUP_CONFIG CLAUDE_CALLED
 rm -f "$TMP/fakehome/.config/standup/post-voice.md"
 
